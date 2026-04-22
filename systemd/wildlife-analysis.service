@@ -1,0 +1,20 @@
+[Unit]
+Description=Wildlife Monitor — Daily Analysis
+After=network.target remote-fs.target
+Wants=remote-fs.target
+
+[Service]
+Type=oneshot
+User=nash
+WorkingDirectory=/home/nash/wildlife_monitor
+ExecStart=/bin/bash -c '\
+    source /home/nash/wildlife_env/bin/activate && \
+    ./nas_sync.sh \
+        --then-process \
+        --data-dir /home/nash/wildlife_monitor/data'
+StandardOutput=append:/home/nash/wildlife_monitor/data/cron.log
+StandardError=append:/home/nash/wildlife_monitor/data/cron.log
+TimeoutStartSec=14400
+
+[Install]
+WantedBy=multi-user.target

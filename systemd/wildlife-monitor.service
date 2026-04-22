@@ -1,0 +1,23 @@
+[Unit]
+Description=Wildlife Monitor Dashboard
+After=network.target remote-fs.target
+Wants=remote-fs.target
+
+[Service]
+Type=simple
+User=nash
+WorkingDirectory=/home/nash/wildlife_monitor
+ExecStart=/home/nash/wildlife_env/bin/python web_app.py \
+    --port 8080 \
+    --host 0.0.0.0 \
+    --data-dir /home/nash/wildlife_monitor/data
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=wildlife-monitor
+# Give the NAS mount time to come up before binding
+ExecStartPre=/bin/sleep 5
+
+[Install]
+WantedBy=multi-user.target

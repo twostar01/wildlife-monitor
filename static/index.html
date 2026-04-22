@@ -1,0 +1,2071 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Wildlife Monitor</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Space+Mono:wght@400;700&family=Crimson+Pro:wght@300;400;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg:      #0e1a10;
+    --surface: #152018;
+    --card:    #1c2b1e;
+    --border:  #2a3d2c;
+    --accent:  #6dba5c;
+    --gold:    #c8a84b;
+    --amber:   #e07b2a;
+    --text:    #dcefd4;
+    --muted:   #7a9e73;
+    --dim:     #3a5a38;
+    --danger:  #c0392b;
+    --font-serif: 'Playfair Display', Georgia, serif;
+    --font-mono:  'Space Mono', monospace;
+    --font-body:  'Crimson Pro', Georgia, serif;
+    --radius: 6px;
+    --shadow: 0 4px 24px rgba(0,0,0,0.5);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html { scroll-behavior: smooth; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-body);
+    font-size: 16px;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+
+  /* ── NOISE OVERLAY ──────────────────────────────────── */
+  body::before {
+    content: '';
+    position: fixed; inset: 0; z-index: 0;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+    pointer-events: none; opacity: 0.4;
+  }
+
+  /* ── LAYOUT ─────────────────────────────────────────── */
+  #app { position: relative; z-index: 1; display: flex; flex-direction: column; min-height: 100vh; }
+
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 32px;
+    background: rgba(14,26,16,0.95);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 100;
+    backdrop-filter: blur(12px);
+  }
+
+  .logo {
+    display: flex; align-items: center; gap: 12px;
+    font-family: var(--font-serif); font-size: 22px; color: var(--accent);
+    letter-spacing: -0.3px;
+  }
+  .logo-icon { font-size: 28px; }
+  .logo-sub { font-size: 11px; font-family: var(--font-mono); color: var(--muted); letter-spacing: 2px; text-transform: uppercase; display: block; margin-top: -4px; }
+
+  nav { display: flex; gap: 4px; }
+  nav button {
+    background: none; border: none; color: var(--muted);
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: 1px;
+    text-transform: uppercase; padding: 8px 14px; border-radius: var(--radius);
+    cursor: pointer; transition: all 0.2s;
+  }
+  nav button:hover { color: var(--text); background: var(--border); }
+  nav button.active { color: var(--accent); background: rgba(109,186,92,0.12); }
+
+  .search-bar {
+    display: flex; align-items: center; gap: 8px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 6px 12px;
+  }
+  .search-bar input {
+    background: none; border: none; color: var(--text);
+    font-family: var(--font-mono); font-size: 12px; outline: none; width: 180px;
+  }
+  .search-bar input::placeholder { color: var(--dim); }
+  .search-icon { color: var(--muted); font-size: 14px; }
+
+  main { flex: 1; padding: 32px; max-width: 1400px; width: 100%; margin: 0 auto; }
+
+  .section { display: none; }
+  .section.active { display: block; animation: fadeIn 0.3s ease; }
+
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+  /* ── CARDS ──────────────────────────────────────────── */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 20px;
+  }
+
+  .card-title {
+    font-family: var(--font-serif); font-size: 13px;
+    color: var(--muted); letter-spacing: 1.5px; text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+
+  /* ── STAT GRID ──────────────────────────────────────── */
+  .stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 28px; }
+
+  .stat-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px 20px;
+    position: relative; overflow: hidden;
+  }
+  .stat-card-link { cursor: pointer; transition: border-color 0.2s, transform 0.1s; }
+  .stat-card-link:hover { border-color: var(--accent); transform: translateY(-1px); }
+  .stat-card::after {
+    content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px;
+    background: linear-gradient(90deg, var(--accent), var(--gold));
+  }
+  .stat-value { font-family: var(--font-mono); font-size: 32px; color: var(--accent); line-height: 1; }
+  .stat-label { font-size: 12px; color: var(--muted); margin-top: 6px; letter-spacing: 0.5px; }
+
+  /* ── CHARTS ─────────────────────────────────────────── */
+  .chart-grid { display: grid; grid-template-columns: 2fr 1fr; gap: 16px; margin-bottom: 28px; }
+  .chart-wrap { height: 200px; position: relative; }
+  @media (max-width: 700px) {
+    .chart-grid { grid-template-columns: 1fr; }
+    .chart-wrap { height: 220px; }
+  }
+
+  /* ── RECENT SIGHTINGS ───────────────────────────────── */
+  .sighting-list { display: flex; flex-direction: column; gap: 8px; }
+  .sighting-item {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 10px 14px;
+    cursor: pointer; transition: border-color 0.2s;
+  }
+  .sighting-item:hover { border-color: var(--accent); }
+  .sighting-thumb {
+    width: 56px; height: 40px; object-fit: cover;
+    border-radius: 4px; background: var(--bg); flex-shrink: 0;
+  }
+  .sighting-thumb-placeholder {
+    width: 56px; height: 40px; background: var(--dim);
+    border-radius: 4px; flex-shrink: 0; display: flex;
+    align-items: center; justify-content: center; color: var(--muted); font-size: 18px;
+  }
+  .sighting-info { flex: 1; min-width: 0; }
+  .sighting-name { font-family: var(--font-serif); font-size: 15px; }
+  .sighting-meta { font-size: 12px; color: var(--muted); font-family: var(--font-mono); }
+  .badge {
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.5px;
+    padding: 2px 8px; border-radius: 12px; text-transform: uppercase;
+  }
+  .badge-animal { background: rgba(109,186,92,0.15); color: var(--accent); border: 1px solid rgba(109,186,92,0.3); }
+  .badge-person { background: rgba(200,168,75,0.15); color: var(--gold); border: 1px solid rgba(200,168,75,0.3); }
+  .badge-quality { background: rgba(109,186,92,0.1); color: var(--accent); }
+
+  .species-chip { color: var(--accent); cursor: pointer; border-bottom: 1px dotted var(--accent); white-space: nowrap; }
+  .species-chip:hover { color: var(--text); }
+  .dual-video-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .dual-video-wrap video { width: 100%; border-radius: 6px; background: #000; }
+  .single-video-wrap video { width: 100%; border-radius: 6px; background: #000; max-height: 480px; }
+  .lens-label { font-family: var(--font-mono); font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+  @media (max-width: 600px) { .dual-video-wrap { grid-template-columns: 1fr; } }
+  .correction-form.open { display: block; }
+  .correction-form input { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 4px; font-size: 12px; width: 100%; box-sizing: border-box; margin-bottom: 8px; font-family: var(--font-mono); }
+  .correction-form input:focus { outline: none; border-color: var(--accent); }
+  .btn-correct { background: transparent; color: var(--accent); border: 1px solid var(--accent); padding: 5px 12px; border-radius: 4px; font-size: 11px; cursor: pointer; font-family: var(--font-mono); }
+  .btn-correct:hover { background: rgba(109,186,92,0.1); }
+  .badge-corrected { background: rgba(109,186,92,0.15); color: var(--accent); font-size: 10px; font-family: var(--font-mono); padding: 2px 6px; border-radius: 3px; }
+  .gallery-item-actions { position: absolute; bottom: 36px; right: 6px; opacity: 0; transition: opacity 0.2s; }
+  .gallery-item:hover .gallery-item-actions { opacity: 1; }
+  .gallery-item { position: relative; }
+  .update-table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 14px; }
+  .update-table th { font-family: var(--font-mono); font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; padding: 0 10px 8px 0; text-align: left; border-bottom: 1px solid var(--border); }
+  .update-table td { padding: 10px 10px 10px 0; border-bottom: 1px solid rgba(109,186,92,0.07); vertical-align: middle; }
+  .update-table tr:last-child td { border-bottom: none; }
+  .update-name { color: var(--text); font-weight: 600; }
+  .update-type { font-family: var(--font-mono); font-size: 10px; color: var(--muted); background: rgba(109,186,92,0.07); padding: 2px 6px; border-radius: 3px; }
+  .update-ver { font-family: var(--font-mono); font-size: 11px; color: var(--muted); max-width: 200px; word-break: break-all; }
+  .update-ver.current { color: var(--text); }
+  .badge-ok  { background: rgba(109,186,92,0.15); color: var(--accent); font-family: var(--font-mono); font-size: 10px; padding: 3px 8px; border-radius: 3px; white-space: nowrap; }
+  .badge-upd { background: rgba(200,168,75,0.15); color: var(--gold); font-family: var(--font-mono); font-size: 10px; padding: 3px 8px; border-radius: 3px; white-space: nowrap; }
+  .badge-unk { background: rgba(122,158,115,0.1); color: var(--muted); font-family: var(--font-mono); font-size: 10px; padding: 3px 8px; border-radius: 3px; white-space: nowrap; }
+  .btn-update { background: transparent; color: var(--gold); border: 1px solid var(--gold); padding: 5px 14px; border-radius: 4px; font-size: 11px; cursor: pointer; white-space: nowrap; font-family: var(--font-mono); }
+  .btn-update:hover { background: rgba(200,168,75,0.1); }
+  .btn-update:disabled { opacity: 0.4; cursor: not-allowed; }
+  .update-feedback { font-size: 11px; color: var(--muted); margin-top: 4px; font-family: var(--font-mono); }
+  .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 800px) { .settings-grid { grid-template-columns: 1fr; } }
+  .setting-row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 18px; }
+  .setting-label { font-family: var(--font-mono); font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  .setting-input { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 8px 12px; border-radius: 4px; font-size: 13px; width: 100%; box-sizing: border-box; font-family: var(--font-mono); }
+  .setting-input:focus { outline: none; border-color: var(--accent); }
+  .setting-hint { font-size: 11px; color: var(--muted); line-height: 1.4; }
+  .nas-row { display: flex; justify-content: space-between; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid var(--border); gap: 12px; }
+  .nas-row:last-child { border-bottom: none; }
+  .nas-key { color: var(--muted); font-family: var(--font-mono); font-size: 11px; white-space: nowrap; padding-top: 1px; }
+  .nas-val { color: var(--text); font-family: var(--font-mono); font-size: 12px; text-align: right; word-break: break-all; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; flex-shrink: 0; }
+  .status-dot.green { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+  .status-dot.red   { background: #e05c5c; box-shadow: 0 0 6px #e05c5c; }
+  .run-log { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 14px; font-family: var(--font-mono); font-size: 11px; color: #a0c878; height: 320px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; margin-top: 14px; line-height: 1.5; }
+  .btn-run { background: var(--accent); color: #0a1a07; border: none; padding: 10px 28px; border-radius: 4px; font-weight: 700; cursor: pointer; font-size: 13px; letter-spacing: 0.5px; }
+  .btn-run:hover { filter: brightness(1.1); }
+  .btn-run:disabled { opacity: 0.45; cursor: not-allowed; filter: none; }
+  .btn-save { background: transparent; color: var(--accent); border: 1px solid var(--accent); padding: 9px 24px; border-radius: 4px; font-weight: 700; cursor: pointer; font-size: 13px; }
+  .btn-save:hover { background: rgba(109,186,92,0.08); }
+  .save-feedback { font-size: 12px; color: var(--accent); margin-left: 12px; opacity: 0; transition: opacity 0.4s; }
+  .save-feedback.show { opacity: 1; }
+  .species-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
+
+  .species-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden; cursor: pointer;
+    transition: transform 0.2s, border-color 0.2s, box-shadow 0.2s;
+  }
+  .species-card:hover { transform: translateY(-3px); border-color: var(--accent); box-shadow: var(--shadow); }
+  .species-img {
+    width: 100%; height: 150px; object-fit: cover;
+    background: var(--bg); display: block;
+  }
+  .species-img-placeholder {
+    width: 100%; height: 150px; background: var(--surface);
+    display: flex; align-items: center; justify-content: center;
+    font-size: 48px;
+  }
+  .species-body { padding: 14px; }
+  .species-common { font-family: var(--font-serif); font-size: 16px; }
+  .species-sci { font-style: italic; font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+  .species-stats { display: flex; gap: 12px; font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+  .species-stats span { color: var(--accent); font-size: 15px; }
+
+  /* ── GALLERY ────────────────────────────────────────── */
+  .gallery-toolbar {
+    display: flex; align-items: center; gap: 12px; margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  .gallery-toolbar select, .gallery-toolbar input {
+    background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); font-family: var(--font-mono); font-size: 12px;
+    padding: 7px 12px; border-radius: var(--radius); outline: none;
+  }
+  .gallery-toolbar select:focus, .gallery-toolbar input:focus { border-color: var(--accent); }
+  .gallery-toolbar label { font-family: var(--font-mono); font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+
+  .gallery-grid { columns: 4; gap: 10px; }
+  @media (max-width: 1200px) { .gallery-grid { columns: 3; } }
+  @media (max-width: 800px)  { .gallery-grid { columns: 2; } }
+
+  .gallery-item {
+    break-inside: avoid; margin-bottom: 10px;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden; cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .gallery-item:hover { border-color: var(--accent); }
+  .gallery-item img { width: 100%; display: block; }
+  .gallery-item-meta {
+    padding: 8px 10px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .gallery-item-name { font-family: var(--font-serif); font-size: 13px; }
+  .quality-bar {
+    height: 3px; border-radius: 2px; background: var(--dim); margin-top: 4px;
+  }
+  .quality-bar-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg, var(--accent), var(--gold)); }
+  .quality-score { font-family: var(--font-mono); font-size: 10px; color: var(--gold); }
+
+  /* ── VIDEOS ─────────────────────────────────────────── */
+  .video-list { display: flex; flex-direction: column; gap: 10px; }
+  .video-item {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px;
+    display: flex; gap: 16px; align-items: flex-start;
+    cursor: pointer; transition: border-color 0.2s;
+  }
+  .video-item:hover { border-color: var(--accent); }
+  .video-thumb {
+    width: 120px; height: 68px; object-fit: cover; border-radius: 4px;
+    background: var(--bg); flex-shrink: 0;
+  }
+  .video-thumb-placeholder {
+    width: 120px; height: 68px; background: var(--dim);
+    border-radius: 4px; flex-shrink: 0; display: flex;
+    align-items: center; justify-content: center; color: var(--muted); font-size: 24px;
+  }
+  .video-info { flex: 1; }
+  .video-name { font-family: var(--font-mono); font-size: 13px; color: var(--text); margin-bottom: 4px; }
+  .video-meta { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+  .video-tags { display: flex; gap: 6px; flex-wrap: wrap; }
+  .tag {
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.3px;
+    padding: 2px 8px; border-radius: 3px;
+    background: rgba(109,186,92,0.1); color: var(--accent);
+    border: 1px solid rgba(109,186,92,0.2);
+  }
+
+  /* ── SPECIES DETAIL MODAL ───────────────────────────── */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.8);
+    z-index: 200; display: none; align-items: flex-start;
+    justify-content: center; padding: 60px 20px; overflow-y: auto;
+    backdrop-filter: blur(6px);
+  }
+  .modal-overlay.open { display: flex; }
+  .modal {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; width: 100%; max-width: 900px;
+    position: relative; animation: fadeIn 0.25s ease;
+    overflow: hidden;
+  }
+  .modal-header {
+    padding: 24px 28px 0;
+    border-bottom: 1px solid var(--border); padding-bottom: 20px;
+    display: flex; align-items: flex-start; justify-content: space-between;
+  }
+  .modal-title { font-family: var(--font-serif); font-size: 26px; }
+  .modal-subtitle { font-style: italic; color: var(--muted); font-size: 15px; }
+  .modal-close {
+    background: none; border: 1px solid var(--border); color: var(--muted);
+    font-size: 18px; width: 36px; height: 36px; border-radius: 50%;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s; flex-shrink: 0;
+  }
+  .modal-close:hover { border-color: var(--accent); color: var(--accent); }
+  .modal-body { padding: 24px 28px; }
+  .modal-chart-wrap { height: 160px; margin-bottom: 20px; }
+
+  /* ── VIDEO PLAYER MODAL ─────────────────────────────── */
+  #videoPlayerModal .modal { max-width: 960px; }
+  #videoPlayer { width: 100%; border-radius: var(--radius); background: #000; }
+  .detection-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 12px; }
+  .detection-chip {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 20px; padding: 4px 12px; font-size: 13px;
+    display: flex; align-items: center; gap: 6px; cursor: pointer;
+    transition: border-color 0.2s;
+  }
+  .detection-chip:hover { border-color: var(--accent); }
+  .detection-chip img { width: 28px; height: 28px; object-fit: cover; border-radius: 50%; }
+
+  /* ── TIMELINE ────────────────────────────────────────── */
+  .timeline-chart-wrap { height: 320px; position: relative; margin-bottom: 28px; }
+  .timeline-controls { display: flex; gap: 24px; margin-bottom: 20px; align-items: flex-end; flex-wrap: wrap; }
+  .timeline-preset { background: transparent; border: 1px solid var(--border); color: var(--muted); padding: 5px 12px; border-radius: 4px; font-family: var(--font-mono); font-size: 11px; cursor: pointer; }
+  .timeline-preset:hover { border-color: var(--accent); color: var(--accent); }
+  .timeline-preset.active { border-color: var(--accent); color: var(--accent); background: rgba(109,186,92,0.1); }
+
+  /* ── SEARCH RESULTS ──────────────────────────────────── */
+  .search-results {
+    position: absolute; top: 100%; right: 0; width: 360px; z-index: 300;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); margin-top: 6px; box-shadow: var(--shadow);
+    overflow: hidden; display: none;
+  }
+  .search-results.open { display: block; }
+  .search-section-title { font-family: var(--font-mono); font-size: 10px; color: var(--muted); padding: 10px 14px 4px; text-transform: uppercase; letter-spacing: 1px; }
+  .search-result-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 8px 14px; cursor: pointer; transition: background 0.15s;
+  }
+  .search-result-item:hover { background: var(--surface); }
+  .search-result-text { font-size: 14px; }
+  .search-result-sub { font-size: 12px; color: var(--muted); font-style: italic; }
+
+  /* ── PAGINATION ──────────────────────────────────────── */
+  .pagination { display: flex; align-items: center; gap: 8px; margin-top: 24px; justify-content: center; }
+  .pagination button {
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    font-family: var(--font-mono); font-size: 12px; padding: 6px 14px;
+    border-radius: var(--radius); cursor: pointer; transition: all 0.2s;
+  }
+  .pagination button:hover { border-color: var(--accent); color: var(--accent); }
+  .pagination button:disabled { opacity: 0.3; cursor: default; }
+  .pagination .page-info { font-family: var(--font-mono); font-size: 12px; color: var(--muted); }
+
+  /* ── SECTION HEADER ──────────────────────────────────── */
+  .section-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 24px;
+  }
+  .section-title { font-family: var(--font-serif); font-size: 28px; }
+  .section-count { font-family: var(--font-mono); font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  /* ── EMPTY STATE ──────────────────────────────────────── */
+  .empty {
+    text-align: center; padding: 60px 20px; color: var(--muted);
+    font-family: var(--font-mono); font-size: 13px;
+  }
+  .empty-icon { font-size: 48px; margin-bottom: 12px; display: block; }
+
+  /* ── LOADING ──────────────────────────────────────────── */
+  .loading { text-align: center; padding: 40px; color: var(--muted); font-family: var(--font-mono); font-size: 12px; }
+  .spinner {
+    display: inline-block; width: 20px; height: 20px;
+    border: 2px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 8px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── SCROLLBAR ────────────────────────────────────────── */
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: var(--bg); }
+  ::-webkit-scrollbar-thumb { background: var(--dim); border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- HEADER -->
+  <header>
+    <div class="logo">
+      <span class="logo-icon">🦌</span>
+      <div>
+        Wildlife Monitor
+        <span class="logo-sub">Field Research Station</span>
+      </div>
+    </div>
+
+    <nav>
+      <button class="active" data-tab="dashboard">Dashboard</button>
+      <button data-tab="species">Species</button>
+      <button data-tab="gallery">Gallery</button>
+      <button data-tab="videos">Videos</button>
+      <button data-tab="timeline">Trends</button>
+      <button data-tab="settings">Settings</button>
+    </nav>
+
+    <div class="search-bar" style="position:relative">
+      <span class="search-icon">🔍</span>
+      <input id="globalSearch" type="text" placeholder="Search species, videos...">
+      <div class="search-results" id="searchResults"></div>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- ── DASHBOARD ───────────────────────────────────── -->
+    <section class="section active" id="tab-dashboard">
+      <div class="stat-grid" id="statGrid">
+        <div class="loading"><span class="spinner"></span>Loading…</div>
+      </div>
+      <div class="chart-grid">
+        <div class="card">
+          <div class="card-title">Activity — Last 7 Days</div>
+          <div class="chart-wrap"><canvas id="activityChart"></canvas></div>
+        </div>
+        <div class="card">
+          <div class="card-title">Top Species</div>
+          <div class="chart-wrap"><canvas id="topSpeciesChart"></canvas></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-title">Recent Detections</div>
+        <div id="recentList" class="sighting-list" style="margin-top:12px"></div>
+      </div>
+    </section>
+
+    <!-- ── SPECIES ──────────────────────────────────────── -->
+    <section class="section" id="tab-species">
+      <div class="section-header">
+        <div>
+          <div class="section-title">Species</div>
+          <div class="section-count" id="speciesCount"></div>
+        </div>
+      </div>
+      <div class="species-grid" id="speciesGrid">
+        <div class="loading"><span class="spinner"></span>Loading…</div>
+      </div>
+    </section>
+
+    <!-- ── GALLERY ──────────────────────────────────────── -->
+    <section class="section" id="tab-gallery">
+      <div class="section-header">
+        <div>
+          <div class="section-title">Image Gallery</div>
+          <div class="section-count" id="galleryCount"></div>
+        </div>
+      </div>
+      <div class="gallery-toolbar">
+        <div>
+          <label>Species</label><br>
+          <select id="gallerySpeciesFilter"><option value="">All Species</option></select>
+        </div>
+        <div>
+          <label>Sort by</label><br>
+          <select id="gallerySort">
+            <option value="quality">Best Quality First</option>
+            <option value="recent">Most Recent First</option>
+          </select>
+        </div>
+      </div>
+      <div class="gallery-grid" id="galleryGrid"></div>
+      <div class="pagination" id="galleryPagination"></div>
+    </section>
+
+    <!-- ── VIDEOS ───────────────────────────────────────── -->
+    <section class="section" id="tab-videos">
+      <div class="section-header">
+        <div>
+          <div class="section-title">Videos</div>
+          <div class="section-count" id="videosCount"></div>
+        </div>
+        <div id="videoDateBadge" style="display:none;align-items:center;gap:8px">
+          <span style="font-family:var(--font-mono);font-size:11px;color:var(--gold);background:rgba(200,168,75,0.12);padding:4px 10px;border-radius:4px" id="videoDateLabel"></span>
+          <button onclick="clearVideoDateFilter()" style="background:none;border:none;color:var(--muted);cursor:pointer;font-size:16px;line-height:1;padding:0" title="Clear date filter">✕</button>
+        </div>
+      </div>
+      <div class="gallery-toolbar">
+        <div>
+          <label>Species</label><br>
+          <select id="videoSpeciesFilter"><option value="">All Species</option></select>
+        </div>
+        <div>
+          <label>Camera</label><br>
+          <select id="videoCameraFilter"><option value="">All Cameras</option></select>
+        </div>
+        <div>
+          <label>Search</label><br>
+          <input type="text" id="videoSearch" placeholder="filename or species…" style="width:200px">
+        </div>
+      </div>
+      <div class="video-list" id="videoList"></div>
+      <div class="pagination" id="videoPagination"></div>
+    </section>
+
+    <!-- ── TIMELINE ─────────────────────────────────────── -->
+    <section class="section" id="tab-timeline">
+      <div class="section-header">
+        <div class="section-title">Detection Trends</div>
+      </div>
+      <div class="timeline-controls" style="flex-wrap:wrap;gap:10px;align-items:flex-end">
+        <div>
+          <label style="font-family:var(--font-mono);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:6px">Quick Range</label>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button class="timeline-preset active" data-days="30">30 days</button>
+            <button class="timeline-preset" data-days="90">90 days</button>
+            <button class="timeline-preset" data-days="365">1 year</button>
+            <button class="timeline-preset" data-days="730">2 years</button>
+            <button class="timeline-preset" data-days="0">All time</button>
+          </div>
+        </div>
+        <div>
+          <label style="font-family:var(--font-mono);font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:6px">Custom Range</label>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input class="setting-input" type="date" id="timelineFrom" style="width:150px">
+            <span style="color:var(--muted);font-size:12px">→</span>
+            <input class="setting-input" type="date" id="timelineTo" style="width:150px">
+            <button class="btn-save" onclick="applyCustomTimeline()" style="padding:7px 16px">Apply</button>
+          </div>
+        </div>
+        <div id="timelineGranularityLabel" style="font-family:var(--font-mono);font-size:11px;color:var(--muted);align-self:flex-end;padding-bottom:2px"></div>
+      </div>
+      <div class="card" style="margin-bottom:20px">
+        <div class="card-title">Daily Detections by Species</div>
+        <div class="timeline-chart-wrap"><canvas id="timelineChart"></canvas></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Species Activity Heatmap</div>
+        <div id="heatmapGrid" style="margin-top:12px;overflow-x:auto"></div>
+      </div>
+    </section>
+
+    <!-- ── SETTINGS ─────────────────────────────────────── -->
+    <section class="section" id="tab-settings">
+      <div class="section-header">
+        <div class="section-title">Settings</div>
+      </div>
+
+      <div class="settings-grid">
+
+        <!-- Processing Settings -->
+        <div class="card">
+          <div class="card-title">Processing Settings</div>
+          <div style="margin-top:18px">
+            <div class="setting-row">
+              <label class="setting-label">Hours Lookback</label>
+              <input class="setting-input" type="number" id="setHours" min="1" max="8760" style="width:120px">
+              <span class="setting-hint">Scan videos modified within the last N hours (default: 24). Use a larger value on first run to catch existing footage. For example: 1 Week = 168 hrs, 1 Month = 730 hrs, 1 Year = 8760 hrs.</span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">Frame Sample Rate</label>
+              <input class="setting-input" type="number" id="setSampleRate" min="1" max="120" style="width:120px">
+              <span class="setting-hint">Extract 1 frame per N frames. Lower = more thorough but slower. Default: 30 (~1 fps at 30 fps video).</span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">Detection Threshold (0.05 – 0.95)</label>
+              <input class="setting-input" type="number" id="setThreshold" min="0.05" max="0.95" step="0.05" style="width:120px">
+              <span class="setting-hint">MegaDetector confidence cutoff. Lower catches more but increases false positives. Default: 0.2.</span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">Country Code</label>
+              <input class="setting-input" type="text" id="setCountry" maxlength="2" placeholder="US" style="width:80px;text-transform:uppercase">
+              <span class="setting-hint">ISO country code for SpeciesNet geographic filtering (e.g. US, GB, AU, CA).</span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">State / Region Code</label>
+              <input class="setting-input" type="text" id="setAdmin1Region" maxlength="10" placeholder="US-UT" style="width:120px;text-transform:uppercase">
+              <span class="setting-hint">Narrows species candidates to those with occurrence records in your state or province — eliminates species that don't live in your area (e.g. European deer in North America). Format: country-region (e.g. US-UT, US-CA, US-TX, GB-ENG). Leave blank for country-level filtering only.</span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">Camera Filename Date Format</label>
+              <select class="setting-input" id="setFilenameDateFormat" style="width:260px">
+                <option value="auto">Auto-detect (recommended)</option>
+                <option value="YYYYMMDDHHMMSS">YYYYMMDDHHMMSS — e.g. Camera_20250807132613.mp4</option>
+                <option value="YYYYMMDD_HHMMSS">YYYYMMDD_HHMMSS — e.g. Camera_20250807_132613.mp4</option>
+                <option value="YYYY-MM-DD_HH-MM-SS">YYYY-MM-DD_HH-MM-SS — e.g. Camera_2025-08-07_13-26-13.mp4</option>
+                <option value="DD-MM-YYYY_HHMMSS">DD-MM-YYYY_HHMMSS — e.g. Camera_07-08-2025_132613.mp4</option>
+                <option value="MM-DD-YYYY_HHMMSS">MM-DD-YYYY_HHMMSS — e.g. Camera_08-07-2025_132613.mp4</option>
+                <option value="YYYYMMDD">YYYYMMDD only — e.g. Camera_20250807.mp4</option>
+              </select>
+              <span class="setting-hint">The date format your cameras embed in filenames. Used to correctly filter videos by date and set recorded_at in the database. Auto-detect tries all known patterns.</span>
+            </div>
+                <input type="checkbox" id="setSkipSpeciesnet" style="width:auto;accent-color:var(--accent);transform:scale(1.2)">
+                Skip SpeciesNet (animal detection only — no species identification)
+              </label>
+            </div>
+            <div style="margin-top:22px;display:flex;align-items:center">
+              <button class="btn-save" onclick="saveSettings()">Save Settings</button>
+              <span class="save-feedback" id="saveFeedback">✓ Settings saved</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- NAS Connection -->
+        <div class="card">
+          <div class="card-title">NAS Connection</div>
+          <div id="nasStatus" style="margin-top:16px">
+            <div class="loading"><span class="spinner"></span>Loading…</div>
+          </div>
+          <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);line-height:1.6">
+            To change NAS settings, run
+            <code style="color:var(--accent);background:rgba(109,186,92,0.08);padding:2px 6px;border-radius:3px">./nas_connect.sh</code>
+            from the terminal on the host machine.
+          </div>
+        </div>
+
+      </div>
+
+      <!-- Retention Policy -->
+      <div class="card" style="margin-top:20px">
+        <div class="card-title">Retention Policy</div>
+        <p style="font-size:12px;color:var(--muted);margin:10px 0 16px;line-height:1.6">
+          Set limits for how long video files are kept on the NAS. DB records (detections, species,
+          timestamps) are always kept — only the video files are deleted. The first limit hit triggers
+          a purge. Set to 0 to disable a limit.
+        </p>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+          <div>
+            <div style="font-family:var(--font-mono);font-size:11px;color:var(--accent);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border)">
+              Blank Videos <span style="color:var(--muted);font-size:10px">(no animal/person — files deleted immediately)</span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">Delete records after (days)</label>
+              <input class="setting-input" type="number" id="setBlankDays" min="0" style="width:100px">
+              <span class="setting-hint">Remove DB records for blank videos older than N days. Files are already deleted by the processor — this cleans up the database. Default: 90.</span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">Storage limit (GB)</label>
+              <input class="setting-input" type="number" id="setBlankGb" min="0" step="1" style="width:100px">
+              <span class="setting-hint">Purge oldest blank DB records when the recorded total size of blank footage exceeds this limit. Default: 20 GB.</span>
+            </div>
+          </div>
+          <div>
+            <div style="font-family:var(--font-mono);font-size:11px;color:var(--accent);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border)">
+              Kept Videos <span style="color:var(--muted);font-size:10px">(animal/person detected)</span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">Delete after (days)</label>
+              <input class="setting-input" type="number" id="setKeptDays" min="0" style="width:100px">
+              <span class="setting-hint">e.g. 730 = keep 2 years of footage. Default: 730. Set 0 to keep forever.</span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">Delete when exceeds (GB)</label>
+              <input class="setting-input" type="number" id="setKeptGb" min="0" step="10" style="width:100px">
+              <span class="setting-hint">Delete oldest kept videos when total exceeds this size. Default: 500 GB.</span>
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <button class="btn-save" onclick="saveSettings()">Save Retention Settings</button>
+          <button class="btn-save" style="background:transparent;color:var(--gold);border-color:var(--gold)"
+                  onclick="previewPurge()">Preview Purge</button>
+          <span class="save-feedback" id="retentionFeedback"></span>
+        </div>
+        <div id="purgePreview" style="display:none;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)"></div>
+      </div>
+
+      <!-- Storage Stats -->
+      <div class="card" style="margin-top:20px">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+          <div class="card-title" style="margin:0">Storage Usage</div>
+          <button class="btn-save" onclick="loadStorageStats()">↻ Refresh</button>
+        </div>
+        <div id="storageStats" style="margin-top:16px">
+          <div class="loading"><span class="spinner"></span>Loading…</div>
+        </div>
+      </div>
+
+      <!-- Software & Models -->
+      <div class="card" style="margin-top:20px">
+        <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
+          <div class="card-title" style="margin:0">Software &amp; Models</div>
+          <button class="btn-save" id="checkUpdatesBtn" onclick="checkUpdates()">↻ Check for Updates</button>
+        </div>
+        <p style="font-size:12px;color:var(--muted);margin:10px 0 0;line-height:1.6">
+          Checks PyPI for the latest pip package versions and compares locally cached model files
+          against the current recommended versions. Model updates clear the local cache —
+          the new model downloads automatically on the next processing run.
+        </p>
+        <div id="updatesContent">
+          <div style="font-size:12px;color:var(--muted);margin-top:16px">Click "Check for Updates" to scan.</div>
+        </div>
+      </div>
+
+      <!-- Backfill -->
+      <div class="card" style="margin-top:20px">
+        <div class="card-title">Backfill Historical Footage</div>
+        <p style="font-size:12px;color:var(--muted);margin:10px 0 16px;line-height:1.6">
+          Process footage from a specific date range. Uses the same country and region settings
+          above — make sure those are saved before running. The log streams in real time below.
+        </p>
+        <div style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap">
+          <div>
+            <label class="setting-label">From</label>
+            <input class="setting-input" type="date" id="backfillFrom" style="width:160px;margin-top:6px">
+          </div>
+          <div>
+            <label class="setting-label">To</label>
+            <input class="setting-input" type="date" id="backfillTo" style="width:160px;margin-top:6px">
+          </div>
+          <button class="btn-run" id="backfillBtn" onclick="triggerBackfill()" style="margin-bottom:1px">▶ Run Backfill</button>
+          <span id="backfillStatusLabel" style="font-size:12px;color:var(--muted)"></span>
+        </div>
+        <div id="backfillLog" class="run-log" style="display:none"></div>
+      </div>
+
+      <!-- Manual Run -->
+      <div class="card" style="margin-top:20px">
+        <div class="card-title">Manual Run</div>
+        <p style="font-size:13px;color:var(--muted);margin:10px 0 16px">
+          Trigger a sync + detection run immediately using the settings above.
+          Output streams in real time below.
+        </p>
+        <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+          <button class="btn-run" id="runBtn" onclick="triggerRun()">▶ Run Now</button>
+          <span id="runStatusLabel" style="font-size:12px;color:var(--muted)"></span>
+        </div>
+        <div id="runLog" class="run-log" style="display:none"></div>
+      </div>
+
+    </section>
+
+  </main>
+
+  <!-- SPECIES DETAIL MODAL -->
+  <div class="modal-overlay" id="speciesModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div>
+          <div class="modal-title" id="modalTitle"></div>
+          <div class="modal-subtitle" id="modalSubtitle"></div>
+        </div>
+        <button class="modal-close" onclick="closeModal('speciesModal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div class="card" style="margin-bottom:16px">
+          <div class="card-title">Detection Trend</div>
+          <div class="modal-chart-wrap"><canvas id="speciesTrendChart"></canvas></div>
+        </div>
+        <div class="card" style="margin-bottom:16px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+            <div class="card-title" style="margin:0">Best Images</div>
+            <button class="btn-correct" id="modalViewGalleryBtn">View all in Gallery →</button>
+          </div>
+          <div class="gallery-grid" id="modalGallery" style="margin-top:12px"></div>
+        </div>
+        <div class="card">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">
+            <div class="card-title" style="margin:0">Videos with this species</div>
+            <button class="btn-correct" id="modalViewVideosBtn">View all Videos →</button>
+          </div>
+          <div class="video-list" id="modalVideoList" style="margin-top:12px"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- VIDEO PLAYER MODAL -->
+  <div class="modal-overlay" id="videoPlayerModal">
+    <div class="modal">
+      <div class="modal-header">
+        <div>
+          <div class="modal-title" id="videoModalTitle"></div>
+          <div class="modal-subtitle" id="videoModalMeta"></div>
+        </div>
+        <button class="modal-close" onclick="closeModal('videoPlayerModal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="videoPlayerWrap">
+          <!-- Populated by openVideo() — single or dual layout depending on pairing -->
+        </div>
+        <div class="detection-chips" id="detectionChips"></div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────────
+const state = {
+  galleryPage: 1, gallerySpecies: '', gallerySort: 'quality',
+  videoPage: 1, videoSpecies: '', videoSearch: '', videoCamera: '',
+  videoDateFrom: '', videoDateTo: '',
+  timelineDays: 30, timelineDateFrom: '', timelineDateTo: '',
+  speciesList: [],
+};
+
+let activityChartInst, topSpeciesChartInst, timelineChartInst, speciesTrendChartInst;
+
+// ── Navigation helpers ────────────────────────────────────────────────────────
+function switchTab(tab) {
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  const btn = document.querySelector(`nav button[data-tab="${tab}"]`);
+  if (btn) btn.classList.add('active');
+  const section = document.getElementById('tab-' + tab);
+  if (section) section.classList.add('active');
+}
+
+function clearVideoDateFilter() {
+  state.videoDateFrom = '';
+  state.videoDateTo   = '';
+  state.videoPage     = 1;
+  loadVideos();
+}
+
+function navigateToVideos({ species, dateFrom, dateTo, search } = {}) {
+  // Reset video filters then apply new ones
+  state.videoPage    = 1;
+  state.videoSpecies = species  || '';
+  state.videoDateFrom = dateFrom || '';
+  state.videoDateTo   = dateTo   || '';
+  state.videoSearch  = search   || '';
+  // Update filter UI controls to reflect the new state
+  const specSel = document.getElementById('videoSpeciesFilter');
+  if (specSel) specSel.value = state.videoSpecies;
+  const searchEl = document.getElementById('videoSearch');
+  if (searchEl) searchEl.value = state.videoSearch;
+  switchTab('videos');
+  loadCameras();
+  loadVideos();
+}
+
+// ── Fetch helpers ─────────────────────────────────────────────────────────────
+async function api(path) {
+  const r = await fetch('/api' + path);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+function cropUrl(name)  { return name ? `/media/crops/${name}` : null; }
+function thumbUrl(name) { return name ? `/media/thumbnails/${name}` : null; }
+
+function fmtDate(dt) {
+  if (!dt) return '—';
+  return new Date(dt).toLocaleDateString('en-GB', { day:'2-digit', month:'short', year:'numeric' });
+}
+function fmtDuration(s) {
+  if (!s) return '—';
+  const m = Math.floor(s/60), sec = Math.floor(s%60);
+  return `${m}:${String(sec).padStart(2,'0')}`;
+}
+
+// ── Navigation ────────────────────────────────────────────────────────────────
+document.querySelectorAll('nav button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    switchTab(btn.dataset.tab);
+    const tab = btn.dataset.tab;
+    if (tab === 'species')  loadSpecies();
+    if (tab === 'gallery')  loadGallery();
+    if (tab === 'videos')   { loadCameras(); loadVideos(); }
+    if (tab === 'timeline') loadTimeline();
+    if (tab === 'settings') { loadSettings(); loadStorageStats(); }
+  });
+});
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+
+// Shared species color palette — used by both the activity stacked bar and
+// the top species donut so the same species always gets the same color.
+const SPECIES_PALETTE = ['#6dba5c','#c8a84b','#e07b2a','#4fa3d4','#9b59b6','#e05c5c','#2abfbf','#f0c040'];
+
+async function loadDashboard() {
+  // Fetch stats and species list in parallel — species needed for recent detections links
+  const [data] = await Promise.all([
+    api('/stats'),
+    state.speciesList.length
+      ? Promise.resolve()
+      : api('/species').then(s => { state.speciesList = s; }).catch(() => {}),
+  ]);
+
+  // Stat cards — clicking navigates to the relevant tab/filter
+  const statCards = [
+    { value: data.total_videos,   label: 'Total Videos Scanned', action: null },
+    { value: data.kept_videos,    label: 'Videos Kept',          action: () => navigateToVideos() },
+    { value: data.unique_species, label: 'Unique Species',       action: () => { switchTab('species'); loadSpecies(); } },
+    { value: data.animal_events,  label: 'Animal Events',        action: () => navigateToVideos() },
+    { value: data.person_events,  label: 'Person Events',        action: () => navigateToVideos({ search: '' }) },
+    { value: data.total_crops,    label: 'Saved Crops',          action: () => { switchTab('gallery'); loadGallery(); } },
+  ];
+  document.getElementById('statGrid').innerHTML = statCards.map((s, i) => `
+    <div class="stat-card${s.action ? ' stat-card-link' : ''}" ${s.action ? `onclick="__statAction(${i})"` : ''}>
+      <div class="stat-value">${s.value}</div>
+      <div class="stat-label">${s.label}</div>
+    </div>
+  `).join('');
+  // Store actions for onclick (can't pass functions in HTML strings)
+  window.__statAction = (i) => statCards[i].action && statCards[i].action();
+
+  // ── Activity stacked bar chart (detections by species per day) ──────────────
+  const rawActivity = (data.activity_7d_by_species || []).filter(r => r.count > 0 && r.label);
+
+  // Build the full 7-day label array regardless of whether there's activity
+  // Use local date arithmetic to avoid UTC offset shifting the day boundary
+  const allDays = [];
+  for (let i = 6; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const y = d.getFullYear();
+    const mo = String(d.getMonth() + 1).padStart(2, '0');
+    const dy = String(d.getDate()).padStart(2, '0');
+    allDays.push(`${y}-${mo}-${dy}`);
+  }
+  const allSpecies  = [...new Set(rawActivity.map(r => r.species))];
+
+  // Assign colors: top_species order first (matches donut), then extras
+  const topOrder = (data.top_species || []).map(s => s.common_name || s.label);
+  const speciesOrder = [
+    ...topOrder.filter(n => allSpecies.includes(n)),
+    ...allSpecies.filter(n => !topOrder.includes(n)),
+  ];
+
+  // Build a lookup: day → species → count
+  const lookup = {};
+  rawActivity.forEach(r => {
+    if (!lookup[r.day]) lookup[r.day] = {};
+    lookup[r.day][r.species] = (lookup[r.day][r.species] || 0) + r.count;
+  });
+
+  // One dataset per species
+  const activityDatasets = speciesOrder.map((sp, i) => ({
+    label:           sp,
+    data:            allDays.map(d => lookup[d]?.[sp] || 0),
+    backgroundColor: SPECIES_PALETTE[i % SPECIES_PALETTE.length],
+    borderColor:     '#1c2b1e',
+    borderWidth:     1,
+    borderRadius:    2,
+  }));
+
+  if (activityChartInst) activityChartInst.destroy();
+  activityChartInst = new Chart(document.getElementById('activityChart'), {
+    type: 'bar',
+    data: { labels: allDays, datasets: activityDatasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: {
+        x: { stacked: true, ticks: { color: '#7a9e73', font: { family: 'Space Mono', size: 10 } }, grid: { color: 'rgba(109,186,92,0.06)' } },
+        y: { stacked: true, ticks: { color: '#7a9e73', font: { family: 'Space Mono', size: 10 }, stepSize: 1 }, grid: { color: 'rgba(109,186,92,0.06)' }, beginAtZero: true },
+      },
+      plugins: {
+        legend: { position: 'bottom', labels: { color: '#7a9e73', font: { family: 'Space Mono', size: 10 }, boxWidth: 12, padding: 16 } },
+        tooltip: {
+          callbacks: {
+            footer: (items) => {
+              const total = items.reduce((s, i) => s + i.parsed.y, 0);
+              return `Total: ${total} — click to view videos`;
+            }
+          }
+        }
+      },
+      onClick: (evt, elements) => {
+        if (!elements.length) return;
+        const day = allDays[elements[0].index];
+        if (day) navigateToVideos({ dateFrom: day, dateTo: day });
+      },
+      onHover: (evt, elements) => {
+        evt.native.target.style.cursor = elements.length ? 'pointer' : 'default';
+      },
+    },
+  });
+
+  // ── Top species donut — uses same palette in same order ─────────────────────
+  const sp = data.top_species || [];
+  if (topSpeciesChartInst) topSpeciesChartInst.destroy();
+  topSpeciesChartInst = new Chart(document.getElementById('topSpeciesChart'), {
+    type: 'doughnut',
+    data: {
+      labels: sp.map(s => s.common_name || s.label),
+      datasets: [{ data: sp.map(s => s.cnt),
+        backgroundColor: sp.map((_, i) => SPECIES_PALETTE[i % SPECIES_PALETTE.length]),
+        borderColor: '#1c2b1e', borderWidth: 2 }]
+    },
+    options: {
+      responsive: true, maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          position: window.innerWidth <= 700 ? 'bottom' : 'right',
+          labels: { color: '#7a9e73', font: { family: 'Space Mono', size: 10 }, boxWidth: 12 }
+        },
+        tooltip: { callbacks: { label: (ctx) => ` ${ctx.label}: ${ctx.parsed} videos` } },
+      },
+      onClick: (evt, elements) => {
+        if (!elements.length) return;
+        const idx = elements[0].index;
+        const clickedLabel = sp[idx]?.label;
+        if (clickedLabel) openSpecies(clickedLabel);
+      },
+      onHover: (evt, elements) => {
+        evt.native.target.style.cursor = elements.length ? 'pointer' : 'default';
+      },
+    },
+  });
+
+  // Recent detections (last 10 kept videos)
+  const vids = await api('/videos?per_page=10&has_species=true');
+  document.getElementById('recentList').innerHTML = vids.items.length ? vids.items.map(v => {
+    // Build clickable species name chips
+    const speciesNames = v.species_list
+      ? v.species_list.split(',').filter(Boolean).slice(0,3)
+      : [];
+    const speciesHtml = speciesNames.length
+      ? speciesNames.map(name => {
+          const trimmed = name.trim();
+          // Find the full label for this common name so we can open the species modal
+          const match = state.speciesList.find(s => (s.common_name||'').toLowerCase() === trimmed.toLowerCase());
+          return match
+            ? `<span class="species-chip" onclick="event.stopPropagation();openSpecies('${escHtml(match.label)}')">${escHtml(trimmed)}</span>`
+            : `<span>${escHtml(trimmed)}</span>`;
+        }).join(', ')
+      : (v.has_animal ? 'Animal detected' : 'Person detected');
+    return `
+    <div class="sighting-item" onclick="openVideo(${v.id})">
+      ${thumbUrl(v.thumbnail_path)
+        ? `<img class="sighting-thumb" src="${thumbUrl(v.thumbnail_path)}" loading="lazy">`
+        : `<div class="sighting-thumb-placeholder">🎥</div>`}
+      <div class="sighting-info">
+        <div class="sighting-name">${speciesHtml}</div>
+        <div class="sighting-meta">${escHtml(v.filename)} · ${fmtDate(v.recorded_at)} · ${fmtDuration(v.duration_secs)}</div>
+      </div>
+      ${v.has_animal ? '<span class="badge badge-animal">Animal</span>' : ''}
+      ${v.has_person ? '<span class="badge badge-person">Person</span>' : ''}
+    </div>`;
+  }).join('') : '<div class="empty"><span class="empty-icon">📷</span>No detections yet. Run the processor to get started.</div>';
+}
+
+// ── Species ───────────────────────────────────────────────────────────────────
+async function loadSpecies() {
+  const grid = document.getElementById('speciesGrid');
+  grid.innerHTML = '<div class="loading"><span class="spinner"></span>Loading…</div>';
+  const data = await api('/species');
+  state.speciesList = data;
+  populateSpeciesFilters(data);
+
+  document.getElementById('speciesCount').textContent = `${data.length} species identified`;
+  if (!data.length) {
+    grid.innerHTML = '<div class="empty"><span class="empty-icon">🔭</span>No species identified yet.</div>';
+    return;
+  }
+
+  grid.innerHTML = data.map(s => `
+    <div class="species-card" onclick="openSpecies('${escHtml(s.label)}')">
+      ${s.best_crop
+        ? `<img class="species-img" src="${cropUrl(s.best_crop)}" loading="lazy" alt="${escHtml(s.common_name||s.label)}">`
+        : `<div class="species-img-placeholder">🦎</div>`}
+      <div class="species-body">
+        <div class="species-common">
+          ${escHtml(s.common_name || s.label)}
+          ${s.has_correction ? ' <span class="badge-corrected">✏ corrected</span>' : ''}
+        </div>
+        <div class="species-sci">${escHtml(s.scientific_name || '')}</div>
+        <div class="species-stats">
+          <div><span>${s.detection_count}</span><br>detections</div>
+          <div><span>${s.video_count}</span><br>videos</div>
+          <div style="margin-left:auto;text-align:right;font-size:10px;color:var(--muted)">Last seen<br>${fmtDate(s.last_seen)}</div>
+        </div>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function openSpecies(label) {
+  document.getElementById('speciesModal').classList.add('open');
+  document.getElementById('modalGallery').innerHTML = '<div class="loading"><span class="spinner"></span></div>';
+  document.getElementById('modalVideoList').innerHTML = '';
+  document.getElementById('modalTitle').textContent = '…';
+
+  const d = await api(`/species/${encodeURIComponent(label)}`);
+  document.getElementById('modalTitle').textContent = d.info.common_name || label;
+  document.getElementById('modalSubtitle').textContent = d.info.scientific_name || label;
+
+  // Wire "View all" buttons — close modal and navigate
+  document.getElementById('modalViewGalleryBtn').onclick = () => {
+    closeModal('speciesModal');
+    state.gallerySpecies = label; state.galleryPage = 1;
+    const sel = document.getElementById('gallerySpeciesFilter');
+    if (sel) sel.value = label;
+    switchTab('gallery'); loadGallery();
+  };
+  document.getElementById('modalViewVideosBtn').onclick = () => {
+    closeModal('speciesModal');
+    navigateToVideos({ species: label });
+  };
+
+  // Trend chart
+  if (speciesTrendChartInst) speciesTrendChartInst.destroy();
+  speciesTrendChartInst = new Chart(document.getElementById('speciesTrendChart'), {
+    type: 'line',
+    data: {
+      labels: d.trend.map(t => t.day),
+      datasets: [{ data: d.trend.map(t => t.count), borderColor: '#6dba5c', backgroundColor: 'rgba(109,186,92,0.1)', fill: true, tension: 0.4, pointRadius: 3 }]
+    },
+    options: chartOpts({ legend: false }),
+  });
+
+  // Crops gallery
+  document.getElementById('modalGallery').innerHTML = d.crops.length
+    ? d.crops.slice(0,24).map(c => `
+        <div class="gallery-item" onclick="openVideo(${c.video_id})">
+          <img src="${cropUrl(c.crop_path)}" loading="lazy">
+          <div class="gallery-item-meta">
+            <div>
+              <div class="quality-bar"><div class="quality-bar-fill" style="width:${c.quality_score||0}%"></div></div>
+            </div>
+            <div class="quality-score">${Math.round(c.quality_score||0)}</div>
+          </div>
+        </div>
+      `).join('')
+    : '<div style="color:var(--muted);font-size:13px">No images available.</div>';
+
+  // Videos
+  document.getElementById('modalVideoList').innerHTML = d.videos.length
+    ? d.videos.map(v => videoItemHtml(v)).join('')
+    : '<div style="color:var(--muted);font-size:13px">No videos.</div>';
+}
+
+// ── Gallery ───────────────────────────────────────────────────────────────────
+async function loadGallery(page) {
+  if (page !== undefined) state.galleryPage = page;
+  const grid = document.getElementById('galleryGrid');
+  grid.innerHTML = '<div class="loading"><span class="spinner"></span>Loading…</div>';
+
+  const p = new URLSearchParams();
+  if (state.gallerySpecies) p.set('species', state.gallerySpecies);
+  p.set('sort', state.gallerySort);
+  p.set('page', state.galleryPage);
+  p.set('per_page', 40);
+
+  const data = await api('/gallery?' + p);
+  document.getElementById('galleryCount').textContent = `${data.total} images`;
+
+  if (!data.items.length) {
+    grid.innerHTML = '<div class="empty"><span class="empty-icon">📷</span>No images yet.</div>';
+    document.getElementById('galleryPagination').innerHTML = '';
+    return;
+  }
+
+  grid.innerHTML = data.items.map(item => {
+    const correctedBadge = item.has_correction
+      ? `<span class="badge-corrected">✏ corrected</span>`
+      : '';
+    const displayName = item.common_name || item.label || 'Unknown';
+    const aiName = (!item.has_correction && item.ai_common_name) ? '' :
+      (item.ai_common_name && item.ai_common_name !== item.common_name
+        ? `<span style="color:var(--muted);font-size:10px">AI: ${escHtml(item.ai_common_name)}</span>`
+        : '');
+    return `
+    <div class="gallery-item" id="gitem-${item.detection_id}">
+      <img src="${cropUrl(item.crop_path)}" loading="lazy" alt="${escHtml(displayName)}"
+           onclick="openVideo(${item.video_id})">
+      <div class="gallery-item-actions">
+        <button class="btn-correct" onclick="toggleCorrectForm(${item.detection_id},'${escHtml(displayName)}','${escHtml(item.scientific_name||'')}')">✏</button>
+      </div>
+      <div class="gallery-item-meta">
+        <div>
+          <div class="gallery-item-name">${escHtml(displayName)} ${correctedBadge}</div>
+          ${aiName}
+          <div class="quality-bar"><div class="quality-bar-fill" style="width:${item.quality_score||0}%"></div></div>
+        </div>
+        <div class="quality-score">${Math.round(item.quality_score||0)}</div>
+      </div>
+      <div class="correction-form" id="cform-${item.detection_id}">
+        <div style="font-size:11px;color:var(--muted);margin-bottom:8px">Correct species identification</div>
+        <input type="text" placeholder="Common name (e.g. Mule Deer)"
+               id="cname-${item.detection_id}" value="${escHtml(item.common_name||'')}">
+        <input type="text" placeholder="Scientific name (e.g. Odocoileus hemionus)"
+               id="csci-${item.detection_id}" value="${escHtml(item.scientific_name||'')}">
+        <div style="display:flex;gap:8px">
+          <button class="btn-correct" onclick="submitCorrection(${item.detection_id})">Save</button>
+          <button class="btn-correct" style="color:var(--muted);border-color:var(--muted)"
+                  onclick="toggleCorrectForm(${item.detection_id})">Cancel</button>
+        </div>
+      </div>
+    </div>
+  `}).join('');
+
+  renderPagination('galleryPagination', data.page, data.pages, p => loadGallery(p));
+}
+
+document.getElementById('gallerySpeciesFilter').addEventListener('change', e => {
+  state.gallerySpecies = e.target.value; state.galleryPage = 1; loadGallery();
+});
+document.getElementById('gallerySort').addEventListener('change', e => {
+  state.gallerySort = e.target.value; state.galleryPage = 1; loadGallery();
+});
+
+// ── Videos ────────────────────────────────────────────────────────────────────
+async function loadVideos(page) {
+  if (page !== undefined) state.videoPage = page;
+  const list = document.getElementById('videoList');
+  list.innerHTML = '<div class="loading"><span class="spinner"></span>Loading…</div>';
+
+  const p = new URLSearchParams();
+  if (state.videoSpecies)  p.set('species',   state.videoSpecies);
+  if (state.videoCamera)   p.set('camera',    state.videoCamera);
+  if (state.videoSearch)   p.set('search',    state.videoSearch);
+  if (state.videoDateFrom) p.set('date_from', state.videoDateFrom);
+  if (state.videoDateTo)   p.set('date_to',   state.videoDateTo);
+  p.set('page', state.videoPage);
+  p.set('per_page', 20);
+
+  const data = await api('/videos?' + p);
+  document.getElementById('videosCount').textContent = `${data.total} videos kept`;
+  const badge = document.getElementById('videoDateBadge');
+  const dateLabel = document.getElementById('videoDateLabel');
+  if (state.videoDateFrom || state.videoDateTo) {
+    const from = state.videoDateFrom || '…';
+    const to   = state.videoDateTo   || '…';
+    dateLabel.textContent = from === to ? `📅 ${from}` : `📅 ${from} → ${to}`;
+    badge.style.display = 'flex';
+  } else {
+    badge.style.display = 'none';
+  }
+
+  if (!data.items.length) {
+    list.innerHTML = '<div class="empty"><span class="empty-icon">🎥</span>No videos found.</div>';
+    document.getElementById('videoPagination').innerHTML = '';
+    return;
+  }
+
+  list.innerHTML = data.items.map(v => videoItemHtml(v)).join('');
+  renderPagination('videoPagination', data.page, data.pages, p => loadVideos(p));
+}
+
+function videoItemHtml(v) {
+  const tags = (v.species_list || '').split(',').filter(Boolean).slice(0,5);
+  const cameraLabel = v.camera_name
+    ? `<span class="tag" style="background:rgba(200,168,75,0.12);color:var(--gold);border-color:rgba(200,168,75,0.25)">📷 ${escHtml(v.camera_name)}</span>`
+    : '';
+  const lensLabel = v.paired_video_id
+    ? `<span class="tag" style="background:rgba(79,163,212,0.12);color:#4fa3d4;border-color:rgba(79,163,212,0.25)">${v.lens_index === 0 ? '📷 Wide' : '🔭 Telephoto'} · paired</span>`
+    : (v.lens_index !== null && v.lens_index !== undefined
+      ? `<span class="tag" style="background:rgba(79,163,212,0.08);color:#4fa3d4;border-color:rgba(79,163,212,0.2)">${v.lens_index === 0 ? '📷 Wide' : '🔭 Telephoto'}</span>`
+      : '');
+  return `
+    <div class="video-item" onclick="openVideo(${v.id})">
+      ${thumbUrl(v.thumbnail_path)
+        ? `<img class="video-thumb" src="${thumbUrl(v.thumbnail_path)}" loading="lazy">`
+        : `<div class="video-thumb-placeholder">🎥</div>`}
+      <div class="video-info">
+        <div class="video-name">${escHtml(v.filename)}</div>
+        <div class="video-meta">${fmtDate(v.recorded_at)} · ${fmtDuration(v.duration_secs)}
+          ${v.has_animal ? ' · <span style="color:var(--accent)">animal</span>' : ''}
+          ${v.has_person ? ' · <span style="color:var(--gold)">person</span>' : ''}
+        </div>
+        <div class="video-tags">${cameraLabel}${lensLabel}${tags.map(t => `<span class="tag">${escHtml(t.trim())}</span>`).join('')}</div>
+      </div>
+    </div>
+  `;
+}
+
+document.getElementById('videoSpeciesFilter').addEventListener('change', e => {
+  state.videoSpecies = e.target.value; state.videoPage = 1; loadVideos();
+});
+document.getElementById('videoCameraFilter').addEventListener('change', e => {
+  state.videoCamera = e.target.value; state.videoPage = 1; loadVideos();
+});
+let videoSearchTimer;
+document.getElementById('videoSearch').addEventListener('input', e => {
+  clearTimeout(videoSearchTimer);
+  videoSearchTimer = setTimeout(() => {
+    state.videoSearch = e.target.value; state.videoPage = 1; loadVideos();
+  }, 300);
+});
+
+async function loadCameras() {
+  const cameras = await api('/cameras').catch(() => []);
+  const sel = document.getElementById('videoCameraFilter');
+  if (!cameras.length) return;
+  sel.innerHTML = '<option value="">All Cameras</option>' +
+    cameras.map(c => `<option value="${escHtml(c.camera_name)}">${escHtml(c.camera_name)} (${c.video_count})</option>`).join('');
+}
+
+// ── Video player ──────────────────────────────────────────────────────────────
+async function openVideo(id) {
+  closeModal('speciesModal');
+  document.getElementById('videoPlayerModal').classList.add('open');
+  document.getElementById('videoPlayerWrap').innerHTML =
+    '<div class="loading" style="min-height:120px"><span class="spinner"></span>Loading…</div>';
+  document.getElementById('detectionChips').innerHTML = '';
+
+  const d = await api(`/videos/${id}`);
+  const v = d.video;
+  document.getElementById('videoModalTitle').textContent = v.filename;
+  document.getElementById('videoModalMeta').textContent =
+    `${fmtDate(v.recorded_at)} · ${fmtDuration(v.duration_secs)}` +
+    (v.lens_index !== null && v.lens_index !== undefined
+      ? ` · ${v.lens_index === 0 ? 'Wide lens' : 'Telephoto lens'}`
+      : '');
+
+  const paired = d.paired;
+  const wrap = document.getElementById('videoPlayerWrap');
+
+  if (paired && paired.filepath) {
+    // Determine which is wide (lens 0) and which is telephoto (lens 1)
+    const wide  = v.lens_index === 0 ? v  : paired;
+    const tele  = v.lens_index === 1 ? v  : paired;
+    const wideId = v.lens_index === 0 ? v.id : paired.id;
+    const teleId = v.lens_index === 1 ? v.id : paired.id;
+
+    wrap.innerHTML = `
+      <div class="dual-video-wrap">
+        <div>
+          <div class="lens-label">📷 Wide (fixed)</div>
+          <video id="videoWide" controls>
+            <source src="/media/video/${wideId}" type="video/mp4">
+          </video>
+        </div>
+        <div>
+          <div class="lens-label">🔭 Telephoto (adjustable)</div>
+          <video id="videoTele" controls>
+            <source src="/media/video/${teleId}" type="video/mp4">
+          </video>
+        </div>
+      </div>`;
+
+    // Sync playback — when one plays/pauses/seeks the other follows
+    const vWide = document.getElementById('videoWide');
+    const vTele = document.getElementById('videoTele');
+    let syncing = false;
+    function syncVideos(src, dst) {
+      if (syncing) return;
+      syncing = true;
+      dst.currentTime = src.currentTime;
+      src.paused ? dst.pause() : dst.play().catch(() => {});
+      syncing = false;
+    }
+    vWide.addEventListener('play',   () => { syncing=false; vTele.play().catch(()=>{}); });
+    vWide.addEventListener('pause',  () => { syncing=false; vTele.pause(); });
+    vWide.addEventListener('seeked', () => syncVideos(vWide, vTele));
+    vTele.addEventListener('play',   () => { syncing=false; vWide.play().catch(()=>{}); });
+    vTele.addEventListener('pause',  () => { syncing=false; vWide.pause(); });
+    vTele.addEventListener('seeked', () => syncVideos(vTele, vWide));
+
+  } else {
+    // Single video
+    wrap.innerHTML = `
+      <div class="single-video-wrap">
+        ${v.lens_index !== null && v.lens_index !== undefined
+          ? `<div class="lens-label">${v.lens_index === 0 ? '📷 Wide (fixed)' : '🔭 Telephoto (adjustable)'}</div>`
+          : ''}
+        <video id="videoPlayer" controls>
+          <source src="/media/video/${v.id}" type="video/mp4">
+        </video>
+      </div>`;
+  }
+
+  // Build detection chips — merge both lenses, prefer telephoto crops
+  // Use a map of label → best chip, preferring higher quality_score
+  const allDets = [
+    ...(d.detections      || []).map(x => ({...x, _lens: v.lens_index ?? 0})),
+    ...(d.pair_detections || []).map(x => ({...x, _lens: paired?.lens_index ?? 1})),
+  ];
+  const seen = {};
+  for (const det of allDets) {
+    if (!det.common_name || det.common_name === 'Blank') continue;
+    const key = det.label || det.common_name;
+    const existing = seen[key];
+    // Prefer telephoto (lens 1) and higher quality
+    const isBetter = !existing
+      || (det._lens === 1 && existing._lens !== 1)
+      || (det._lens === existing._lens && (det.quality_score || 0) > (existing.quality_score || 0));
+    if (isBetter) seen[key] = det;
+  }
+
+  const chips = Object.values(seen);
+  document.getElementById('detectionChips').innerHTML = chips.length
+    ? chips.map(det => `
+        <div class="detection-chip" onclick="seekVideosTo(${det.timestamp_secs||0})">
+          ${det.crop_path ? `<img src="${cropUrl(det.crop_path)}" loading="lazy">` : ''}
+          <span>
+            ${escHtml(det.common_name || det.category)}
+            ${det._lens === 1 ? '<span style="color:var(--muted);font-size:9px"> 🔭</span>' : ''}
+            · ${fmtDuration(det.timestamp_secs)}
+          </span>
+        </div>
+      `).join('')
+    : '';
+}
+
+function seekVideosTo(secs) {
+  // Seek all video elements in the player modal
+  document.querySelectorAll('#videoPlayerWrap video').forEach(v => {
+    v.currentTime = secs;
+    v.play().catch(() => {});
+  });
+}
+
+// ── Timeline ──────────────────────────────────────────────────────────────────
+async function loadTimeline() {
+  const p = new URLSearchParams();
+  if (state.timelineDateFrom || state.timelineDateTo) {
+    if (state.timelineDateFrom) p.set('date_from', state.timelineDateFrom);
+    if (state.timelineDateTo)   p.set('date_to',   state.timelineDateTo);
+  } else {
+    // days=0 means "all time" — omit the param so the backend returns everything
+    if (state.timelineDays > 0) p.set('days', state.timelineDays);
+  }
+
+  const resp = await api('/timeline?' + p);
+  const rows = resp.rows || [];
+  const granularity = resp.granularity || 'day';
+  const windowDays  = resp.window_days || state.timelineDays;
+
+  // Update granularity label
+  const glabel = document.getElementById('timelineGranularityLabel');
+  if (glabel) glabel.textContent = `Grouped by ${granularity}`;
+
+  // Pivot by species and period
+  const allPeriods = new Set();
+  const bySpecies  = {};
+  for (const row of rows) {
+    allPeriods.add(row.period);
+    const key = row.common_name || row.label;
+    if (!bySpecies[key]) bySpecies[key] = {};
+    bySpecies[key][row.period] = (bySpecies[key][row.period] || 0) + row.count;
+  }
+
+  const sortedPeriods = [...allPeriods].sort();
+  const colors = ['#6dba5c','#c8a84b','#e07b2a','#4fa3d4','#9b59b6','#e74c3c','#1abc9c','#f39c12'];
+  const topSp = Object.entries(bySpecies)
+    .map(([k,v]) => [k, Object.values(v).reduce((a,b)=>a+b,0)])
+    .sort((a,b) => b[1]-a[1]).slice(0,8).map(x=>x[0]);
+
+  if (timelineChartInst) timelineChartInst.destroy();
+  timelineChartInst = new Chart(document.getElementById('timelineChart'), {
+    type: 'bar',
+    data: {
+      labels: sortedPeriods,
+      datasets: topSp.map((sp, i) => ({
+        label: sp,
+        data: sortedPeriods.map(d => bySpecies[sp][d] || 0),
+        backgroundColor: colors[i % colors.length] + 'bb',
+        borderColor:     colors[i % colors.length],
+        borderWidth: 1,
+      }))
+    },
+    options: {
+      ...chartOpts({ legend: true }),
+      scales: {
+        x: { stacked: true, ticks: { color: '#7a9e73', font: { family: 'Space Mono', size: 9 }, maxRotation: 45 }, grid: { color: '#1c2b1e' } },
+        y: { stacked: true, ticks: { color: '#7a9e73', font: { family: 'Space Mono', size: 10 } }, grid: { color: '#1c2b1e' }, beginAtZero: true },
+      },
+    },
+  });
+
+  // Heatmap
+  renderHeatmap(sortedPeriods, bySpecies, topSp, granularity);
+}
+
+function renderHeatmap(periods, bySpecies, topSp, granularity) {
+  const el = document.getElementById('heatmapGrid');
+  if (!periods.length) { el.innerHTML = '<div class="empty">No data yet.</div>'; return; }
+
+  // For large windows limit heatmap columns to avoid horizontal overflow
+  const MAX_COLS = 52;
+  const displayPeriods = periods.length > MAX_COLS ? periods.slice(-MAX_COLS) : periods;
+  const max = Math.max(...Object.values(bySpecies).flatMap(v => Object.values(v)));
+
+  // Format period label for column headers
+  const fmtPeriod = p => {
+    if (granularity === 'month') return p;          // YYYY-MM
+    if (granularity === 'week')  return p.slice(5); // MM-DD
+    return p.slice(5);                               // MM-DD
+  };
+
+  let html = '<table style="border-collapse:collapse;font-family:var(--font-mono);font-size:11px">';
+  html += '<tr><th style="padding:4px 8px;text-align:left;color:var(--muted)">Species</th>';
+  for (const d of displayPeriods) {
+    html += `<th style="padding:4px 4px;color:var(--muted);writing-mode:vertical-rl;text-orientation:mixed;height:80px;white-space:nowrap">${fmtPeriod(d)}</th>`;
+  }
+  html += '</tr>';
+  for (const sp of topSp) {
+    html += `<tr><td style="padding:4px 8px;white-space:nowrap;color:var(--text)">${escHtml(sp)}</td>`;
+    for (const d of displayPeriods) {
+      const val = bySpecies[sp][d] || 0;
+      const alpha = val ? Math.max(0.15, val/max) : 0;
+      html += `<td style="padding:2px;text-align:center"><div title="${val} on ${d}" style="width:18px;height:18px;background:rgba(109,186,92,${alpha});border-radius:3px;margin:0 auto"></div></td>`;
+    }
+    html += '</tr>';
+  }
+  html += '</table>';
+  if (periods.length > MAX_COLS) {
+    html += `<div style="font-size:11px;color:var(--muted);margin-top:8px">Showing most recent ${MAX_COLS} ${granularity}s of ${periods.length} total.</div>`;
+  }
+  el.innerHTML = html;
+}
+
+// Timeline preset buttons
+document.querySelectorAll('.timeline-preset').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.timeline-preset').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    state.timelineDays     = parseInt(btn.dataset.days);
+    state.timelineDateFrom = '';
+    state.timelineDateTo   = '';
+    document.getElementById('timelineFrom').value = '';
+    document.getElementById('timelineTo').value   = '';
+    loadTimeline();
+  });
+});
+
+function applyCustomTimeline() {
+  const from = document.getElementById('timelineFrom').value;
+  const to   = document.getElementById('timelineTo').value;
+  if (!from && !to) return;
+  document.querySelectorAll('.timeline-preset').forEach(b => b.classList.remove('active'));
+  state.timelineDateFrom = from;
+  state.timelineDateTo   = to;
+  state.timelineDays     = 0;
+  loadTimeline();
+}
+
+// ── Search ────────────────────────────────────────────────────────────────────
+let searchTimer;
+document.getElementById('globalSearch').addEventListener('input', e => {
+  const q = e.target.value.trim();
+  clearTimeout(searchTimer);
+  const el = document.getElementById('searchResults');
+  if (!q) { el.classList.remove('open'); return; }
+  searchTimer = setTimeout(async () => {
+    const data = await api(`/search?q=${encodeURIComponent(q)}`);
+    let html = '';
+    if (data.species.length) {
+      html += '<div class="search-section-title">Species</div>';
+      html += data.species.map(s => `
+        <div class="search-result-item" onclick="openSpecies('${escHtml(s.label)}');closeSearch()">
+          <span style="font-size:20px">🦎</span>
+          <div>
+            <div class="search-result-text">${escHtml(s.common_name || s.label)}</div>
+            <div class="search-result-sub">${escHtml(s.scientific_name||'')} · ${s.cnt} detections</div>
+          </div>
+        </div>`).join('');
+    }
+    if (data.videos.length) {
+      html += '<div class="search-section-title">Videos</div>';
+      html += data.videos.map(v => `
+        <div class="search-result-item" onclick="openVideo(${v.id});closeSearch()">
+          <span style="font-size:20px">🎥</span>
+          <div>
+            <div class="search-result-text">${escHtml(v.filename)}</div>
+            <div class="search-result-sub">${fmtDate(v.recorded_at)}</div>
+          </div>
+        </div>`).join('');
+    }
+    if (!html) html = '<div class="search-result-item" style="color:var(--muted)">No results found.</div>';
+    el.innerHTML = html;
+    el.classList.add('open');
+  }, 250);
+});
+
+function closeSearch() {
+  document.getElementById('searchResults').classList.remove('open');
+  document.getElementById('globalSearch').value = '';
+}
+
+document.addEventListener('click', e => {
+  if (!e.target.closest('.search-bar')) {
+    document.getElementById('searchResults').classList.remove('open');
+  }
+});
+
+// ── Modals ────────────────────────────────────────────────────────────────────
+function closeModal(id) {
+  document.getElementById(id).classList.remove('open');
+  if (id === 'videoPlayerModal') {
+    document.querySelectorAll('#videoPlayerWrap video').forEach(v => {
+      v.pause();
+      v.src = '';
+    });
+  }
+}
+
+document.querySelectorAll('.modal-overlay').forEach(el => {
+  el.addEventListener('click', e => { if (e.target === el) closeModal(el.id); });
+});
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.querySelectorAll('.modal-overlay.open').forEach(m => closeModal(m.id));
+});
+
+// ── Chart defaults ────────────────────────────────────────────────────────────
+function chartOpts({ legend = false } = {}) {
+  return {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { intersect: false, mode: 'index' },
+    plugins: {
+      legend: legend ? {
+        display: true,
+        labels: { color: '#7a9e73', font: { family: 'Space Mono', size: 10 }, boxWidth: 12 }
+      } : { display: false },
+      tooltip: {
+        backgroundColor: '#1c2b1e', borderColor: '#2a3d2c', borderWidth: 1,
+        titleColor: '#6dba5c', bodyColor: '#dcefd4',
+        titleFont: { family: 'Space Mono', size: 11 },
+        bodyFont: { family: 'Crimson Pro', size: 13 },
+      }
+    },
+    scales: {
+      x: { ticks: { color: '#7a9e73', font: { family: 'Space Mono', size: 10 } }, grid: { color: '#1c2b1e' } },
+      y: { ticks: { color: '#7a9e73', font: { family: 'Space Mono', size: 10 } }, grid: { color: '#1c2b1e' }, beginAtZero: true }
+    }
+  };
+}
+
+// ── Pagination ────────────────────────────────────────────────────────────────
+function renderPagination(containerId, page, pages, cb) {
+  const el = document.getElementById(containerId);
+  if (pages <= 1) { el.innerHTML = ''; return; }
+  el.innerHTML = `
+    <button ${page<=1?'disabled':''} onclick="(${cb.toString()})(${page-1})">← Prev</button>
+    <span class="page-info">Page ${page} of ${pages}</span>
+    <button ${page>=pages?'disabled':''} onclick="(${cb.toString()})(${page+1})">Next →</button>
+  `;
+}
+
+// ── Species filter population ─────────────────────────────────────────────────
+function populateSpeciesFilters(speciesList) {
+  const opts = '<option value="">All Species</option>' +
+    speciesList.map(s => `<option value="${escHtml(s.label)}">${escHtml(s.common_name||s.label)}</option>`).join('');
+  document.getElementById('gallerySpeciesFilter').innerHTML = opts;
+  document.getElementById('videoSpeciesFilter').innerHTML = opts;
+}
+
+// ── Util ──────────────────────────────────────────────────────────────────────
+function escHtml(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+// ── Software & Models update checker ─────────────────────────────────────────
+async function checkUpdates() {
+  const btn = document.getElementById('checkUpdatesBtn');
+  const content = document.getElementById('updatesContent');
+  btn.disabled = true;
+  btn.textContent = '↻ Checking…';
+  content.innerHTML = '<div class="loading" style="margin-top:16px"><span class="spinner"></span>Checking PyPI and local cache…</div>';
+
+  const data = await fetch('/api/updates').then(r => r.json()).catch(() => null);
+  btn.disabled = false;
+  btn.textContent = '↻ Check for Updates';
+
+  if (!data || !data.components) {
+    content.innerHTML = '<div style="color:#e05c5c;font-size:12px;margin-top:16px">Failed to fetch update info. Check the terminal for errors.</div>';
+    return;
+  }
+
+  const anyUpdates = data.components.some(c => c.up_to_date === false);
+  const summary = anyUpdates
+    ? `<div style="color:var(--gold);font-size:12px;margin:14px 0 4px">⚠ Updates available</div>`
+    : `<div style="color:var(--accent);font-size:12px;margin:14px 0 4px">✓ Everything is up to date</div>`;
+
+  const rows = data.components.map(c => {
+    const typeBadge = `<span class="update-type">${escHtml(c.type)}</span>`;
+    const instVer   = `<span class="update-ver current">${escHtml(c.installed)}</span>`;
+    const latestVer = `<span class="update-ver">${escHtml(c.latest)}</span>`;
+
+    let statusBadge, actionCell;
+    if (c.up_to_date === true) {
+      statusBadge = `<span class="badge-ok">✓ current</span>`;
+      actionCell  = `<span style="color:var(--muted);font-size:11px">—</span>`;
+    } else if (c.up_to_date === false) {
+      statusBadge = `<span class="badge-upd">⬆ update available</span>`;
+      const btnLabel = c.type === 'package' ? 'Upgrade' : 'Clear cache';
+      const hint     = c.type === 'model'
+        ? '<div class="update-feedback">Model re-downloads on next run</div>'
+        : '';
+      actionCell = `
+        <div>
+          <button class="btn-update" id="upd-${escHtml(c.id)}"
+            onclick="applyUpdate('${escHtml(c.id)}','${escHtml(c.action)}','${escHtml(c.action_arg)}')">
+            ${btnLabel}
+          </button>
+          ${hint}
+        </div>`;
+    } else {
+      statusBadge = `<span class="badge-unk">unknown</span>`;
+      actionCell  = `<span style="color:var(--muted);font-size:11px">—</span>`;
+    }
+
+    return `<tr>
+      <td><div class="update-name">${escHtml(c.name)}</div><div style="margin-top:3px">${typeBadge}</div></td>
+      <td>${instVer}</td>
+      <td>${latestVer}</td>
+      <td>${statusBadge}</td>
+      <td>${actionCell}</td>
+    </tr>`;
+  }).join('');
+
+  content.innerHTML = summary + `
+    <table class="update-table">
+      <thead><tr>
+        <th>Component</th>
+        <th>Installed</th>
+        <th>Latest</th>
+        <th>Status</th>
+        <th>Action</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function applyUpdate(id, action, actionArg) {
+  const btn = document.getElementById(`upd-${id}`);
+  if (btn) { btn.disabled = true; btn.textContent = 'Working…'; }
+
+  const res = await fetch('/api/updates/apply', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ action, action_arg: actionArg }),
+  }).then(r => r.json()).catch(() => null);
+
+  if (res && res.ok) {
+    // Re-run check to refresh all statuses
+    await checkUpdates();
+  } else {
+    if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
+    const errMsg = res?.detail || res?.output || 'Update failed. Check the terminal.';
+    const row = btn?.closest('tr');
+    if (row) {
+      const fb = row.querySelector('.update-feedback');
+      if (fb) { fb.style.color = '#e05c5c'; fb.textContent = errMsg; }
+    }
+  }
+}
+
+// ── Storage & retention ───────────────────────────────────────────────────────
+async function loadStorageStats() {
+  const el = document.getElementById('storageStats');
+  el.innerHTML = '<div class="loading"><span class="spinner"></span>Loading…</div>';
+  const s = await fetch('/api/maintenance/storage').then(r => r.json()).catch(() => null);
+  if (!s) { el.innerHTML = '<div style="color:#e05c5c;font-size:12px">Failed to load storage stats.</div>'; return; }
+
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
+      <div class="stat-card" style="padding:14px">
+        <div class="stat-value" style="font-size:22px">${s.blank_gb.toFixed(1)} GB</div>
+        <div class="stat-label">Blank videos (${s.blank_videos})</div>
+      </div>
+      <div class="stat-card" style="padding:14px">
+        <div class="stat-value" style="font-size:22px">${s.kept_gb.toFixed(1)} GB</div>
+        <div class="stat-label">Kept videos (${s.kept_videos})</div>
+      </div>
+      <div class="stat-card" style="padding:14px">
+        <div class="stat-value" style="font-size:22px">${s.total_active_gb.toFixed(1)} GB</div>
+        <div class="stat-label">Total active</div>
+      </div>
+      <div class="stat-card" style="padding:14px">
+        <div class="stat-value" style="font-size:22px;color:var(--muted)">${s.purged_gb_reclaimed.toFixed(1)} GB</div>
+        <div class="stat-label">Reclaimed (${s.purged_videos} purged)</div>
+      </div>
+    </div>`;
+}
+
+async function previewPurge() {
+  const preview = document.getElementById('purgePreview');
+  preview.style.display = 'block';
+  preview.innerHTML = '<div class="loading"><span class="spinner"></span>Calculating…</div>';
+
+  const res = await fetch('/api/maintenance/purge?dry_run=true', {method:'POST'})
+    .then(r => r.json()).catch(() => null);
+
+  if (!res) {
+    preview.innerHTML = '<div style="color:#e05c5c;font-size:12px">Failed to calculate purge.</div>';
+    return;
+  }
+
+  const total = res.blank_count + res.kept_count;
+  if (total === 0) {
+    preview.innerHTML = '<div style="color:var(--accent);font-size:12px">✓ Nothing to purge — all videos are within retention limits.</div>';
+    return;
+  }
+
+  const rows = (cat, label) => res[cat].map(v => `
+    <tr>
+      <td style="color:var(--muted);font-size:10px;padding:4px 8px 4px 0">${escHtml(label)}</td>
+      <td style="font-size:11px;padding:4px 8px 4px 0">${escHtml(v.filename)}</td>
+      <td style="font-size:11px;color:var(--muted);padding:4px 8px 4px 0">${escHtml(v.recorded_at?.slice(0,10)||'')}</td>
+      <td style="font-size:11px;text-align:right;padding:4px 0">${v.size_mb ? v.size_mb.toFixed(0) + ' MB' : '—'}</td>
+    </tr>`).join('');
+
+  const sizeNote = res.total_freed_gb === 0
+    ? '<div style="font-size:11px;color:var(--muted);margin-top:6px">⚠ File sizes unavailable for some records — freed space estimate may be 0 even if files exist.</div>'
+    : '';
+
+  preview.innerHTML = `
+    <div style="font-size:12px;color:#e05c5c;margin-bottom:8px;padding:8px;background:rgba(224,92,92,0.08);border-radius:4px;border:1px solid rgba(224,92,92,0.2)">
+      ⚠ Do not run purge while a backfill is in progress. Videos processed in the last 7 days are excluded automatically.
+    </div>
+    <div style="font-size:12px;color:var(--gold);margin-bottom:10px">
+      ⚠ ${total} video record(s) would be marked as purged — ${res.total_freed_gb.toFixed(2)} GB freed
+    </div>
+    ${sizeNote}
+    <table style="width:100%;border-collapse:collapse;margin:10px 0 14px">
+      <thead><tr>
+        <th style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-align:left;padding-bottom:6px">Type</th>
+        <th style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-align:left;padding-bottom:6px">File</th>
+        <th style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-align:left;padding-bottom:6px">Recorded</th>
+        <th style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-align:right;padding-bottom:6px">Size</th>
+      </tr></thead>
+      <tbody>${rows('blank','blank')}${rows('kept','kept')}</tbody>
+    </table>
+    <div style="display:flex;gap:10px;align-items:center">
+      <button class="btn-run" style="font-size:12px;padding:8px 20px" onclick="runPurge()">Delete These Files Now</button>
+      <button class="btn-save" onclick="document.getElementById('purgePreview').style.display='none'">Cancel</button>
+    </div>`;
+}
+
+async function runPurge() {
+  const preview = document.getElementById('purgePreview');
+  preview.innerHTML = '<div class="loading"><span class="spinner"></span>Purging…</div>';
+  const res = await fetch('/api/maintenance/purge?dry_run=false', {method:'POST'})
+    .then(r => r.json()).catch(() => null);
+  const total = (res?.blank_count||0) + (res?.kept_count||0);
+  preview.innerHTML = res
+    ? `<div style="color:var(--accent);font-size:12px">✓ Purge complete — ${total} file(s) deleted, ${(res.total_freed_gb||0).toFixed(2)} GB freed. DB records preserved.</div>`
+    : '<div style="color:#e05c5c;font-size:12px">Purge failed. Check terminal.</div>';
+  loadStorageStats();
+}
+
+// ── Settings ──────────────────────────────────────────────────────────────────
+let _pollTimer = null;
+
+async function loadSettings() {
+  const data = await api('/settings').catch(() => null);
+  if (!data) return;
+
+  const p = data.processing || {};
+  document.getElementById('setHours').value            = p.hours        ?? 24;
+  document.getElementById('setSampleRate').value       = p.sample_rate  ?? 30;
+  document.getElementById('setThreshold').value        = p.md_threshold ?? 0.2;
+  document.getElementById('setCountry').value          = p.country      ?? 'US';
+  document.getElementById('setAdmin1Region').value     = p.admin1_region ?? '';
+  document.getElementById('setSkipSpeciesnet').checked = !!p.skip_speciesnet;
+  document.getElementById('setFilenameDateFormat').value = p.filename_date_format ?? 'auto';
+  document.getElementById('setBlankDays').value        = p.blank_retention_days ?? 60;
+  document.getElementById('setBlankGb').value          = p.blank_retention_gb   ?? 20;
+  document.getElementById('setKeptDays').value         = p.kept_retention_days  ?? 730;
+  document.getElementById('setKeptGb').value           = p.kept_retention_gb    ?? 500;
+
+  renderNasStatus(data.nas || {});
+  checkRunStatus();
+}
+
+function renderNasStatus(nas) {
+  const el = document.getElementById('nasStatus');
+  if (!nas.configured) {
+    el.innerHTML = `<div style="color:var(--muted);font-size:13px">
+      NAS not configured. Run <code style="color:var(--accent)">./nas_connect.sh</code> on the host machine.
+    </div>`;
+    return;
+  }
+  const mounted = nas.mounted;
+  const dot = `<span class="status-dot ${mounted ? 'green' : 'red'}"></span>`;
+  const proto = (nas.NAS_PROTOCOL||'').toUpperCase();
+  const sourcePath = nas.NAS_VIDEO_SUBDIR
+    ? `${nas.NAS_MOUNT}/${nas.NAS_VIDEO_SUBDIR}`
+    : (nas.NAS_MOUNT || '—');
+  const archivePath = nas.NAS_ARCHIVE_SUBDIR
+    ? `${nas.NAS_MOUNT}/${nas.NAS_ARCHIVE_SUBDIR}`
+    : '—';
+  const rows = [
+    ['Status',       `${dot}${mounted ? 'Mounted' : 'Not mounted'}`],
+    ['Protocol',     proto || '—'],
+    ['Host',         nas.NAS_HOST  || '—'],
+    ['Share',        nas.NAS_SHARE || '—'],
+    ['Mount point',  nas.NAS_MOUNT || '—'],
+    ['Source videos',sourcePath],
+    ['Archive',      archivePath],
+    ...(proto === 'SMB'
+      ? [['SMB user', nas.NAS_SMB_USER || '—']]
+      : [['Auth', 'NFS — IP-based']]),
+  ];
+  el.innerHTML = rows.map(([k, v]) => `
+    <div class="nas-row">
+      <span class="nas-key">${escHtml(k)}</span>
+      <span class="nas-val">${v}</span>
+    </div>
+  `).join('');
+}
+
+async function saveSettings() {
+  const payload = {
+    hours:                parseInt(document.getElementById('setHours').value)      || 24,
+    sample_rate:          parseInt(document.getElementById('setSampleRate').value)  || 30,
+    md_threshold:         parseFloat(document.getElementById('setThreshold').value) || 0.2,
+    country:              document.getElementById('setCountry').value.toUpperCase().trim(),
+    admin1_region:        document.getElementById('setAdmin1Region').value.toUpperCase().trim(),
+    skip_speciesnet:      document.getElementById('setSkipSpeciesnet').checked,
+    filename_date_format: document.getElementById('setFilenameDateFormat').value,
+    blank_retention_days: parseInt(document.getElementById('setBlankDays').value) || 0,
+    blank_retention_gb:   parseFloat(document.getElementById('setBlankGb').value) || 0,
+    kept_retention_days:  parseInt(document.getElementById('setKeptDays').value)  || 0,
+    kept_retention_gb:    parseFloat(document.getElementById('setKeptGb').value)  || 0,
+  };
+  const res = await fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload),
+  }).then(r => r.json()).catch(() => null);
+  const fb = document.getElementById('saveFeedback');
+  fb.textContent = (res && res.ok) ? '✓ Settings saved' : '✗ Save failed';
+  fb.classList.add('show');
+  setTimeout(() => fb.classList.remove('show'), 2500);
+}
+
+let _activeLogEl    = 'runLog';
+let _activeStatusEl = 'runStatusLabel';
+let _activeBtnEl    = 'runBtn';
+
+async function triggerRun() {
+  const btn = document.getElementById('runBtn');
+  const label = document.getElementById('runStatusLabel');
+  btn.disabled = true;
+  label.textContent = 'Starting…';
+  const res = await fetch('/api/run', {method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
+    .then(r => r.json()).catch(() => null);
+  if (!res || !res.ok) {
+    label.textContent = res?.error || 'Failed to start. Check terminal.';
+    btn.disabled = false;
+    return;
+  }
+  document.getElementById('runLog').style.display = 'block';
+  _activeLogEl    = 'runLog';
+  _activeStatusEl = 'runStatusLabel';
+  _activeBtnEl    = 'runBtn';
+  startRunPolling();
+}
+
+async function triggerBackfill() {
+  const dateFrom = document.getElementById('backfillFrom').value;
+  const dateTo   = document.getElementById('backfillTo').value;
+  if (!dateFrom && !dateTo) {
+    document.getElementById('backfillStatusLabel').textContent = '✗ Set at least one date';
+    return;
+  }
+  const btn = document.getElementById('backfillBtn');
+  const label = document.getElementById('backfillStatusLabel');
+  btn.disabled = true;
+  label.textContent = 'Starting…';
+  const res = await fetch('/api/run', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ date_from: dateFrom || null, date_to: dateTo || null }),
+  }).then(r => r.json()).catch(() => null);
+  if (!res || !res.ok) {
+    label.textContent = res?.error || 'Failed to start. Check terminal.';
+    btn.disabled = false;
+    return;
+  }
+  document.getElementById('backfillLog').style.display = 'block';
+  _activeLogEl    = 'backfillLog';
+  _activeStatusEl = 'backfillStatusLabel';
+  _activeBtnEl    = 'backfillBtn';
+  startRunPolling();
+}
+
+function startRunPolling() {
+  if (_pollTimer) clearInterval(_pollTimer);
+  _pollTimer = setInterval(checkRunStatus, 2000);
+}
+
+async function checkRunStatus() {
+  const data = await fetch('/api/run/status').then(r => r.json()).catch(() => null);
+  if (!data) return;
+  const btn   = document.getElementById(_activeBtnEl);
+  const label = document.getElementById(_activeStatusEl);
+  const log   = document.getElementById(_activeLogEl);
+
+  if (data.log) {
+    log.style.display = 'block';
+    log.textContent = data.log;
+    log.scrollTop = log.scrollHeight;
+  }
+
+  if (data.running) {
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; }
+    if (label) label.textContent = 'Processing — see log below';
+  } else {
+    if (btn) { btn.disabled = false; btn.textContent = _activeBtnEl === 'backfillBtn' ? '▶ Run Backfill' : '▶ Run Now'; }
+    if (_pollTimer) { clearInterval(_pollTimer); _pollTimer = null; }
+    if (data.exit_code === 0 && data.log) {
+      if (label) label.textContent = '✓ Completed successfully';
+      loadDashboard();
+    } else if (data.exit_code !== null && data.exit_code !== 0) {
+      if (label) label.textContent = `✗ Exited with code ${data.exit_code}`;
+    } else {
+      if (label) label.textContent = '';
+    }
+  }
+}
+
+// ── Species correction ────────────────────────────────────────────────────────
+function toggleCorrectForm(detectionId, currentName, currentSci) {
+  const form = document.getElementById(`cform-${detectionId}`);
+  if (!form) return;
+  const isOpen = form.classList.contains('open');
+  // Close all other open forms first
+  document.querySelectorAll('.correction-form.open').forEach(f => f.classList.remove('open'));
+  if (!isOpen) {
+    form.classList.add('open');
+    const nameInput = document.getElementById(`cname-${detectionId}`);
+    if (nameInput) nameInput.focus();
+  }
+}
+
+async function submitCorrection(detectionId) {
+  const common = document.getElementById(`cname-${detectionId}`)?.value?.trim() || '';
+  const sci    = document.getElementById(`csci-${detectionId}`)?.value?.trim() || '';
+  const res = await fetch('/api/species/correct', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ detection_id: detectionId, user_common_name: common, user_scientific_name: sci }),
+  }).then(r => r.json()).catch(() => null);
+
+  if (res?.ok) {
+    // Close the form and reload the gallery to reflect the change
+    const form = document.getElementById(`cform-${detectionId}`);
+    if (form) form.classList.remove('open');
+    loadGallery();
+    // Also reload species list if visible
+    if (document.getElementById('tab-species').classList.contains('active')) loadSpecies();
+  }
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+loadDashboard();
+loadCameras();
+</script>
+</body>
+</html>
