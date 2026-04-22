@@ -1,12 +1,12 @@
 # Wildlife Monitor
 
-Automated wildlife detection for security camera and camera trap footage. Videos are pulled from a Synology NAS, processed locally using MegaDetector and SpeciesNet, and results are browsed through a web dashboard. Footage with detections is archived back to the NAS in an organised folder structure. Footage with no detections is retained briefly then purged on a configurable schedule.
+Automated wildlife detection for security camera and camera trap footage. Videos are pulled from a network-attached storage (NAS), processed locally using MegaDetector and SpeciesNet, and results are browsed through a web dashboard. Footage with detections is archived back to the NAS in an organised folder structure. Footage with no detections is retained briefly then purged on a configurable schedule.
 
 ---
 
 ## What it does
 
-1. **Syncs** recent video files from a Synology NAS to local staging storage
+1. **Syncs** recent video files from a network-attached storage (NAS) to local staging storage
 2. **Detects** animals, people, and vehicles using [MegaDetector V6](https://github.com/agentmorris/MegaDetector)
 3. **Identifies** species using [SpeciesNet](https://github.com/google/wildlife-datasets) (2,000+ species, trained on 65M images), with state/province-level geographic filtering to eliminate impossible identifications
 4. **Scores** each animal crop for image quality (sharpness, brightness, contrast, size)
@@ -62,7 +62,7 @@ wildlife_monitor/
 - Ubuntu 20.04 or later (tested on 22.04, 24.04, 25.04)
 - Python 3.10–3.12 (Python 3.13 is not yet supported by SpeciesNet)
 - 8 GB RAM minimum; 16 GB recommended
-- A Synology NAS accessible on the local network via NFS or SMB
+- A network-attached storage (NAS) accessible on the local network via NFS or SMB
 - GPU optional (NVIDIA with CUDA 11 or 12); CPU works but is ~10x slower
 
 ---
