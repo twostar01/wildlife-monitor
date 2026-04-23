@@ -360,6 +360,21 @@ if [[ "$THEN_PROCESS" == true ]]; then
     fi
 
     if [[ "$NO_CLEANUP" == false ]]; then
+        # ── Promote paired blank videos ───────────────────────────────────────
+        # If one lens of a dual-lens pair kept a video, keep the other lens too
+        # even if it had no detections of its own.
+        PROMOTED=$(python3 -c "
+import sys
+sys.path.insert(0, '$SCRIPT_DIR')
+from database import init_db, promote_paired_blanks
+init_db('$DATA_DIR/wildlife.db')
+n = promote_paired_blanks()
+print(n)
+" 2>/dev/null)
+        if [[ -n "$PROMOTED" && "$PROMOTED" -gt 0 ]]; then
+            ok "Promoted $PROMOTED paired blank video(s) to kept (partner lens detected an animal)"
+        fi
+
         # ── Archive kept videos to NAS, then clean up all local copies ─────────
         NAS_ARCHIVE_SUBDIR="${NAS_ARCHIVE_SUBDIR:-wildlife_archive}"
         NAS_ARCHIVE_ROOT="$NAS_MOUNT/$NAS_ARCHIVE_SUBDIR"

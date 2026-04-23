@@ -43,7 +43,7 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS videos (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     filename        TEXT NOT NULL,
-    filepath        TEXT NOT NULL UNIQUE,
+    filepath        TEXT UNIQUE,
     camera_name     TEXT,          -- top-level folder name on NAS (e.g. "FrontDoor")
     file_size_mb    REAL,
     duration_secs   REAL,
@@ -126,6 +126,25 @@ ALTER TABLE videos ADD COLUMN paired_video_id INTEGER REFERENCES videos(id);
 # SpeciesNet returns ';;;;;;blank' when it determines a crop has no animal.
 BLANK_LABEL_FILTER = "s.label NOT LIKE '%;;;;;;blank'"
 
+# Suppression filter — exclude Unknown species and blank labels for any video
+# that also has at least one real identified species. If a video has a known
+# species, the Unknown/blank entries are just low-confidence frames of the
+# same animal and clutter the display.
+SUPPRESS_UNKNOWN_IF_IDENTIFIED = """(
+    s.label != 'Unknown species'
+    OR NOT EXISTS (
+        SELECT 1 FROM species s2
+        JOIN detections d2 ON s2.detection_id = d2.id
+        WHERE d2.video_id = d.video_id
+          AND s2.label != 'Unknown species'
+          AND s2.label NOT LIKE '%;;;;;;blank'
+    )
+)"""
+
+# Combined filter — always exclude blank, and suppress Unknown when a real
+# species is present on the same video.
+KNOWN_SPECIES_FILTER = f"{BLANK_LABEL_FILTER} AND {SUPPRESS_UNKNOWN_IF_IDENTIFIED}"
+
 # SQL expression that returns the display name — user correction when set, else SpeciesNet common_name
 DISPLAY_COMMON     = "COALESCE(NULLIF(s.user_common_name,''), s.common_name)"
 DISPLAY_SCIENTIFIC = "COALESCE(NULLIF(s.user_scientific_name,''), s.scientific_name)"
@@ -147,6 +166,38 @@ def init_db(db_path: Optional[str] = None):
         sp_cols = [r[1] for r in conn.execute("PRAGMA table_info(species)").fetchall()]
         if "user_common_name" not in sp_cols:
             conn.executescript(MIGRATION_ADD_CORRECTIONS)
+        # Migration: drop NOT NULL constraint on filepath so purged/blank records can have NULL
+        filepath_notnull = next(
+            (r[3] for r in conn.execute("PRAGMA table_info(videos)").fetchall() if r[1] == "filepath"), 0
+        )
+        if filepath_notnull:
+            log.info("DB migration: removing NOT NULL from videos.filepath...")
+            conn.executescript("""
+                PRAGMA foreign_keys=OFF;
+                CREATE TABLE videos_new (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    filename        TEXT NOT NULL,
+                    filepath        TEXT UNIQUE,
+                    camera_name     TEXT,
+                    file_size_mb    REAL,
+                    duration_secs   REAL,
+                    recorded_at     TEXT,
+                    processed_at    TEXT,
+                    has_animal      INTEGER DEFAULT 0,
+                    has_person      INTEGER DEFAULT 0,
+                    kept            INTEGER DEFAULT 0,
+                    thumbnail_path  TEXT,
+                    frame_count     INTEGER,
+                    file_purged_at  TEXT,
+                    lens_index      INTEGER,
+                    paired_video_id INTEGER REFERENCES videos_new(id) ON DELETE SET NULL
+                );
+                INSERT INTO videos_new SELECT * FROM videos;
+                DROP TABLE videos;
+                ALTER TABLE videos_new RENAME TO videos;
+                PRAGMA foreign_keys=ON;
+            """)
+            log.info("DB migration: filepath NOT NULL constraint removed")
 
 
 # ── Write helpers ──────────────────────────────────────────────────────────────
@@ -525,7 +576,28 @@ def get_blank_videos(
 
 
 
-def get_storage_stats() -> dict:
+def promote_paired_blanks() -> int:
+    """
+    If one lens of a dual-lens pair detected an animal or person, mark the
+    other lens as kept=1 too — even if it had no detections itself.
+    Both lenses are recorded simultaneously and should be kept or discarded together.
+    Returns the number of videos promoted.
+    """
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE videos
+            SET kept = 1
+            WHERE kept = 0
+              AND paired_video_id IS NOT NULL
+              AND paired_video_id IN (
+                  SELECT id FROM videos WHERE kept = 1
+              )
+        """)
+        count = conn.total_changes
+    return count
+
+
+
     """Return storage usage broken out by blank vs kept vs purged videos."""
     with get_conn() as conn:
         blank = conn.execute("""
@@ -601,13 +673,15 @@ def get_stats() -> dict:
             "SELECT COUNT(DISTINCT video_id) FROM detections WHERE category='person'"
         ).fetchone()[0]
         total_species = conn.execute(
-            f"SELECT COUNT(DISTINCT label) FROM species s WHERE {BLANK_LABEL_FILTER}"
+            f"""SELECT COUNT(DISTINCT s.label)
+                FROM species s
+                JOIN detections d ON s.detection_id = d.id
+                WHERE {KNOWN_SPECIES_FILTER}"""
         ).fetchone()[0]
         total_detections = conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
         total_crops = conn.execute("SELECT COUNT(*) FROM crops").fetchone()[0]
 
         # Last 7 days activity broken out by species
-        # Generate all 7 days first so days with no activity still appear as zero
         activity_raw = conn.execute(f"""
             WITH RECURSIVE dates(day) AS (
                 SELECT DATE('now', '-6 days')
@@ -615,24 +689,27 @@ def get_stats() -> dict:
                 SELECT DATE(day, '+1 day')
                 FROM dates WHERE day < DATE('now')
             )
-            SELECT d.day,
+            SELECT dates.day,
                    COALESCE(s.common_name, 'Unknown') as species,
                    s.label,
                    COUNT(DISTINCT v.id) as count
-            FROM dates d
+            FROM dates
             LEFT JOIN videos v
-                ON DATE(v.recorded_at) = d.day AND v.kept = 1
-            LEFT JOIN detections det ON v.id = det.video_id
-            LEFT JOIN species s ON s.detection_id = det.id AND {BLANK_LABEL_FILTER}
-            GROUP BY d.day, s.label
-            ORDER BY d.day
+                ON DATE(v.recorded_at) = dates.day AND v.kept = 1
+            LEFT JOIN detections d ON v.id = d.video_id
+            LEFT JOIN species s ON s.detection_id = d.id AND {KNOWN_SPECIES_FILTER}
+            GROUP BY dates.day, s.label
+            ORDER BY dates.day
         """).fetchall()
 
-        # Top 5 species (excluding blanks)
+        # Top 5 species — exclude Unknown species from this list entirely
+        # since it's not a real species and dominates the chart unhelpfully
         top_species = conn.execute(f"""
             SELECT {DISPLAY_COMMON} AS common_name, s.label, COUNT(*) as cnt
             FROM species s
-            WHERE {BLANK_LABEL_FILTER}
+            JOIN detections d ON s.detection_id = d.id
+            WHERE {KNOWN_SPECIES_FILTER}
+              AND s.label != 'Unknown species'
             GROUP BY s.label
             ORDER BY cnt DESC LIMIT 5
         """).fetchall()
@@ -680,7 +757,7 @@ def get_species_list() -> list:
             FROM species s
             JOIN detections d ON s.detection_id = d.id
             JOIN videos v ON d.video_id = v.id
-            WHERE {BLANK_LABEL_FILTER}
+            WHERE {KNOWN_SPECIES_FILTER}
             GROUP BY s.label
             ORDER BY detection_count DESC
         """).fetchall()
@@ -741,7 +818,7 @@ def get_gallery(
     offset = (page - 1) * per_page
     order = "c.quality_score DESC" if sort_by == "quality" else "v.recorded_at DESC"
 
-    conditions = [BLANK_LABEL_FILTER]
+    conditions = [KNOWN_SPECIES_FILTER]
     params = []
     if species_label:
         conditions.append("s.label = ?")
@@ -828,14 +905,12 @@ def get_videos(
         conditions.append("DATE(v.recorded_at) <= ?")
         params.append(date_to)
     if has_species is True:
-        # Only videos with at least one real (non-blank) species identification
         conditions.append(f"""
             v.id IN (SELECT d.video_id FROM detections d
                      JOIN species s ON s.detection_id=d.id
                      WHERE {BLANK_LABEL_FILTER} AND s.label != 'Unknown species')
         """)
     elif has_species is False:
-        # Videos with no real species (blank-only or no detections)
         conditions.append(f"""
             v.id NOT IN (SELECT d.video_id FROM detections d
                          JOIN species s ON s.detection_id=d.id
@@ -859,7 +934,8 @@ def get_videos(
             SELECT v.id, v.filename, v.camera_name, v.recorded_at, v.duration_secs,
                    v.has_animal, v.has_person, v.thumbnail_path,
                    v.lens_index, v.paired_video_id,
-                   GROUP_CONCAT(DISTINCT s.common_name) as species_list
+                   GROUP_CONCAT(DISTINCT CASE WHEN {KNOWN_SPECIES_FILTER}
+                       THEN {DISPLAY_COMMON} END) as species_list
             FROM videos v
             LEFT JOIN detections d ON v.id = d.video_id
             LEFT JOIN species s ON s.detection_id = d.id
@@ -884,14 +960,15 @@ def get_video_by_id(video_id: int) -> dict:
         if not video:
             return {}
 
-        detections = conn.execute("""
+        detections = conn.execute(f"""
             SELECT d.id, d.frame_number, d.timestamp_secs, d.category, d.confidence,
-                   s.label, s.common_name, s.scientific_name,
+                   s.label, {DISPLAY_COMMON} as common_name, s.scientific_name,
                    c.crop_path, c.quality_score
             FROM detections d
             LEFT JOIN species s ON s.detection_id = d.id
             LEFT JOIN crops c ON c.detection_id = d.id
             WHERE d.video_id = ?
+              AND ({KNOWN_SPECIES_FILTER} OR s.label IS NULL)
             ORDER BY d.timestamp_secs
         """, (video_id,)).fetchall()
 
@@ -903,14 +980,15 @@ def get_video_by_id(video_id: int) -> dict:
             paired_row = conn.execute("SELECT * FROM videos WHERE id=?", (pair_id,)).fetchone()
             if paired_row:
                 paired = dict(paired_row)
-                pair_detections = [dict(r) for r in conn.execute("""
+                pair_detections = [dict(r) for r in conn.execute(f"""
                     SELECT d.id, d.frame_number, d.timestamp_secs, d.category, d.confidence,
-                           s.label, s.common_name, s.scientific_name,
+                           s.label, {DISPLAY_COMMON} as common_name, s.scientific_name,
                            c.crop_path, c.quality_score
                     FROM detections d
                     LEFT JOIN species s ON s.detection_id = d.id
                     LEFT JOIN crops c ON c.detection_id = d.id
                     WHERE d.video_id = ?
+                      AND ({KNOWN_SPECIES_FILTER} OR s.label IS NULL)
                     ORDER BY d.timestamp_secs
                 """, (pair_id,)).fetchall()]
 
@@ -981,8 +1059,7 @@ def get_timeline(
             JOIN detections d ON v.id = d.video_id
             JOIN species s ON s.detection_id = d.id
             WHERE v.kept = 1 {where}
-              AND {BLANK_LABEL_FILTER}
-              AND s.label != 'Unknown species'
+              AND {KNOWN_SPECIES_FILTER}
             GROUP BY period, s.label
             ORDER BY period
         """, params).fetchall()

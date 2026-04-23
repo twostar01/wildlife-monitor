@@ -271,7 +271,9 @@ def serve_video(video_id: int):
     result = db.get_video_by_id(video_id)
     if not result or not result.get("video"):
         raise HTTPException(404, "Video not found")
-    filepath = result["video"]["filepath"]
+    filepath = result["video"].get("filepath")
+    if not filepath:
+        raise HTTPException(404, "Video file has been purged")
     if not os.path.exists(filepath):
         raise HTTPException(404, f"Video file missing on disk: {filepath}")
     mime = mimetypes.guess_type(filepath)[0] or "video/mp4"
@@ -733,6 +735,12 @@ def api_run_status():
 def api_storage_stats():
     """Return storage usage broken out by blank vs kept videos."""
     return db.get_storage_stats()
+
+
+@app.post("/api/maintenance/promote_paired")
+def api_promote_paired():
+    count = db.promote_paired_blanks()
+    return {"ok": True, "promoted": count}
 
 
 @app.post("/api/maintenance/purge")

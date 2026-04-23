@@ -1438,46 +1438,53 @@ async function openVideo(id) {
   const paired = d.paired;
   const wrap = document.getElementById('videoPlayerWrap');
 
-  if (paired && paired.filepath) {
-    // Determine which is wide (lens 0) and which is telephoto (lens 1)
-    const wide  = v.lens_index === 0 ? v  : paired;
-    const tele  = v.lens_index === 1 ? v  : paired;
+  if (paired && paired.id) {
+    const wide   = v.lens_index === 0 ? v  : paired;
+    const tele   = v.lens_index === 1 ? v  : paired;
     const wideId = v.lens_index === 0 ? v.id : paired.id;
     const teleId = v.lens_index === 1 ? v.id : paired.id;
+    const widePurged = !wide.filepath  || wide.file_purged_at;
+    const telePurged = !tele.filepath  || tele.file_purged_at;
+
+    const videoEl = (id, purged, label) => purged
+      ? `<div style="display:flex;align-items:center;justify-content:center;height:200px;background:rgba(0,0,0,0.3);border-radius:4px;color:var(--muted);font-size:12px;font-family:var(--font-mono)">
+           ${label} — file purged
+         </div>`
+      : `<video id="video${label.replace(' ','')}" controls style="width:100%">
+           <source src="/media/video/${id}" type="video/mp4">
+         </video>`;
 
     wrap.innerHTML = `
       <div class="dual-video-wrap">
         <div>
           <div class="lens-label">📷 Wide (fixed)</div>
-          <video id="videoWide" controls>
-            <source src="/media/video/${wideId}" type="video/mp4">
-          </video>
+          ${videoEl(wideId, widePurged, 'Wide')}
         </div>
         <div>
           <div class="lens-label">🔭 Telephoto (adjustable)</div>
-          <video id="videoTele" controls>
-            <source src="/media/video/${teleId}" type="video/mp4">
-          </video>
+          ${videoEl(teleId, telePurged, 'Telephoto')}
         </div>
       </div>`;
 
-    // Sync playback — when one plays/pauses/seeks the other follows
-    const vWide = document.getElementById('videoWide');
-    const vTele = document.getElementById('videoTele');
-    let syncing = false;
-    function syncVideos(src, dst) {
-      if (syncing) return;
-      syncing = true;
-      dst.currentTime = src.currentTime;
-      src.paused ? dst.pause() : dst.play().catch(() => {});
-      syncing = false;
+    // Only sync if both videos are present
+    if (!widePurged && !telePurged) {
+      const vWide = document.getElementById('videoWide');
+      const vTele = document.getElementById('videoTelephoto');
+      let syncing = false;
+      function syncVideos(src, dst) {
+        if (syncing) return;
+        syncing = true;
+        dst.currentTime = src.currentTime;
+        src.paused ? dst.pause() : dst.play().catch(() => {});
+        syncing = false;
+      }
+      vWide.addEventListener('play',   () => { syncing=false; vTele.play().catch(()=>{}); });
+      vWide.addEventListener('pause',  () => { syncing=false; vTele.pause(); });
+      vWide.addEventListener('seeked', () => syncVideos(vWide, vTele));
+      vTele.addEventListener('play',   () => { syncing=false; vWide.play().catch(()=>{}); });
+      vTele.addEventListener('pause',  () => { syncing=false; vWide.pause(); });
+      vTele.addEventListener('seeked', () => syncVideos(vTele, vWide));
     }
-    vWide.addEventListener('play',   () => { syncing=false; vTele.play().catch(()=>{}); });
-    vWide.addEventListener('pause',  () => { syncing=false; vTele.pause(); });
-    vWide.addEventListener('seeked', () => syncVideos(vWide, vTele));
-    vTele.addEventListener('play',   () => { syncing=false; vWide.play().catch(()=>{}); });
-    vTele.addEventListener('pause',  () => { syncing=false; vWide.pause(); });
-    vTele.addEventListener('seeked', () => syncVideos(vTele, vWide));
 
   } else {
     // Single video
