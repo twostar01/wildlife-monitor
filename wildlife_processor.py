@@ -485,14 +485,8 @@ def process_videos(args):
                             insert_crop(det_id, crop["crop_path"], **q)
 
         if not kept:
-            if args.dry_run:
-                log.info(f"  [DRY-RUN] Would delete")
-            else:
-                try:
-                    video_path.unlink()
-                    log.info("  Deleted")
-                except OSError as e:
-                    log.error(f"  Delete failed: {e}")
+            log.info("  No detections — will be archived to blanks folder")
+
 
     log.info(f"Done. Launch dashboard: python web_app.py --data-dir {args.data_dir}")
 

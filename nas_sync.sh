@@ -464,6 +464,102 @@ PYEOF
             exit 1
         fi
 
+        # ── Archive blank videos to NAS blanks folder ─────────────────────────
+        NAS_BLANK_ROOT="$NAS_ARCHIVE_ROOT/blanks"
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo "  Archiving blank videos → NAS: $NAS_BLANK_ROOT"
+        echo "  Structure: blanks/<camera>/<year>/<month>/<day>/<file>"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        echo ""
+
+        python3 - <<PYEOF
+import os, sys, sqlite3, shutil
+from pathlib import Path
+from datetime import datetime
+
+db_path      = "$DB_PATH"
+local_dir    = "$LOCAL_DIR"
+blank_root   = "$NAS_BLANK_ROOT"
+archive_root = "$NAS_ARCHIVE_ROOT"
+
+conn = sqlite3.connect(db_path)
+conn.row_factory = sqlite3.Row
+rows = conn.execute("""
+    SELECT id, filepath, camera_name, recorded_at, filename
+    FROM videos
+    WHERE kept=0
+      AND has_animal=0 AND has_person=0
+      AND filepath IS NOT NULL
+      AND file_purged_at IS NULL
+""").fetchall()
+
+archived = skipped = failed = already_archived = 0
+
+for row in rows:
+    local_path = Path(row["filepath"])
+
+    # Skip if already in archive
+    if str(local_path).startswith(archive_root):
+        already_archived += 1
+        continue
+
+    if not local_path.exists():
+        skipped += 1
+        continue
+
+    camera = row["camera_name"] or "unknown_camera"
+    rec_dt = row["recorded_at"] or ""
+    try:
+        dt = datetime.fromisoformat(rec_dt)
+        year, month, day = f"{dt.year:04d}", f"{dt.month:02d}", f"{dt.day:02d}"
+    except (ValueError, TypeError):
+        mtime = local_path.stat().st_mtime
+        dt    = datetime.fromtimestamp(mtime)
+        year, month, day = f"{dt.year:04d}", f"{dt.month:02d}", f"{dt.day:02d}"
+
+    dest_dir  = Path(blank_root) / camera / year / month / day
+    dest_path = dest_dir / row["filename"]
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    if dest_path.exists():
+        src_size  = local_path.stat().st_size
+        dest_size = dest_path.stat().st_size
+        if src_size == dest_size:
+            conn.execute("UPDATE videos SET filepath=? WHERE id=?",
+                         (str(dest_path), row["id"]))
+            conn.commit()
+            print(f"  → SKIP (already archived)  blanks/{camera}/{year}/{month}/{day}/{row['filename']}")
+            already_archived += 1
+            continue
+
+    try:
+        src_stat  = local_path.stat()
+        src_atime = src_stat.st_atime
+        shutil.move(str(local_path), str(dest_path))
+        os.utime(str(dest_path), (src_atime, dt.timestamp()))
+        conn.execute("UPDATE videos SET filepath=? WHERE id=?",
+                     (str(dest_path), row["id"]))
+        conn.commit()
+        size_mb = dest_path.stat().st_size / 1_048_576
+        print(f"  ✓  {size_mb:.0f} MB  blanks/{camera}/{year}/{month}/{day}/{row['filename']}")
+        archived += 1
+    except Exception as e:
+        print(f"  ✗  FAILED  {row['filename']}: {e}", file=sys.stderr)
+        failed += 1
+
+conn.close()
+print(f"\n  Blank archived: {archived}   Already done: {already_archived}   Skipped: {skipped}   Failed: {failed}")
+if failed:
+    sys.exit(1)
+PYEOF
+
+        BLANK_ARCHIVE_EXIT=$?
+        if [[ "$BLANK_ARCHIVE_EXIT" -ne 0 ]]; then
+            warn "Some blank videos failed to archive. Local copies kept for safety."
+            exit 1
+        fi
+
         # ── Delete ALL local staging copies (kept and deleted alike) ─────────
         echo ""
         info "Cleaning up local staging directory..."
@@ -486,8 +582,9 @@ PYEOF
 
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-        ok "All done. Kept footage is on the NAS at:"
-        echo "     $NAS_ARCHIVE_ROOT/<camera>/<year>/<month>/<day>/"
+        ok "All done. Footage archived to NAS at:"
+        echo "     Kept:  $NAS_ARCHIVE_ROOT/<camera>/<year>/<month>/<day>/"
+        echo "     Blank: $NAS_ARCHIVE_ROOT/blanks/<camera>/<year>/<month>/<day>/"
         echo "  The dashboard reads videos directly from there via the mount."
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 

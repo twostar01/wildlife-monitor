@@ -393,6 +393,22 @@ def api_timeline(
     return db.get_timeline(days=days, date_from=date_from, date_to=date_to)
 
 
+@app.get("/api/blanks")
+def api_blanks(
+    page:      int = Query(1,  ge=1),
+    per_page:  int = Query(20, ge=1, le=100),
+    camera:    str = Query(None),
+    search:    str = Query(None),
+    date_from: str = Query(None),
+    date_to:   str = Query(None),
+):
+    return db.get_blank_videos(
+        page=page, per_page=per_page,
+        camera=camera, search=search,
+        date_from=date_from, date_to=date_to,
+    )
+
+
 @app.get("/api/search")
 def api_search(q: str = Query(..., min_length=1)):
     result = db.search(q)
@@ -645,11 +661,16 @@ def api_purge(dry_run: bool = Query(False)):
     Pass dry_run=true to see what would be deleted without deleting anything.
     """
     settings = _load_settings()
+
+    def _limit(val):
+        """Convert setting value to None if 0/falsy (disabled), else return as-is."""
+        return val if val else None
+
     purgeable = db.get_purgeable_videos(
-        blank_days = settings.get("blank_retention_days") or None,
-        blank_gb   = settings.get("blank_retention_gb")   or None,
-        kept_days  = settings.get("kept_retention_days")  or None,
-        kept_gb    = settings.get("kept_retention_gb")    or None,
+        blank_days = _limit(settings.get("blank_retention_days")),
+        blank_gb   = _limit(settings.get("blank_retention_gb")),
+        kept_days  = _limit(settings.get("kept_retention_days")),
+        kept_gb    = _limit(settings.get("kept_retention_gb")),
     )
 
     results = {"blank": [], "kept": [], "dry_run": dry_run}
@@ -657,18 +678,22 @@ def api_purge(dry_run: bool = Query(False)):
 
     for category in ("blank", "kept"):
         for video in purgeable[category]:
+            size_mb = video["file_size_mb"] or 0
             entry = {
                 "id":          video["id"],
                 "filename":    video["filename"],
                 "recorded_at": video["recorded_at"],
-                "size_mb":     round(video["file_size_mb"] or 0, 1),
+                "size_mb":     round(size_mb, 1),
                 "deleted":     False,
             }
             if not dry_run:
                 deleted = db.purge_video_file(video["id"])
                 entry["deleted"] = deleted
                 if deleted:
-                    total_freed_mb += video["file_size_mb"] or 0
+                    total_freed_mb += size_mb
+            else:
+                # In dry run, sum up what would be freed
+                total_freed_mb += size_mb
             results[category].append(entry)
 
     results["total_freed_gb"] = round(total_freed_mb / 1024, 2)

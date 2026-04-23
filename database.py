@@ -370,6 +370,7 @@ def get_purgeable_videos(
             FROM videos
             WHERE has_animal = 0 AND has_person = 0
               AND kept = 0
+              AND filepath IS NOT NULL
               AND file_purged_at IS NULL
               AND processed_at < DATETIME('now', ?)
             ORDER BY recorded_at ASC
@@ -467,16 +468,73 @@ def purge_video_file(video_id: int) -> bool:
         return deleted
 
 
+def get_blank_videos(
+    page: int = 1,
+    per_page: int = 20,
+    camera: Optional[str] = None,
+    search: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+) -> dict:
+    """Return paginated blank videos (no detections), newest first."""
+    conditions = [
+        "v.has_animal = 0 AND v.has_person = 0",
+        "v.kept = 0",
+    ]
+    params: list = []
+
+    if camera:
+        conditions.append("v.camera_name = ?")
+        params.append(camera)
+    if search:
+        conditions.append("v.filename LIKE ?")
+        params.append(f"%{search}%")
+    if date_from:
+        conditions.append("DATE(v.recorded_at) >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("DATE(v.recorded_at) <= ?")
+        params.append(date_to)
+
+    where = "WHERE " + " AND ".join(conditions)
+    offset = (page - 1) * per_page
+
+    with get_conn() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM videos v {where}", params
+        ).fetchone()[0]
+
+        rows = conn.execute(
+            f"""SELECT v.id, v.filename, v.filepath, v.camera_name,
+                       v.recorded_at, v.file_size_mb, v.duration_secs,
+                       v.thumbnail_path, v.processed_at, v.file_purged_at
+                FROM videos v
+                {where}
+                ORDER BY v.recorded_at DESC
+                LIMIT ? OFFSET ?""",
+            params + [per_page, offset],
+        ).fetchall()
+
+    return {
+        "total":    total,
+        "page":     page,
+        "pages":    max(1, -(-total // per_page)),
+        "per_page": per_page,
+        "videos":   [dict(r) for r in rows],
+    }
+
+
+
 def get_storage_stats() -> dict:
-    """Return storage usage broken out by blank vs kept videos.
-    Blank video files are deleted immediately by the processor so they
-    don't contribute to active storage — only kept videos count."""
+    """Return storage usage broken out by blank vs kept vs purged videos."""
     with get_conn() as conn:
         blank = conn.execute("""
             SELECT COUNT(*) as count,
-                   0 as total_mb
+                   COALESCE(SUM(file_size_mb), 0) as total_mb
             FROM videos
-            WHERE has_animal=0 AND has_person=0 AND file_purged_at IS NULL
+            WHERE has_animal=0 AND has_person=0
+              AND kept=0
+              AND file_purged_at IS NULL
         """).fetchone()
 
         kept = conn.execute("""
@@ -496,12 +554,12 @@ def get_storage_stats() -> dict:
 
     return {
         "blank_videos":        blank["count"],
-        "blank_gb":            0.0,  # files already deleted by processor
+        "blank_gb":            round(blank["total_mb"] / 1024, 2),
         "kept_videos":         kept["count"],
         "kept_gb":             round(kept["total_mb"] / 1024, 2),
         "purged_videos":       purged["count"],
         "purged_gb_reclaimed": round(purged["total_mb"] / 1024, 2),
-        "total_active_gb":     round(kept["total_mb"] / 1024, 2),
+        "total_active_gb":     round((blank["total_mb"] + kept["total_mb"]) / 1024, 2),
     }
 
 

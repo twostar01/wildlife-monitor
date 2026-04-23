@@ -432,6 +432,7 @@
       <button data-tab="species">Species</button>
       <button data-tab="gallery">Gallery</button>
       <button data-tab="videos">Videos</button>
+      <button data-tab="blanks">Blanks</button>
       <button data-tab="timeline">Trends</button>
       <button data-tab="settings">Settings</button>
     </nav>
@@ -532,6 +533,34 @@
       </div>
       <div class="video-list" id="videoList"></div>
       <div class="pagination" id="videoPagination"></div>
+    </section>
+
+    <!-- ── BLANKS ──────────────────────────────────────────── -->
+    <section class="section" id="tab-blanks">
+      <div class="section-header">
+        <div class="section-title">Blank Videos</div>
+        <div class="section-subtitle">Videos with no animal or person detections</div>
+      </div>
+      <div class="filter-row" style="margin-bottom:16px">
+        <div>
+          <label>Camera</label><br>
+          <select id="blankCameraFilter"><option value="">All Cameras</option></select>
+        </div>
+        <div>
+          <label>From</label><br>
+          <input class="setting-input" type="date" id="blankDateFrom" style="width:150px">
+        </div>
+        <div>
+          <label>To</label><br>
+          <input class="setting-input" type="date" id="blankDateTo" style="width:150px">
+        </div>
+        <div>
+          <label>Search</label><br>
+          <input type="text" id="blankSearch" placeholder="filename…" style="width:200px">
+        </div>
+      </div>
+      <div class="video-list" id="blankList"></div>
+      <div class="pagination" id="blankPagination"></div>
     </section>
 
     <!-- ── TIMELINE ─────────────────────────────────────── -->
@@ -653,17 +682,18 @@
         <p style="font-size:12px;color:var(--muted);margin:10px 0 16px;line-height:1.6">
           Set limits for how long video files are kept on the NAS. DB records (detections, species,
           timestamps) are always kept — only the video files are deleted. The first limit hit triggers
-          a purge. Set to 0 to disable a limit.
+          a purge. Set to 0 to disable a limit. Blank videos are archived to a blanks folder on the NAS
+          and deleted when retention limits are reached.
         </p>
         <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
           <div>
             <div style="font-family:var(--font-mono);font-size:11px;color:var(--accent);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border)">
-              Blank Videos <span style="color:var(--muted);font-size:10px">(no animal/person — files deleted immediately)</span>
+              Blank Videos <span style="color:var(--muted);font-size:10px">(no animal/person detected)</span>
             </div>
             <div class="setting-row">
               <label class="setting-label">Delete records after (days)</label>
               <input class="setting-input" type="number" id="setBlankDays" min="0" style="width:100px">
-              <span class="setting-hint">Remove DB records for blank videos older than N days. Files are already deleted by the processor — this cleans up the database. Default: 90.</span>
+              <span class="setting-hint">Delete blank video files older than N days. Blank videos are archived to the NAS blanks folder and kept until this limit is reached. Default: 90.</span>
             </div>
             <div class="setting-row">
               <label class="setting-label">Storage limit (GB)</label>
@@ -823,6 +853,7 @@ const state = {
   galleryPage: 1, gallerySpecies: '', gallerySort: 'quality',
   videoPage: 1, videoSpecies: '', videoSearch: '', videoCamera: '',
   videoDateFrom: '', videoDateTo: '',
+  blankPage: 1,
   timelineDays: 30, timelineDateFrom: '', timelineDateTo: '',
   speciesList: [],
 };
@@ -837,6 +868,9 @@ function switchTab(tab) {
   if (btn) btn.classList.add('active');
   const section = document.getElementById('tab-' + tab);
   if (section) section.classList.add('active');
+  if (tab === 'blanks')   { loadCameras(); loadBlanks(); }
+  if (tab === 'timeline') loadTimeline();
+  if (tab === 'settings') { loadSettings(); loadStorageStats(); }
 }
 
 function clearVideoDateFilter() {
@@ -886,13 +920,11 @@ function fmtDuration(s) {
 // ── Navigation ────────────────────────────────────────────────────────────────
 document.querySelectorAll('nav button').forEach(btn => {
   btn.addEventListener('click', () => {
-    switchTab(btn.dataset.tab);
     const tab = btn.dataset.tab;
-    if (tab === 'species')  loadSpecies();
-    if (tab === 'gallery')  loadGallery();
-    if (tab === 'videos')   { loadCameras(); loadVideos(); }
-    if (tab === 'timeline') loadTimeline();
-    if (tab === 'settings') { loadSettings(); loadStorageStats(); }
+    switchTab(tab);
+    if (tab === 'species') loadSpecies();
+    if (tab === 'gallery') loadGallery();
+    if (tab === 'videos')  { loadCameras(); loadVideos(); }
   });
 });
 
@@ -1308,10 +1340,68 @@ document.getElementById('videoSearch').addEventListener('input', e => {
 async function loadCameras() {
   const cameras = await api('/cameras').catch(() => []);
   const sel = document.getElementById('videoCameraFilter');
+  const blankSel = document.getElementById('blankCameraFilter');
   if (!cameras.length) return;
-  sel.innerHTML = '<option value="">All Cameras</option>' +
+  const opts = '<option value="">All Cameras</option>' +
     cameras.map(c => `<option value="${escHtml(c.camera_name)}">${escHtml(c.camera_name)} (${c.video_count})</option>`).join('');
+  sel.innerHTML = opts;
+  blankSel.innerHTML = opts;
 }
+
+async function loadBlanks(page = 1) {
+  state.blankPage = page;
+  const params = new URLSearchParams({ page, per_page: 20 });
+  const cam   = document.getElementById('blankCameraFilter').value;
+  const from  = document.getElementById('blankDateFrom').value;
+  const to    = document.getElementById('blankDateTo').value;
+  const srch  = document.getElementById('blankSearch').value.trim();
+  if (cam)  params.set('camera',    cam);
+  if (from) params.set('date_from', from);
+  if (to)   params.set('date_to',   to);
+  if (srch) params.set('search',    srch);
+
+  const data = await api('/blanks?' + params);
+  const list = document.getElementById('blankList');
+
+  if (!data.videos.length) {
+    list.innerHTML = '<div class="empty">No blank videos found.</div>';
+    document.getElementById('blankPagination').innerHTML = '';
+    return;
+  }
+
+  list.innerHTML = data.videos.map(v => `
+    <div class="video-item" onclick="openVideo(${v.id})">
+      <div class="video-thumb">
+        ${v.thumbnail_path
+          ? `<img src="/media/thumbnails/${encodeURIComponent(v.thumbnail_path.split('/').pop())}" loading="lazy">`
+          : '<div class="no-thumb">No preview</div>'}
+      </div>
+      <div class="video-meta">
+        <div class="video-filename">${escHtml(v.filename)}</div>
+        <div class="video-details">
+          ${v.camera_name ? `<span>${escHtml(v.camera_name)}</span> · ` : ''}
+          <span>${fmtDate(v.recorded_at)}</span> ·
+          <span>${v.file_size_mb ? v.file_size_mb.toFixed(0) + ' MB' : '—'}</span>
+          ${v.file_purged_at ? ' · <span style="color:var(--muted)">purged</span>' : ''}
+        </div>
+        <div style="margin-top:6px">
+          <span class="chip" style="background:rgba(150,150,150,0.15);color:var(--muted);border:1px solid var(--border)">No detections</span>
+        </div>
+      </div>
+    </div>`).join('');
+
+  renderPagination('blankPagination', data.page, data.pages, loadBlanks);
+}
+
+// Blank filter listeners
+document.getElementById('blankCameraFilter').addEventListener('change', () => loadBlanks(1));
+document.getElementById('blankDateFrom').addEventListener('change', () => loadBlanks(1));
+document.getElementById('blankDateTo').addEventListener('change', () => loadBlanks(1));
+let _blankSearchTimer;
+document.getElementById('blankSearch').addEventListener('input', () => {
+  clearTimeout(_blankSearchTimer);
+  _blankSearchTimer = setTimeout(() => loadBlanks(1), 400);
+});
 
 // ── Video player ──────────────────────────────────────────────────────────────
 async function openVideo(id) {
