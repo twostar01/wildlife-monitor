@@ -1786,9 +1786,17 @@ async function checkUpdates() {
     const latestVer = `<span class="update-ver">${escHtml(c.latest)}</span>`;
 
     let statusBadge, actionCell;
-    if (c.up_to_date === true) {
+    if (c.downloaded === false) {
+      // Model cache cleared or never downloaded — not an error, just needs a run
+      statusBadge = `<span class="badge-unk">not downloaded</span>`;
+      actionCell  = `<span style="color:var(--muted);font-size:11px;font-family:var(--font-mono)">Downloads on next run</span>`;
+    } else if (c.up_to_date === true) {
       statusBadge = `<span class="badge-ok">✓ current</span>`;
-      actionCell  = `<span style="color:var(--muted);font-size:11px">—</span>`;
+      actionCell  = c.action
+        ? `<button class="btn-update" id="upd-${escHtml(c.id)}"
+             onclick="applyUpdate('${escHtml(c.id)}','${escHtml(c.action)}','${escHtml(c.action_arg || '')}')">
+             Clear cache</button>`
+        : `<span style="color:var(--muted);font-size:11px">—</span>`;
     } else if (c.up_to_date === false) {
       statusBadge = `<span class="badge-upd">⬆ update available</span>`;
       const btnLabel = c.type === 'package' ? 'Upgrade' : 'Clear cache';
@@ -1798,7 +1806,7 @@ async function checkUpdates() {
       actionCell = `
         <div>
           <button class="btn-update" id="upd-${escHtml(c.id)}"
-            onclick="applyUpdate('${escHtml(c.id)}','${escHtml(c.action)}','${escHtml(c.action_arg)}')">
+            onclick="applyUpdate('${escHtml(c.id)}','${escHtml(c.action)}','${escHtml(c.action_arg || '')}')">
             ${btnLabel}
           </button>
           ${hint}
@@ -1841,11 +1849,22 @@ async function applyUpdate(id, action, actionArg) {
   }).then(r => r.json()).catch(() => null);
 
   if (res && res.ok) {
-    // Re-run check to refresh all statuses
-    await checkUpdates();
+    // Show confirmation in the row before it gets re-rendered
+    const row = btn?.closest('tr');
+    if (row) {
+      const fb = row.querySelector('.update-feedback');
+      if (fb) {
+        fb.style.color = 'var(--accent)';
+        fb.textContent = action === 'clear_model_cache'
+          ? '✓ Cache cleared — model re-downloads on next run'
+          : '✓ Updated — restart the server to apply';
+      }
+    }
+    // Re-render after a short delay so user sees the confirmation
+    setTimeout(() => checkUpdates(), 1800);
   } else {
     if (btn) { btn.disabled = false; btn.textContent = 'Retry'; }
-    const errMsg = res?.detail || res?.output || 'Update failed. Check the terminal.';
+    const errMsg = res?.detail || res?.output || 'Failed. Check the terminal.';
     const row = btn?.closest('tr');
     if (row) {
       const fb = row.querySelector('.update-feedback');

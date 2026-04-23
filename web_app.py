@@ -465,27 +465,50 @@ def api_check_updates():
 
     # ── MegaDetector model ────────────────────────────────────────────────────
     try:
-        from megadetector.detection.pytorch_detector import known_models, DEFAULT_MODEL as MD_DEFAULT
-        md_default_url  = known_models.get(MD_DEFAULT, {}).get("url", "")
-        md_cached_files = list((Path.home() / ".cache" / "megadetector").glob("*.pt")) if (Path.home() / ".cache" / "megadetector").exists() else []
-        md_cached_name  = md_cached_files[0].name if md_cached_files else None
-        md_expected     = md_default_url.split("/")[-1] if md_default_url else None
-        md_current      = md_cached_name or "not downloaded"
-        md_up_to_date   = (md_cached_name == md_expected) if md_expected else None
+        # Try to find the cached model file — MegaDetector downloads to one of
+        # several locations depending on the version and how it was invoked.
+        md_cache_dirs = [
+            Path.home() / ".cache" / "megadetector",
+            Path.home() / ".cache" / "huggingface" / "hub",
+            Path.home() / ".local" / "share" / "megadetector",
+        ]
+        md_cached_files = []
+        for d in md_cache_dirs:
+            if d.exists():
+                md_cached_files += list(d.rglob("*.pt")) + list(d.rglob("*.onnx"))
+
+        md_cached_name = md_cached_files[0].name if md_cached_files else None
+        md_current     = md_cached_name or "not downloaded"
+
+        # Try to get the expected model name from the package
+        md_expected = None
+        try:
+            from megadetector.detection.pytorch_detector import DEFAULT_MODEL as MD_DEFAULT
+            md_expected = MD_DEFAULT
+        except ImportError:
+            pass
+        try:
+            from megadetector.utils.ct_utils import DEFAULT_DETECTOR_LABEL as MD_DEFAULT2
+            md_expected = md_expected or MD_DEFAULT2
+        except ImportError:
+            pass
+
+        md_up_to_date = True if md_cached_name else False
+
         results.append({
             "id":         "model_megadetector",
             "type":       "model",
             "name":       "MegaDetector model",
             "label":      "MegaDetector model",
             "installed":  md_current,
-            "latest":     md_expected or "unknown",
+            "latest":     md_expected or "see megadetector docs",
             "up_to_date": md_up_to_date,
             "action":     "clear_model_cache",
-            "action_arg": str(Path.home() / ".cache" / "megadetector"),
+            "action_arg": str(md_cache_dirs[0]),
         })
     except Exception as e:
         results.append({"id": "model_megadetector", "type": "model", "name": "MegaDetector model",
-                        "installed": "error", "latest": "unknown", "up_to_date": None,
+                        "installed": f"error: {e}", "latest": "unknown", "up_to_date": None,
                         "action": None, "error": str(e)})
 
     # ── SpeciesNet model ──────────────────────────────────────────────────────
@@ -493,20 +516,22 @@ def api_check_updates():
         from speciesnet import DEFAULT_MODEL as SN_DEFAULT, SUPPORTED_MODELS
         # Kaggle cache path: ~/.cache/kaggle/models/google/speciesnet/...
         kaggle_cache = Path.home() / ".cache" / "kaggle" / "models" / "google" / "speciesnet"
-        sn_cached    = "downloaded" if kaggle_cache.exists() and any(kaggle_cache.rglob("*.pkl")) else "not downloaded"
-        # Latest = last entry in SUPPORTED_MODELS (highest version)
-        sn_latest    = SUPPORTED_MODELS[-1] if SUPPORTED_MODELS else "unknown"
-        sn_up_to_date = (SN_DEFAULT == sn_latest) if sn_latest != "unknown" else None
+        sn_downloaded = kaggle_cache.exists() and any(kaggle_cache.rglob("*.pkl"))
+        sn_cached     = "downloaded" if sn_downloaded else "not downloaded"
+        sn_latest     = SUPPORTED_MODELS[-1] if SUPPORTED_MODELS else "unknown"
+        # Only flag as update available if it IS downloaded but on an older version
+        sn_up_to_date = True if not sn_downloaded else (SN_DEFAULT == sn_latest)
         results.append({
-            "id":         "model_speciesnet",
-            "type":       "model",
-            "name":       "SpeciesNet model",
-            "label":      "SpeciesNet model",
-            "installed":  f"{SN_DEFAULT} ({sn_cached})",
-            "latest":     sn_latest,
-            "up_to_date": sn_up_to_date,
-            "action":     "clear_model_cache",
-            "action_arg": str(Path.home() / ".cache" / "kaggle" / "models" / "google" / "speciesnet"),
+            "id":           "model_speciesnet",
+            "type":         "model",
+            "name":         "SpeciesNet model",
+            "label":        "SpeciesNet model",
+            "installed":    f"{SN_DEFAULT} ({sn_cached})",
+            "latest":       sn_latest,
+            "up_to_date":   sn_up_to_date,
+            "downloaded":   sn_downloaded,
+            "action":       "clear_model_cache" if sn_downloaded else None,
+            "action_arg":   str(Path.home() / ".cache" / "kaggle" / "models" / "google" / "speciesnet"),
         })
     except Exception as e:
         results.append({"id": "model_speciesnet", "type": "model", "name": "SpeciesNet model",
