@@ -29,6 +29,12 @@ import threading
 from pathlib import Path
 from typing import Optional
 
+try:
+    import psutil
+    _PSUTIL = True
+except ImportError:
+    _PSUTIL = False
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -407,6 +413,57 @@ def api_blanks(
         camera=camera, search=search,
         date_from=date_from, date_to=date_to,
     )
+
+
+@app.get("/api/system")
+def api_system():
+    """Return system resource usage — CPU, RAM, local disk, service uptime."""
+    if not _PSUTIL:
+        return {"available": False, "error": "psutil not installed"}
+
+    import datetime
+
+    # CPU — 0.5s interval is fast but non-blocking enough for a dashboard call
+    cpu_pct = psutil.cpu_percent(interval=0.5)
+
+    # RAM
+    ram   = psutil.virtual_memory()
+    ram_used_gb  = round(ram.used  / 1024**3, 1)
+    ram_total_gb = round(ram.total / 1024**3, 1)
+    ram_pct      = ram.percent
+
+    # Local disk — partition containing the data directory
+    try:
+        disk = psutil.disk_usage(DATA_DIR)
+        disk_used_gb  = round(disk.used  / 1024**3, 1)
+        disk_total_gb = round(disk.total / 1024**3, 1)
+        disk_pct      = round(disk.percent, 1)
+    except Exception:
+        disk_used_gb = disk_total_gb = disk_pct = None
+
+    # Service uptime — time since the current process started
+    try:
+        proc         = psutil.Process(os.getpid())
+        started_at   = datetime.datetime.fromtimestamp(proc.create_time())
+        uptime_secs  = int((datetime.datetime.now() - started_at).total_seconds())
+        h, rem       = divmod(uptime_secs, 3600)
+        m, s         = divmod(rem, 60)
+        uptime_str   = f"{h}h {m}m" if h else f"{m}m {s}s"
+    except Exception:
+        uptime_str = None
+
+    return {
+        "available":    True,
+        "cpu_pct":      cpu_pct,
+        "ram_used_gb":  ram_used_gb,
+        "ram_total_gb": ram_total_gb,
+        "ram_pct":      ram_pct,
+        "disk_used_gb": disk_used_gb,
+        "disk_total_gb":disk_total_gb,
+        "disk_pct":     disk_pct,
+        "uptime":       uptime_str,
+        "hostname":     socket.gethostname(),
+    }
 
 
 @app.get("/api/search")

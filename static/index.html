@@ -650,6 +650,8 @@
               </select>
               <span class="setting-hint">The date format your cameras embed in filenames. Used to correctly filter videos by date and set recorded_at in the database. Auto-detect tries all known patterns.</span>
             </div>
+            <div class="setting-row">
+              <label class="setting-label" style="display:flex;align-items:center;gap:10px;cursor:pointer;flex-direction:row;text-transform:none;letter-spacing:0;font-size:13px;color:var(--text)">
                 <input type="checkbox" id="setSkipSpeciesnet" style="width:auto;accent-color:var(--accent);transform:scale(1.2)">
                 Skip SpeciesNet (animal detection only — no species identification)
               </label>
@@ -661,17 +663,30 @@
           </div>
         </div>
 
-        <!-- NAS Connection -->
-        <div class="card">
-          <div class="card-title">NAS Connection</div>
-          <div id="nasStatus" style="margin-top:16px">
-            <div class="loading"><span class="spinner"></span>Loading…</div>
+        <!-- Right column: NAS Connection + System Stats -->
+        <div style="display:flex;flex-direction:column;gap:20px">
+
+          <!-- NAS Connection -->
+          <div class="card">
+            <div class="card-title">NAS Connection</div>
+            <div id="nasStatus" style="margin-top:16px">
+              <div class="loading"><span class="spinner"></span>Loading…</div>
+            </div>
+            <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);line-height:1.6">
+              To change NAS settings, run
+              <code style="color:var(--accent);background:rgba(109,186,92,0.08);padding:2px 6px;border-radius:3px">./nas_connect.sh</code>
+              from the terminal on the host machine.
+            </div>
           </div>
-          <div style="margin-top:18px;padding-top:14px;border-top:1px solid var(--border);font-size:12px;color:var(--muted);line-height:1.6">
-            To change NAS settings, run
-            <code style="color:var(--accent);background:rgba(109,186,92,0.08);padding:2px 6px;border-radius:3px">./nas_connect.sh</code>
-            from the terminal on the host machine.
+
+          <!-- System Stats -->
+          <div class="card">
+            <div class="card-title">System</div>
+            <div id="systemStats" style="margin-top:16px">
+              <div class="loading"><span class="spinner"></span>Loading…</div>
+            </div>
           </div>
+
         </div>
 
       </div>
@@ -870,7 +885,7 @@ function switchTab(tab) {
   if (section) section.classList.add('active');
   if (tab === 'blanks')   { loadCameras(); loadBlanks(); }
   if (tab === 'timeline') loadTimeline();
-  if (tab === 'settings') { loadSettings(); loadStorageStats(); }
+  if (tab === 'settings') { loadSettings(); loadStorageStats(); loadSystemStats(); }
 }
 
 function clearVideoDateFilter() {
@@ -1874,6 +1889,43 @@ async function applyUpdate(id, action, actionArg) {
 }
 
 // ── Storage & retention ───────────────────────────────────────────────────────
+async function loadSystemStats() {
+  const el = document.getElementById('systemStats');
+  if (!el) return;
+  const s = await fetch('/api/system').then(r => r.json()).catch(() => null);
+  if (!s || !s.available) {
+    el.innerHTML = '<div style="font-size:11px;color:var(--muted)">System stats unavailable — install psutil: pip install psutil</div>';
+    return;
+  }
+
+  const bar = (pct, color) => `
+    <div style="height:4px;background:var(--border);border-radius:2px;margin-top:4px">
+      <div style="height:100%;width:${Math.min(pct,100)}%;background:${color};border-radius:2px;transition:width 0.3s"></div>
+    </div>`;
+
+  const cpuColor  = s.cpu_pct  > 80 ? '#e05c5c' : s.cpu_pct  > 50 ? 'var(--gold)' : 'var(--accent)';
+  const ramColor  = s.ram_pct  > 80 ? '#e05c5c' : s.ram_pct  > 60 ? 'var(--gold)' : 'var(--accent)';
+  const diskColor = s.disk_pct > 85 ? '#e05c5c' : s.disk_pct > 70 ? 'var(--gold)' : 'var(--accent)';
+
+  const row = (label, value, pct, color) => `
+    <div style="margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;align-items:baseline">
+        <span style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px">${label}</span>
+        <span style="font-family:var(--font-mono);font-size:12px;color:var(--text)">${value}</span>
+      </div>
+      ${bar(pct, color)}
+    </div>`;
+
+  el.innerHTML = `
+    ${row('CPU', `${s.cpu_pct.toFixed(0)}%`, s.cpu_pct, cpuColor)}
+    ${row('Memory', `${s.ram_used_gb} / ${s.ram_total_gb} GB`, s.ram_pct, ramColor)}
+    ${s.disk_used_gb != null ? row('Local Disk', `${s.disk_used_gb} / ${s.disk_total_gb} GB`, s.disk_pct, diskColor) : ''}
+    <div style="padding-top:10px;border-top:1px solid var(--border);display:grid;grid-template-columns:1fr 1fr;gap:6px;font-family:var(--font-mono);font-size:11px">
+      ${s.uptime   ? `<div style="color:var(--muted)">Uptime</div><div style="text-align:right;color:var(--text)">${escHtml(s.uptime)}</div>` : ''}
+      ${s.hostname ? `<div style="color:var(--muted)">Host</div><div style="text-align:right;color:var(--text)">${escHtml(s.hostname)}</div>` : ''}
+    </div>`;
+}
+
 async function loadStorageStats() {
   const el = document.getElementById('storageStats');
   el.innerHTML = '<div class="loading"><span class="spinner"></span>Loading…</div>';
