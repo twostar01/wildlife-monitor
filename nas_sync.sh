@@ -405,6 +405,9 @@ rows = conn.execute(
 archived = skipped = failed = already_archived = 0
 
 for row in rows:
+    if not row["filepath"]:
+        skipped += 1
+        continue
     local_path = Path(row["filepath"])
 
     # Skip if this video is already in the archive (re-run safety)
@@ -435,25 +438,28 @@ for row in rows:
 
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    # If destination already exists with the same size, just update the DB path
+    # If destination already exists, just update the DB path — don't re-move
     if dest_path.exists():
-        src_size  = local_path.stat().st_size
-        dest_size = dest_path.stat().st_size
-        if src_size == dest_size:
-            conn.execute("UPDATE videos SET filepath=? WHERE id=?",
-                         (str(dest_path), row["id"]))
-            conn.commit()
-            print(f"  → SKIP (already archived)  {camera}/{year}/{month}/{day}/{row['filename']}")
-            already_archived += 1
-            continue
+        # Clear any other record pointing here first to avoid UNIQUE conflict
+        conn.execute("UPDATE videos SET filepath=NULL WHERE filepath=? AND id!=?",
+                     (str(dest_path), row["id"]))
+        conn.commit()
+        conn.execute("UPDATE videos SET filepath=? WHERE id=?",
+                     (str(dest_path), row["id"]))
+        conn.commit()
+        print(f"  → SKIP (already on NAS)  {camera}/{year}/{month}/{day}/{row['filename']}")
+        already_archived += 1
+        continue
 
     try:
         # Capture timestamps before the move (source is gone afterwards)
         src_stat = local_path.stat()
         src_atime = src_stat.st_atime
         shutil.move(str(local_path), str(dest_path))
-        # Restore original mtime on the archive copy so date-based queries stay accurate
         os.utime(str(dest_path), (src_atime, dt.timestamp()))
+        conn.execute("UPDATE videos SET filepath=NULL WHERE filepath=? AND id!=?",
+                     (str(dest_path), row["id"]))
+        conn.commit()
         conn.execute("UPDATE videos SET filepath=? WHERE id=?",
                      (str(dest_path), row["id"]))
         conn.commit()
@@ -512,10 +518,13 @@ rows = conn.execute("""
 archived = skipped = failed = already_archived = 0
 
 for row in rows:
+    if not row["filepath"]:
+        skipped += 1
+        continue
     local_path = Path(row["filepath"])
 
-    # Skip if already in archive
-    if str(local_path).startswith(archive_root):
+    # Skip if already in the blanks archive
+    if str(local_path).startswith(blank_root):
         already_archived += 1
         continue
 
@@ -538,21 +547,24 @@ for row in rows:
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     if dest_path.exists():
-        src_size  = local_path.stat().st_size
-        dest_size = dest_path.stat().st_size
-        if src_size == dest_size:
-            conn.execute("UPDATE videos SET filepath=? WHERE id=?",
-                         (str(dest_path), row["id"]))
-            conn.commit()
-            print(f"  → SKIP (already archived)  blanks/{camera}/{year}/{month}/{day}/{row['filename']}")
-            already_archived += 1
-            continue
+        conn.execute("UPDATE videos SET filepath=NULL WHERE filepath=? AND id!=?",
+                     (str(dest_path), row["id"]))
+        conn.commit()
+        conn.execute("UPDATE videos SET filepath=? WHERE id=?",
+                     (str(dest_path), row["id"]))
+        conn.commit()
+        print(f"  → SKIP (already on NAS)  blanks/{camera}/{year}/{month}/{day}/{row['filename']}")
+        already_archived += 1
+        continue
 
     try:
         src_stat  = local_path.stat()
         src_atime = src_stat.st_atime
         shutil.move(str(local_path), str(dest_path))
         os.utime(str(dest_path), (src_atime, dt.timestamp()))
+        conn.execute("UPDATE videos SET filepath=NULL WHERE filepath=? AND id!=?",
+                     (str(dest_path), row["id"]))
+        conn.commit()
         conn.execute("UPDATE videos SET filepath=? WHERE id=?",
                      (str(dest_path), row["id"]))
         conn.commit()

@@ -2179,6 +2179,28 @@ async function checkRunStatus() {
     log.style.display = 'block';
     log.textContent = data.log;
     log.scrollTop = log.scrollHeight;
+
+    // Parse progress from [X/Y] pattern in log
+    const progressMatch = data.log.match(/\[(\d+)\/(\d+)\][^\n]*$/m);
+    if (progressMatch) {
+      const cur = parseInt(progressMatch[1]);
+      const tot = parseInt(progressMatch[2]);
+      const pct = Math.round((cur / tot) * 100);
+      let bar = document.getElementById('runProgressBar');
+      if (!bar) {
+        bar = document.createElement('div');
+        bar.id = 'runProgressBar';
+        bar.style.cssText = 'margin:8px 0 4px;height:6px;background:var(--border);border-radius:3px;overflow:hidden';
+        bar.innerHTML = '<div id="runProgressFill" style="height:100%;background:var(--accent);border-radius:3px;transition:width 0.3s"></div>';
+        log.parentNode.insertBefore(bar, log);
+        const lbl = document.createElement('div');
+        lbl.id = 'runProgressLabel';
+        lbl.style.cssText = 'font-family:var(--font-mono);font-size:11px;color:var(--muted);margin-bottom:6px';
+        log.parentNode.insertBefore(lbl, log);
+      }
+      document.getElementById('runProgressFill').style.width = pct + '%';
+      document.getElementById('runProgressLabel').textContent = `Processing ${cur} of ${tot} videos (${pct}%)`;
+    }
   }
 
   if (data.running) {

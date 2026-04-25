@@ -635,6 +635,44 @@ def promote_paired_blanks() -> int:
     }
 
 
+def get_storage_stats() -> dict:
+    """Return storage usage broken out by blank vs kept vs purged videos."""
+    with get_conn() as conn:
+        blank = conn.execute("""
+            SELECT COUNT(*) as count,
+                   COALESCE(SUM(file_size_mb), 0) as total_mb
+            FROM videos
+            WHERE has_animal=0 AND has_person=0
+              AND kept=0
+              AND file_purged_at IS NULL
+        """).fetchone()
+
+        kept = conn.execute("""
+            SELECT COUNT(*) as count,
+                   COALESCE(SUM(file_size_mb), 0) as total_mb
+            FROM videos
+            WHERE (has_animal=1 OR has_person=1)
+              AND kept=1
+              AND file_purged_at IS NULL
+        """).fetchone()
+
+        purged = conn.execute("""
+            SELECT COUNT(*) as count,
+                   COALESCE(SUM(file_size_mb), 0) as total_mb
+            FROM videos WHERE file_purged_at IS NOT NULL
+        """).fetchone()
+
+    return {
+        "blank_videos":        blank["count"],
+        "blank_gb":            round(blank["total_mb"] / 1024, 2),
+        "kept_videos":         kept["count"],
+        "kept_gb":             round(kept["total_mb"] / 1024, 2),
+        "purged_videos":       purged["count"],
+        "purged_gb_reclaimed": round(purged["total_mb"] / 1024, 2),
+        "total_active_gb":     round((blank["total_mb"] + kept["total_mb"]) / 1024, 2),
+    }
+
+
 def insert_crop(
     detection_id: int,
     crop_path: str,

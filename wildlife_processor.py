@@ -360,7 +360,8 @@ def process_videos(args):
     if not videos:
         log.info("No videos found."); return
 
-    log.info(f"Found {len(videos)} video(s)")
+    total = len(videos)
+    log.info(f"Found {total} video(s)")
     log.info("Loading MegaDetector...")
     detector = load_megadetector(args.megadetector_model, force_cpu=args.cpu)
     log.info("MegaDetector ready")
@@ -368,8 +369,8 @@ def process_videos(args):
     crops_dir = os.path.join(args.data_dir, "crops")
     thumb_dir = os.path.join(args.data_dir, "thumbnails")
 
-    for video_path in videos:
-        log.info(f"→ {video_path.name}")
+    for i, video_path in enumerate(videos, 1):
+        log.info(f"[{i}/{total}] → {video_path.name}")
         file_size   = video_path.stat().st_size / 1_048_576
         # Prefer filename-embedded date over mtime — mtime can be wrong after copy/move
         video_date  = _video_date(video_path, args.filename_date_format or 'auto')
