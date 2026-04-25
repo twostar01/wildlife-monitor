@@ -143,20 +143,20 @@ def _camera_from_filename(stem: str) -> str:
     """
     Extract camera name from filename when there is no camera subfolder.
     Handles common DVR naming patterns:
-      World Watch_00_20260327160902   →  World Watch_00   (14-digit timestamp)
+      World Watch_00_20260327160902   →  World Watch      (dual-lens: strip _NN suffix)
       camera1_20260327_160902         →  camera1          (date + time separated)
       front_20260327                  →  front            (date only)
     """
-    # 14-digit timestamp: _YYYYMMDDHHMMSS
-    m = re.match(r'^(.+)_\d{14}$', stem)
+    # 14-digit timestamp: _YYYYMMDDHHMMSS — also strip optional _NN lens index before it
+    m = re.match(r'^(.+?)(?:_\d{2})?_\d{14}$', stem)
     if m:
         return m.group(1)
     # 8-digit date + 6-digit time separated: _YYYYMMDD_HHMMSS
-    m = re.match(r'^(.+)_\d{8}_\d{6}$', stem)
+    m = re.match(r'^(.+?)(?:_\d{2})?_\d{8}_\d{6}$', stem)
     if m:
         return m.group(1)
     # 8-digit date alone: _YYYYMMDD
-    m = re.match(r'^(.+)_\d{8}$', stem)
+    m = re.match(r'^(.+?)(?:_\d{2})?_\d{8}$', stem)
     if m:
         return m.group(1)
     return ""
