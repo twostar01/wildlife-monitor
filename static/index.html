@@ -752,6 +752,18 @@
         </div>
       </div>
 
+      <!-- Species Blacklist -->
+      <div class="card" style="margin-top:20px">
+        <div class="card-title">Species Blacklist</div>
+        <p style="font-size:12px;color:var(--muted);margin:10px 0 16px;line-height:1.6">
+          Species on this list are suppressed from all dashboard views. If a blacklisted species
+          is the top SpeciesNet result, the next highest candidate is used instead.
+          Adding a species optionally requeues all affected videos for SpeciesNet reprocessing.
+        </p>
+        <div id="blacklistTable" style="margin-bottom:16px"></div>
+        <button class="btn-save" onclick="openAddBlacklist()">+ Add Species</button>
+      </div>
+
       <!-- Software & Models -->
       <div class="card" style="margin-top:20px">
         <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
@@ -809,6 +821,15 @@
   </main>
 
   <!-- SPECIES DETAIL MODAL -->
+  <!-- ── CORRECTION MODAL ──────────────────────────────────────── -->
+  <div class="modal-overlay" id="correctionModal">
+    <div class="modal" style="max-width:540px">
+      <button class="modal-close" onclick="closeModal('correctionModal')">✕</button>
+      <div class="modal-title">Correct Species Identification</div>
+      <div id="correctionModalBody" style="margin-top:16px"></div>
+    </div>
+  </div>
+
   <div class="modal-overlay" id="speciesModal">
     <div class="modal">
       <div class="modal-header">
@@ -870,6 +891,7 @@ const state = {
   videoDateFrom: '', videoDateTo: '',
   blankPage: 1,
   timelineDays: 30, timelineDateFrom: '', timelineDateTo: '',
+  currentVideoId: null,
   speciesList: [],
 };
 
@@ -885,7 +907,7 @@ function switchTab(tab) {
   if (section) section.classList.add('active');
   if (tab === 'blanks')   { loadCameras(); loadBlanks(); }
   if (tab === 'timeline') loadTimeline();
-  if (tab === 'settings') { loadSettings(); loadStorageStats(); loadSystemStats(); }
+  if (tab === 'settings') { loadSettings(); loadStorageStats(); loadSystemStats(); loadBlacklist(); }
 }
 
 function clearVideoDateFilter() {
@@ -1424,6 +1446,7 @@ async function openVideo(id) {
   document.getElementById('videoPlayerModal').classList.add('open');
   document.getElementById('videoPlayerWrap').innerHTML =
     '<div class="loading" style="min-height:120px"><span class="spinner"></span>Loading…</div>';
+  state.currentVideoId = id;
   document.getElementById('detectionChips').innerHTML = '';
 
   const d = await api(`/videos/${id}`);
@@ -1518,15 +1541,26 @@ async function openVideo(id) {
   }
 
   const chips = Object.values(seen);
+  // Store candidates for correction modal lookup
+  window._detectionCandidates = {};
+  chips.forEach(det => {
+    if (det.label) window._detectionCandidates[det.label] = det.top_candidates_json || '[]';
+  });
+
   document.getElementById('detectionChips').innerHTML = chips.length
     ? chips.map(det => `
-        <div class="detection-chip" onclick="seekVideosTo(${det.timestamp_secs||0})">
+        <div class="detection-chip" onclick="seekVideosTo(${det.timestamp_secs||0})"
+          title="Click to seek · Click ✏ to correct species">
           ${det.crop_path ? `<img src="${cropUrl(det.crop_path)}" loading="lazy">` : ''}
           <span>
+            ${det.corrected ? '<span style="color:var(--accent);font-size:9px">✏ </span>' : ''}
             ${escHtml(det.common_name || det.category)}
             ${det._lens === 1 ? '<span style="color:var(--muted);font-size:9px"> 🔭</span>' : ''}
             · ${fmtDuration(det.timestamp_secs)}
           </span>
+          ${det.label ? `<span class="chip-correct-btn" title="Correct species"
+            onclick="event.stopPropagation();openCorrectionModal(${state.currentVideoId},'${escHtml(det.label)}','${escHtml(det.common_name||det.category||'')}',window._detectionCandidates['${escHtml(det.label)}']||'[]')"
+            style="margin-left:4px;opacity:0.5;cursor:pointer;font-size:10px">✏</span>` : ''}
         </div>
       `).join('')
     : '';
@@ -1723,6 +1757,10 @@ function closeModal(id) {
       v.src = '';
     });
   }
+  if (id === 'correctionModal') {
+    const title = document.querySelector('#correctionModal .modal-title');
+    if (title) title.textContent = 'Correct Species Identification';
+  }
 }
 
 document.querySelectorAll('.modal-overlay').forEach(el => {
@@ -1896,6 +1934,31 @@ async function applyUpdate(id, action, actionArg) {
 }
 
 // ── Storage & retention ───────────────────────────────────────────────────────
+async function loadStorageStats() {
+  const el = document.getElementById('storageStats');
+  if (!el) return;
+  const data = await fetch('/api/maintenance/storage').then(r => r.json()).catch(() => null);
+  if (!data) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">Unavailable</div>'; return; }
+  el.innerHTML = `
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
+      <div class="storage-stat">
+        <div class="storage-label">Blank Videos</div>
+        <div class="storage-value">${data.blank_gb ?? 0} GB</div>
+        <div class="storage-sub">${data.blank_videos ?? 0} files</div>
+      </div>
+      <div class="storage-stat">
+        <div class="storage-label">Kept Videos</div>
+        <div class="storage-value">${data.kept_gb ?? 0} GB</div>
+        <div class="storage-sub">${data.kept_videos ?? 0} files</div>
+      </div>
+      <div class="storage-stat">
+        <div class="storage-label">Purged</div>
+        <div class="storage-value">${data.purged_gb_reclaimed ?? 0} GB</div>
+        <div class="storage-sub">${data.purged_videos ?? 0} records</div>
+      </div>
+    </div>`;
+}
+
 async function loadSystemStats() {
   const el = document.getElementById('systemStats');
   if (!el) return;
@@ -1931,6 +1994,247 @@ async function loadSystemStats() {
       ${s.uptime   ? `<div style="color:var(--muted)">Uptime</div><div style="text-align:right;color:var(--text)">${escHtml(s.uptime)}</div>` : ''}
       ${s.hostname ? `<div style="color:var(--muted)">Host</div><div style="text-align:right;color:var(--text)">${escHtml(s.hostname)}</div>` : ''}
     </div>`;
+}
+
+// ── Species Correction ────────────────────────────────────────────────────────
+
+let _correctionContext = null; // {videoId, originalLabel, commonName, candidates}
+
+async function openCorrectionModal(videoId, originalLabel, commonName, candidatesJson) {
+  _correctionContext = { videoId, originalLabel, commonName };
+  let candidates = [];
+  try { candidates = JSON.parse(candidatesJson || '[]'); } catch {}
+
+  const body = document.getElementById('correctionModalBody');
+  body.innerHTML = `
+    <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
+      Correcting: <strong style="color:var(--text)">${escHtml(commonName || originalLabel)}</strong>
+      on this video only.
+    </div>
+
+    ${candidates.length ? `
+    <div style="margin-bottom:14px">
+      <div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Top Candidates</div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${candidates.map(c => `
+          <button onclick="applyCorrectionQuick('${escHtml(c.label)}','${escHtml(c.common_name||'')}','${escHtml(c.scientific_name||'')}',${videoId},'${escHtml(originalLabel)}')"
+            style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:4px;font-size:11px;cursor:pointer;text-align:left">
+            ${escHtml(c.common_name || c.label)}
+            <span style="color:var(--muted);font-size:10px"> ${(c.score*100).toFixed(0)}%</span>
+          </button>`).join('')}
+      </div>
+    </div>` : ''}
+
+    <div style="margin-bottom:14px">
+      <div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">
+        Search Species
+        <label style="margin-left:12px;font-size:10px;cursor:pointer">
+          <input type="checkbox" id="corrAllRegions" onchange="searchSpeciesCorrection()"> Show all regions
+        </label>
+      </div>
+      <input id="corrSearchInput" class="setting-input" type="text" placeholder="Type species name…"
+        oninput="searchSpeciesCorrection()" style="width:100%;margin-bottom:8px">
+      <div id="corrSearchResults" style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;display:none"></div>
+    </div>
+
+    <div style="display:flex;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+      <button class="btn-run" style="background:rgba(224,92,92,0.15);border-color:#e05c5c;color:#e05c5c;font-size:12px;padding:7px 16px"
+        onclick="applyCorrection(${videoId},'${escHtml(originalLabel)}',null,null,null)">
+        ⛔ Suppress this species
+      </button>
+      <button class="btn-save" onclick="closeModal('correctionModal')">Cancel</button>
+    </div>`;
+
+  document.getElementById('correctionModal').classList.add('open');
+}
+
+let _corrSearchTimer;
+async function searchSpeciesCorrection() {
+  clearTimeout(_corrSearchTimer);
+  _corrSearchTimer = setTimeout(async () => {
+    const q = document.getElementById('corrSearchInput').value.trim();
+    if (q.length < 2) { document.getElementById('corrSearchResults').style.display='none'; return; }
+    const allRegions = document.getElementById('corrAllRegions').checked;
+    const results = await fetch(`/api/species/search?q=${encodeURIComponent(q)}&all_regions=${allRegions}`)
+      .then(r => r.json()).catch(() => []);
+    const el = document.getElementById('corrSearchResults');
+    if (!results.length) {
+      el.style.display = 'block';
+      el.innerHTML = '<div style="padding:10px;font-size:12px;color:var(--muted)">No results found</div>';
+      return;
+    }
+    el.style.display = 'block';
+    el.innerHTML = results.map(r => `
+      <div onclick="applyCorrectionQuick('${escHtml(r.label)}','${escHtml(r.common_name||'')}','${escHtml(r.scientific_name||'')}',${_correctionContext?.videoId},'${escHtml(_correctionContext?.originalLabel)}')"
+        style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:12px"
+        onmouseover="this.style.background='var(--surface)'" onmouseout="this.style.background=''">
+        <strong>${escHtml(r.common_name || r.label)}</strong>
+        <span style="color:var(--muted);font-size:11px;margin-left:6px">${escHtml(r.scientific_name || '')}</span>
+      </div>`).join('');
+  }, 350);
+}
+
+async function applyCorrectionQuick(label, common, scientific, videoId, originalLabel) {
+  await applyCorrection(videoId, originalLabel, label, common, scientific);
+}
+
+async function applyCorrection(videoId, originalLabel, correctedLabel, correctedCommon, correctedScientific) {
+  const res = await fetch('/api/corrections', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      video_id: videoId,
+      original_label: originalLabel,
+      corrected_label: correctedLabel,
+      corrected_common: correctedCommon,
+      corrected_scientific: correctedScientific,
+    }),
+  }).then(r => r.json()).catch(() => null);
+
+  if (res && res.ok) {
+    closeModal('correctionModal');
+    // Refresh video player if open
+    const vpModal = document.getElementById('videoPlayerModal');
+    if (vpModal && vpModal.classList.contains('open')) {
+      openVideo(videoId);
+    }
+    loadDashboard();
+  }
+}
+
+// ── Species Blacklist ─────────────────────────────────────────────────────────
+
+async function loadBlacklist() {
+  const el = document.getElementById('blacklistTable');
+  if (!el) return;
+  const entries = await fetch('/api/blacklist').then(r => r.json()).catch(() => []);
+  if (!entries.length) {
+    el.innerHTML = '<div style="font-size:12px;color:var(--muted)">No species blacklisted.</div>';
+    return;
+  }
+  el.innerHTML = `
+    <table style="width:100%;border-collapse:collapse;font-size:12px">
+      <thead><tr>
+        <th style="text-align:left;padding:6px 8px;font-family:var(--font-mono);font-size:10px;color:var(--muted)">Species</th>
+        <th style="text-align:right;padding:6px 8px;font-family:var(--font-mono);font-size:10px;color:var(--muted)">Affected</th>
+        <th style="padding:6px 8px"></th>
+      </tr></thead>
+      <tbody>
+        ${entries.map(e => `
+          <tr style="border-top:1px solid var(--border)">
+            <td style="padding:8px">
+              <div style="color:var(--text)">${escHtml(e.common_name || e.label)}</div>
+              <div style="color:var(--muted);font-size:11px;font-style:italic">${escHtml(e.scientific_name || '')}</div>
+              ${e.note ? `<div style="color:var(--muted);font-size:10px">${escHtml(e.note)}</div>` : ''}
+            </td>
+            <td style="padding:8px;text-align:right;color:var(--muted)">${e.affected_count} video(s)</td>
+            <td style="padding:8px;text-align:right">
+              ${e.affected_count > 0 ? `
+                <button onclick="requeueBlacklisted('${escHtml(e.label)}')" class="btn-save" style="font-size:11px;padding:4px 10px;margin-right:6px">
+                  Requeue ${e.affected_count}
+                </button>` : ''}
+              <button onclick="removeBlacklist('${escHtml(e.label)}')" style="background:transparent;border:1px solid #e05c5c;color:#e05c5c;padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer">
+                Remove
+              </button>
+            </td>
+          </tr>`).join('')}
+      </tbody>
+    </table>`;
+}
+
+function openAddBlacklist() {
+  _correctionContext = null;
+  const body = document.getElementById('correctionModalBody');
+  body.innerHTML = `
+    <p style="font-size:12px;color:var(--muted);margin-bottom:16px">
+      Search for a species to add to the blacklist. Future detections of this species
+      will use the next highest probability candidate instead.
+    </p>
+    <div style="margin-bottom:14px">
+      <label style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:6px">
+        Search
+        <label style="margin-left:12px;font-size:10px;cursor:pointer;text-transform:none;letter-spacing:0">
+          <input type="checkbox" id="blAddAllRegions" onchange="searchBlacklistAdd()"> Show all regions
+        </label>
+      </label>
+      <input id="blAddSearch" class="setting-input" type="text" placeholder="Type species name…"
+        oninput="searchBlacklistAdd()" style="width:100%;margin-bottom:8px">
+      <div id="blAddResults" style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;display:none"></div>
+    </div>
+    <div id="blAddSelected" style="display:none;padding:12px;background:var(--surface);border-radius:4px;margin-bottom:12px"></div>
+    <label style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;display:block;margin-bottom:6px">Note (optional)</label>
+    <input id="blAddNote" class="setting-input" type="text" placeholder="e.g. Not native to Utah" style="width:100%;margin-bottom:14px">
+    <label style="display:flex;align-items:center;gap:8px;font-size:12px;cursor:pointer;margin-bottom:16px">
+      <input type="checkbox" id="blAddRequeue"> Also requeue all existing detections for reprocessing
+    </label>
+    <div style="display:flex;gap:10px">
+      <button id="blAddConfirm" class="btn-run" onclick="confirmAddBlacklist()" disabled style="font-size:12px;padding:7px 16px">Add to Blacklist</button>
+      <button class="btn-save" onclick="closeModal('correctionModal')">Cancel</button>
+    </div>`;
+
+  document.getElementById('correctionModal').classList.add('open');
+  document.getElementById('correctionModal').querySelector('.modal-title').textContent = 'Add to Species Blacklist';
+}
+
+let _blAddSelected = null;
+let _blAddTimer;
+async function searchBlacklistAdd() {
+  clearTimeout(_blAddTimer);
+  _blAddTimer = setTimeout(async () => {
+    const q = document.getElementById('blAddSearch').value.trim();
+    if (q.length < 2) { document.getElementById('blAddResults').style.display='none'; return; }
+    const allRegions = document.getElementById('blAddAllRegions').checked;
+    const results = await fetch(`/api/species/search?q=${encodeURIComponent(q)}&all_regions=${allRegions}`)
+      .then(r => r.json()).catch(() => []);
+    const el = document.getElementById('blAddResults');
+    el.style.display = 'block';
+    el.innerHTML = results.map(r => `
+      <div onclick="selectBlacklistSpecies('${escHtml(r.label)}','${escHtml(r.common_name||'')}','${escHtml(r.scientific_name||'')}')"
+        style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:12px"
+        onmouseover="this.style.background='var(--surface)'" onmouseout="this.style.background=''">
+        <strong>${escHtml(r.common_name || r.label)}</strong>
+        <span style="color:var(--muted);font-size:11px;margin-left:6px">${escHtml(r.scientific_name||'')}</span>
+      </div>`).join('') || '<div style="padding:10px;font-size:12px;color:var(--muted)">No results</div>';
+  }, 350);
+}
+
+function selectBlacklistSpecies(label, common, scientific) {
+  _blAddSelected = {label, common, scientific};
+  document.getElementById('blAddResults').style.display = 'none';
+  document.getElementById('blAddSearch').value = common || label;
+  const sel = document.getElementById('blAddSelected');
+  sel.style.display = 'block';
+  sel.innerHTML = `<strong>${escHtml(common||label)}</strong> <em style="color:var(--muted)">${escHtml(scientific||'')}</em>`;
+  document.getElementById('blAddConfirm').disabled = false;
+}
+
+async function confirmAddBlacklist() {
+  if (!_blAddSelected) return;
+  const note    = document.getElementById('blAddNote').value.trim();
+  const requeue = document.getElementById('blAddRequeue').checked;
+  const res = await fetch('/api/blacklist', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({..._blAddSelected, common_name: _blAddSelected.common,
+                          scientific_name: _blAddSelected.scientific, note, requeue}),
+  }).then(r => r.json()).catch(() => null);
+  if (res && res.ok) {
+    closeModal('correctionModal');
+    loadBlacklist();
+    if (res.requeued > 0) alert(`✓ ${res.requeued} video(s) queued for reprocessing at next scheduled run.`);
+  }
+}
+
+async function removeBlacklist(label) {
+  if (!confirm(`Remove "${label}" from blacklist?`)) return;
+  await fetch(`/api/blacklist/${encodeURIComponent(label)}`, {method:'DELETE'});
+  loadBlacklist();
+}
+
+async function requeueBlacklisted(label) {
+  const res = await fetch(`/api/blacklist/${encodeURIComponent(label)}/requeue`, {method:'POST'})
+    .then(r => r.json()).catch(() => null);
+  if (res && res.ok) alert(`✓ ${res.requeued} video(s) queued for reprocessing.`);
 }
 
 async function loadStorageStats() {

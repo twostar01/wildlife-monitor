@@ -296,6 +296,23 @@ def api_species():
     return rows
 
 
+@app.get("/api/species/search")
+def api_species_search(
+    q:           str  = Query(""),
+    country:     str  = Query(None),
+    admin1:      str  = Query(None),
+    all_regions: bool = Query(False),
+    limit:       int  = Query(20, ge=1, le=100),
+):
+    """Search SpeciesNet taxonomy. Filtered to region by default."""
+    settings     = _load_settings()
+    country      = country or settings.get("country")
+    admin1       = admin1  or settings.get("admin1_region")
+    classes_path = os.path.join(DATA_DIR, "speciesnet_classes.json")
+    return db.search_taxonomy(q, classes_path, country=country, admin1=admin1,
+                              limit=limit, all_regions=all_regions)
+
+
 @app.get("/api/species/{label:path}")
 def api_species_detail(label: str):
     detail = db.get_species_detail(label)
@@ -466,6 +483,88 @@ def api_system():
         "uptime":       uptime_str,
         "hostname":     socket.gethostname(),
     }
+
+
+class BlacklistEntry(BaseModel):
+    label:           str
+    common_name:     str
+    scientific_name: str
+    note:            Optional[str] = ""
+    requeue:         bool = False   # if True, also requeue affected videos
+
+
+class CorrectionRequest(BaseModel):
+    video_id:            int
+    original_label:      str
+    corrected_label:     Optional[str] = None   # None = suppress
+    corrected_common:    Optional[str] = None
+    corrected_scientific: Optional[str] = None
+    note:                Optional[str] = ""
+
+
+@app.get("/api/blacklist")
+def api_get_blacklist():
+    entries = db.get_blacklist()
+    for e in entries:
+        e["affected_count"] = db.get_blacklist_affected_count(e["label"])
+    return entries
+
+
+@app.post("/api/blacklist")
+def api_add_blacklist(entry: BlacklistEntry):
+    db.add_to_blacklist(entry.label, entry.common_name, entry.scientific_name, entry.note or "")
+    requeued = 0
+    if entry.requeue:
+        requeued = db.requeue_species(entry.label)
+    return {"ok": True, "requeued": requeued}
+
+
+@app.delete("/api/blacklist/{label:path}")
+def api_remove_blacklist(label: str):
+    db.remove_from_blacklist(label)
+    return {"ok": True}
+
+
+@app.post("/api/blacklist/{label:path}/requeue")
+def api_requeue_species(label: str):
+    count = db.requeue_species(label)
+    return {"ok": True, "requeued": count}
+
+
+@app.get("/api/corrections")
+def api_get_corrections(video_id: int = Query(None)):
+    if video_id:
+        return db.get_video_corrections(video_id)
+    # All corrections — for admin view
+    with db.get_conn() as conn:
+        rows = conn.execute("""
+            SELECT vc.*, v.filename, v.camera_name
+            FROM video_corrections vc
+            JOIN videos v ON vc.video_id = v.id
+            ORDER BY vc.corrected_at DESC
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/corrections")
+def api_save_correction(req: CorrectionRequest):
+    correction_id = db.save_video_correction(
+        req.video_id, req.original_label, req.corrected_label,
+        req.corrected_common, req.corrected_scientific, req.note or ""
+    )
+    return {"ok": True, "id": correction_id}
+
+
+@app.delete("/api/corrections/{correction_id}")
+def api_delete_correction(correction_id: int):
+    db.delete_video_correction(correction_id)
+    return {"ok": True}
+
+
+@app.get("/api/maintenance/reprocess_queue")
+def api_reprocess_queue():
+    return {"videos": db.get_reprocess_queue(), "count": len(db.get_reprocess_queue())}
+
 
 
 @app.get("/api/search")

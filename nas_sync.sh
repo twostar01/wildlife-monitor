@@ -359,6 +359,28 @@ if [[ "$THEN_PROCESS" == true ]]; then
         exit 0
     fi
 
+    # ── SpeciesNet-only reprocess for flagged videos ──────────────────────────
+    REQUEUE_COUNT=$(python3 - <<PYEOF
+import sys
+sys.path.insert(0, '$SCRIPT_DIR')
+from database import init_db, get_reprocess_queue
+init_db('$DATA_DIR/wildlife.db')
+print(len(get_reprocess_queue()))
+PYEOF
+)
+    if [[ -n "$REQUEUE_COUNT" && "$REQUEUE_COUNT" -gt 0 ]]; then
+        echo ""
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        info "Reprocessing $REQUEUE_COUNT flagged video(s) with SpeciesNet..."
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+        source "$VENV_DIR/bin/activate"
+        python3 "$SCRIPT_DIR/wildlife_processor.py" \
+            --reprocess-flagged \
+            --video-dir "$LOCAL_DIR" \
+            --data-dir "$DATA_DIR" \
+            "${EXTRA_PROCESSOR_ARGS[@]}"
+    fi
+
     if [[ "$NO_CLEANUP" == false ]]; then
         # ── Promote paired blank videos ───────────────────────────────────────
         # If one lens of a dual-lens pair kept a video, keep the other lens too

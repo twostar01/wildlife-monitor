@@ -95,11 +95,34 @@ CREATE TABLE IF NOT EXISTS crops (
     created_at      TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS blacklist (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    label           TEXT UNIQUE NOT NULL,
+    common_name     TEXT,
+    scientific_name TEXT,
+    created_at      TEXT,
+    note            TEXT
+);
+
+CREATE TABLE IF NOT EXISTS video_corrections (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    video_id             INTEGER NOT NULL REFERENCES videos(id),
+    original_label       TEXT NOT NULL,
+    corrected_label      TEXT,           -- NULL means suppress
+    corrected_common     TEXT,
+    corrected_scientific TEXT,
+    corrected_at         TEXT NOT NULL,
+    note                 TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_videos_recorded_at ON videos(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_videos_camera ON videos(camera_name);
 CREATE INDEX IF NOT EXISTS idx_detections_video_id ON detections(video_id);
 CREATE INDEX IF NOT EXISTS idx_species_label ON species(label);
 CREATE INDEX IF NOT EXISTS idx_crops_quality ON crops(quality_score DESC);
+CREATE INDEX IF NOT EXISTS idx_blacklist_label ON blacklist(label);
+CREATE INDEX IF NOT EXISTS idx_corrections_video ON video_corrections(video_id);
+CREATE INDEX IF NOT EXISTS idx_corrections_label ON video_corrections(original_label);
 """
 
 # Migration: add camera_name to existing databases that predate this column
@@ -122,6 +145,14 @@ ALTER TABLE videos ADD COLUMN lens_index INTEGER;
 ALTER TABLE videos ADD COLUMN paired_video_id INTEGER REFERENCES videos(id);
 """
 
+MIGRATION_ADD_REPROCESS = """
+ALTER TABLE videos ADD COLUMN needs_reprocess INTEGER DEFAULT 0;
+"""
+
+MIGRATION_ADD_CANDIDATES = """
+ALTER TABLE species ADD COLUMN top_candidates_json TEXT;
+"""
+
 # Labels to exclude from all dashboard queries.
 # SpeciesNet returns ';;;;;;blank' when it determines a crop has no animal.
 BLANK_LABEL_FILTER = "s.label NOT LIKE '%;;;;;;blank'"
@@ -141,9 +172,12 @@ SUPPRESS_UNKNOWN_IF_IDENTIFIED = """(
     )
 )"""
 
-# Combined filter — always exclude blank, and suppress Unknown when a real
-# species is present on the same video.
-KNOWN_SPECIES_FILTER = f"{BLANK_LABEL_FILTER} AND {SUPPRESS_UNKNOWN_IF_IDENTIFIED}"
+# Combined filter — always exclude blank, suppress Unknown when a real species
+# is present, and exclude any species on the blacklist.
+KNOWN_SPECIES_FILTER = (
+    f"{BLANK_LABEL_FILTER} AND {SUPPRESS_UNKNOWN_IF_IDENTIFIED} "
+    f"AND s.label NOT IN (SELECT label FROM blacklist)"
+)
 
 # SQL expression that returns the display name — user correction when set, else SpeciesNet common_name
 DISPLAY_COMMON     = "COALESCE(NULLIF(s.user_common_name,''), s.common_name)"
@@ -166,6 +200,10 @@ def init_db(db_path: Optional[str] = None):
         sp_cols = [r[1] for r in conn.execute("PRAGMA table_info(species)").fetchall()]
         if "user_common_name" not in sp_cols:
             conn.executescript(MIGRATION_ADD_CORRECTIONS)
+        if "top_candidates_json" not in sp_cols:
+            conn.executescript(MIGRATION_ADD_CANDIDATES)
+        if "needs_reprocess" not in cols:
+            conn.executescript(MIGRATION_ADD_REPROCESS)
         # Migration: drop NOT NULL constraint on filepath so purged/blank records can have NULL
         filepath_notnull = next(
             (r[3] for r in conn.execute("PRAGMA table_info(videos)").fetchall() if r[1] == "filepath"), 0
@@ -346,13 +384,14 @@ def insert_species(
     common_name: Optional[str],
     scientific_name: Optional[str],
     confidence: float,
+    top_candidates_json: Optional[str] = None,
 ) -> int:
     with get_conn() as conn:
         cur = conn.execute(
             """INSERT INTO species
-               (detection_id, label, common_name, scientific_name, confidence)
-               VALUES (?,?,?,?,?)""",
-            (detection_id, label, common_name, scientific_name, confidence),
+               (detection_id, label, common_name, scientific_name, confidence, top_candidates_json)
+               VALUES (?,?,?,?,?,?)""",
+            (detection_id, label, common_name, scientific_name, confidence, top_candidates_json),
         )
         return cur.lastrowid
 
@@ -576,6 +615,192 @@ def get_blank_videos(
 
 
 
+def get_blacklist() -> list:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM blacklist ORDER BY common_name"
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def add_to_blacklist(label: str, common_name: str, scientific_name: str, note: str = "") -> dict:
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO blacklist (label, common_name, scientific_name, created_at, note)
+               VALUES (?,?,?,?,?)
+               ON CONFLICT(label) DO UPDATE SET
+                 common_name=excluded.common_name,
+                 scientific_name=excluded.scientific_name,
+                 note=excluded.note""",
+            (label, common_name, scientific_name, datetime.now().isoformat(), note),
+        )
+    return {"ok": True}
+
+
+def remove_from_blacklist(label: str) -> dict:
+    with get_conn() as conn:
+        conn.execute("DELETE FROM blacklist WHERE label=?", (label,))
+    return {"ok": True}
+
+
+def get_blacklist_affected_count(label: str) -> int:
+    """Count videos with detections of a given species label."""
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT COUNT(DISTINCT d.video_id) FROM species s
+            JOIN detections d ON s.detection_id = d.id
+            WHERE s.label = ?
+        """, (label,)).fetchone()
+    return row[0] if row else 0
+
+
+def requeue_species(label: str) -> int:
+    """Mark all kept videos with detections of label for SpeciesNet reprocessing."""
+    with get_conn() as conn:
+        conn.execute("""
+            UPDATE videos SET needs_reprocess=1
+            WHERE kept=1 AND id IN (
+                SELECT DISTINCT d.video_id FROM detections d
+                JOIN species s ON s.detection_id = d.id
+                WHERE s.label = ?
+            )
+        """, (label,))
+        count = conn.total_changes
+    return count
+
+
+def get_reprocess_queue() -> list:
+    """Return kept videos flagged for SpeciesNet reprocessing."""
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, filename, filepath, camera_name, recorded_at
+            FROM videos
+            WHERE needs_reprocess=1 AND kept=1 AND filepath IS NOT NULL
+            ORDER BY recorded_at
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def clear_reprocess_flag(video_id: int):
+    with get_conn() as conn:
+        conn.execute("UPDATE videos SET needs_reprocess=0 WHERE id=?", (video_id,))
+
+
+def save_video_correction(
+    video_id: int,
+    original_label: str,
+    corrected_label: Optional[str],
+    corrected_common: Optional[str],
+    corrected_scientific: Optional[str],
+    note: str = "",
+) -> int:
+    """Save or update a video-level species correction."""
+    with get_conn() as conn:
+        # Replace existing correction for same video+original_label
+        conn.execute("""
+            DELETE FROM video_corrections
+            WHERE video_id=? AND original_label=?
+        """, (video_id, original_label))
+        cur = conn.execute("""
+            INSERT INTO video_corrections
+            (video_id, original_label, corrected_label, corrected_common,
+             corrected_scientific, corrected_at, note)
+            VALUES (?,?,?,?,?,?,?)
+        """, (video_id, original_label, corrected_label, corrected_common,
+               corrected_scientific, datetime.now().isoformat(), note))
+    return cur.lastrowid
+
+
+def get_video_corrections(video_id: int) -> list:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM video_corrections WHERE video_id=? ORDER BY corrected_at",
+            (video_id,)
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def delete_video_correction(correction_id: int):
+    with get_conn() as conn:
+        conn.execute("DELETE FROM video_corrections WHERE id=?", (correction_id,))
+
+
+def apply_corrections_to_species(species_list: list, corrections: list) -> list:
+    """
+    Post-processing: overlay video_corrections onto a species list.
+    corrections is the result of get_video_corrections(video_id).
+    Returns species_list with corrected entries modified in place.
+    """
+    corr_map = {c["original_label"]: c for c in corrections}
+    result = []
+    for sp in species_list:
+        label = sp.get("label")
+        if label and label in corr_map:
+            c = corr_map[label]
+            if c["corrected_label"] is None:
+                continue  # suppressed
+            sp = dict(sp)
+            sp["label"]           = c["corrected_label"]
+            sp["common_name"]     = c["corrected_common"]
+            sp["scientific_name"] = c["corrected_scientific"]
+            sp["corrected"]       = True
+            sp["original_label"]  = label
+        result.append(sp)
+    return result
+
+
+def search_taxonomy(
+    query: str,
+    classes_path: str,
+    country: Optional[str] = None,
+    admin1: Optional[str] = None,
+    limit: int = 20,
+    all_regions: bool = False,
+) -> list:
+    """
+    Search SpeciesNet taxonomy from cached classes JSON.
+    Filters by query string against common name and scientific name.
+    Region filtering is not applied here — SpeciesNet's geo-prior handles
+    filtering at classification time. The all_regions flag is accepted for
+    API compatibility but has no effect currently.
+    """
+    import json as _json
+    try:
+        with open(classes_path) as f:
+            classes = _json.load(f)
+    except (FileNotFoundError, ValueError):
+        return []
+
+    q = query.lower().strip()
+    results = []
+
+    for entry in classes:
+        label      = entry.get("label", "")
+        common     = (entry.get("common_name") or "").lower()
+        scientific = (entry.get("scientific_name") or "").lower()
+
+        # Skip blank/unknown pseudo-labels
+        if not label or label.endswith(";;;;;;blank") or label == "Unknown species":
+            continue
+
+        # Text match — require at least 2 chars
+        if len(q) >= 2 and q not in common and q not in scientific:
+            continue
+        if len(q) < 2:
+            continue
+
+        results.append({
+            "label":           entry.get("label"),
+            "common_name":     entry.get("common_name"),
+            "scientific_name": entry.get("scientific_name"),
+        })
+
+        if len(results) >= limit:
+            break
+
+    return results
+
+
 def promote_paired_blanks() -> int:
     """
     If one lens of a dual-lens pair detected an animal or person, mark the
@@ -728,14 +953,16 @@ def get_stats() -> dict:
                 FROM dates WHERE day < DATE('now')
             )
             SELECT dates.day,
-                   COALESCE(s.common_name, 'Unknown') as species,
+                   s.common_name as species,
                    s.label,
                    COUNT(DISTINCT v.id) as count
             FROM dates
             LEFT JOIN videos v
                 ON DATE(v.recorded_at) = dates.day AND v.kept = 1
             LEFT JOIN detections d ON v.id = d.video_id
-            LEFT JOIN species s ON s.detection_id = d.id AND {KNOWN_SPECIES_FILTER}
+            LEFT JOIN species s ON s.detection_id = d.id
+                AND {KNOWN_SPECIES_FILTER}
+                AND s.label != 'Unknown species'
             GROUP BY dates.day, s.label
             ORDER BY dates.day
         """).fetchall()
@@ -1001,6 +1228,7 @@ def get_video_by_id(video_id: int) -> dict:
         detections = conn.execute(f"""
             SELECT d.id, d.frame_number, d.timestamp_secs, d.category, d.confidence,
                    s.label, {DISPLAY_COMMON} as common_name, s.scientific_name,
+                   s.top_candidates_json,
                    c.crop_path, c.quality_score
             FROM detections d
             LEFT JOIN species s ON s.detection_id = d.id
@@ -1010,6 +1238,12 @@ def get_video_by_id(video_id: int) -> dict:
             ORDER BY d.timestamp_secs
         """, (video_id,)).fetchall()
 
+        # Fetch video-level corrections and apply as post-processing layer
+        corrections = get_video_corrections(video_id)
+        det_list    = apply_corrections_to_species(
+            [dict(r) for r in detections], corrections
+        )
+
         # Fetch paired lens video if this is a dual-lens camera
         paired = None
         pair_detections = []
@@ -1018,9 +1252,10 @@ def get_video_by_id(video_id: int) -> dict:
             paired_row = conn.execute("SELECT * FROM videos WHERE id=?", (pair_id,)).fetchone()
             if paired_row:
                 paired = dict(paired_row)
-                pair_detections = [dict(r) for r in conn.execute(f"""
+                raw_pair_dets = [dict(r) for r in conn.execute(f"""
                     SELECT d.id, d.frame_number, d.timestamp_secs, d.category, d.confidence,
                            s.label, {DISPLAY_COMMON} as common_name, s.scientific_name,
+                           s.top_candidates_json,
                            c.crop_path, c.quality_score
                     FROM detections d
                     LEFT JOIN species s ON s.detection_id = d.id
@@ -1029,10 +1264,13 @@ def get_video_by_id(video_id: int) -> dict:
                       AND ({KNOWN_SPECIES_FILTER} OR s.label IS NULL)
                     ORDER BY d.timestamp_secs
                 """, (pair_id,)).fetchall()]
+                pair_corrections = get_video_corrections(pair_id)
+                pair_detections  = apply_corrections_to_species(raw_pair_dets, pair_corrections)
 
         return {
             "video":           dict(video),
-            "detections":      [dict(r) for r in detections],
+            "detections":      det_list,
+            "corrections":     corrections,
             "paired":          paired,
             "pair_detections": pair_detections,
         }

@@ -5,7 +5,7 @@ Wildlife Video Processor — with database, crop storage, and quality scoring.
 
 import os
 import sys
-import json
+import json as _json
 import argparse
 import tempfile
 import re
@@ -360,6 +360,17 @@ def process_videos(args):
     if not videos:
         log.info("No videos found."); return
 
+    # Load blacklist from DB once before processing loop
+    try:
+        from database import get_blacklist
+        blacklisted_labels = {e["label"] for e in get_blacklist()}
+    except Exception:
+        blacklisted_labels = set()
+    if blacklisted_labels:
+        log.info(f"Blacklist loaded: {len(blacklisted_labels)} species suppressed")
+    if blacklisted_labels:
+        log.info(f"Blacklist loaded: {len(blacklisted_labels)} species suppressed")
+
     total = len(videos)
     log.info(f"Found {total} video(s)")
     log.info("Loading MegaDetector...")
@@ -452,26 +463,42 @@ def process_videos(args):
                     for crop, pred in zip(saved, preds):
                         classes = pred.get("classifications", {}).get("classes", [])
                         scores  = pred.get("classifications", {}).get("scores", [])
-                        if classes and scores and scores[0] >= SPECIES_CONFIDENCE_THRESHOLD:
-                            label = classes[0]
-                            score = scores[0]
-                        else:
-                            label = "Unknown species"
-                            score = scores[0] if scores else 0.0
+
+                        # Build top-5 candidates (post geo-filter, pre blacklist)
+                        top5 = []
+                        for lbl, sc in zip(classes[:5], scores[:5]):
+                            sci_c, com_c = parse_label(lbl)
+                            top5.append({"label": lbl, "common_name": com_c,
+                                         "scientific_name": sci_c, "score": round(sc, 4)})
+                        top5_json = _json.dumps(top5) if top5 else None
+
+                        # Walk candidates — skip blacklisted, take first above threshold
+                        label = "Unknown species"
+                        score = scores[0] if scores else 0.0
+                        for lbl, sc in zip(classes, scores):
+                            if lbl in blacklisted_labels:
+                                continue
+                            if sc >= SPECIES_CONFIDENCE_THRESHOLD:
+                                label = lbl
+                                score = sc
+                            else:
+                                label = "Unknown species"
+                                score = sc
+                            break
 
                         q = score_image(crop["crop_path"])
                         quality = q["quality_score"] if q else 0.0
 
                         # Keep the highest-quality crop for each distinct species label
                         if label not in best_per_species or quality > best_per_species[label][3]:
-                            best_per_species[label] = (crop, pred, score, quality, q)
+                            best_per_species[label] = (crop, pred, score, quality, q, top5_json)
 
                     # Store one detection + species + crop per distinct species
-                    for label, (crop, pred, score, quality, q) in best_per_species.items():
+                    for label, (crop, pred, score, quality, q, top5_json) in best_per_species.items():
                         sci, common = parse_label(label)
                         det_id = insert_detection(vid_id, crop["frame_number"], crop["timestamp_secs"],
                                                   "animal", crop["confidence"], crop["bbox"])
-                        insert_species(det_id, label, common, sci, score)
+                        insert_species(det_id, label, common, sci, score, top5_json)
                         if q:
                             insert_crop(det_id, crop["crop_path"], **q)
                         if label == "Unknown species":
@@ -513,6 +540,10 @@ def parse_args():
                             "YYYY-MM-DD_HH-MM-SS", "DD-MM-YYYY_HHMMSS",
                             "MM-DD-YYYY_HHMMSS", "YYYYMMDD"],
                    help="Date format embedded in camera filenames. 'auto' tries all known patterns.")
+    p.add_argument("--reprocess-flagged", action="store_true", default=False,
+                   help="Re-run SpeciesNet only on videos flagged for reprocessing. Skips MegaDetector.")
+    p.add_argument("--generate-taxonomy", action="store_true", default=False,
+                   help="Generate speciesnet_classes.json taxonomy cache and exit.")
     p.add_argument("--country",            default=None,
                    help="ISO country code for SpeciesNet geographic filtering (e.g. US, GB, AU)")
     p.add_argument("--admin1-region",      default=None,
@@ -526,4 +557,144 @@ def parse_args():
     return p.parse_args()
 
 if __name__ == "__main__":
-    process_videos(parse_args())
+    args = parse_args()
+
+    # Basic logging for modes that don't go through process_videos()
+    log = logging.getLogger("wildlife_processor")
+    if not log.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s  %(levelname)-8s %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+    # ── Generate taxonomy cache ────────────────────────────────────────────────
+    if args.generate_taxonomy:
+        log.info("Generating SpeciesNet taxonomy cache...")
+        try:
+            from speciesnet import SpeciesNet
+            from speciesnet import DEFAULT_MODEL as SN_DEFAULT_MODEL
+            log.info(f"Loading SpeciesNet model: {SN_DEFAULT_MODEL}")
+            sn  = SpeciesNet(SN_DEFAULT_MODEL)
+            clf = sn.classifier
+            labels = clf.labels.values()  # dict of {int: label_string}
+            classes_out = []
+            for label in labels:
+                parts = label.split(";")
+                if len(parts) >= 7:
+                    common = parts[6].strip()
+                    genus  = parts[4].strip()
+                    sp     = parts[5].strip()
+                    sci    = f"{genus} {sp}".strip() if genus and sp else ""
+                else:
+                    common = ""
+                    sci    = ""
+                if not common and not sci:
+                    continue
+                classes_out.append({
+                    "label":           label,
+                    "common_name":     common,
+                    "scientific_name": sci,
+                })
+            out_path = os.path.join(args.data_dir, "speciesnet_classes.json")
+            os.makedirs(args.data_dir, exist_ok=True)
+            with open(out_path, "w") as f:
+                _json.dump(classes_out, f)
+            log.info(f"Taxonomy written: {len(classes_out)} species → {out_path}")
+        except Exception as e:
+            log.error(f"Failed to generate taxonomy: {e}")
+        sys.exit(0)
+
+    # ── Reprocess flagged videos (SpeciesNet only) ─────────────────────────────
+    if args.reprocess_flagged:
+        from database import init_db, get_reprocess_queue, clear_reprocess_flag, get_blacklist
+        import sqlite3 as _sqlite3
+        init_db(os.path.join(args.data_dir, "wildlife.db"))
+        queue = get_reprocess_queue()
+        if not queue:
+            log.info("No videos flagged for reprocessing.")
+            sys.exit(0)
+        log.info(f"Reprocessing {len(queue)} flagged video(s) with SpeciesNet only...")
+        blacklisted = {e["label"] for e in get_blacklist()}
+        THRESHOLD   = args.species_threshold
+
+        from speciesnet import SpeciesNetClassifier
+        classifier_kwargs = {}
+        if args.country:
+            classifier_kwargs["country"] = args.country
+        if args.admin1_region:
+            classifier_kwargs["admin1_region"] = args.admin1_region
+        clf = SpeciesNetClassifier(**classifier_kwargs)
+
+        conn = _sqlite3.connect(os.path.join(args.data_dir, "wildlife.db"))
+        conn.row_factory = _sqlite3.Row
+
+        for video in queue:
+            vid_id = video["id"]
+            log.info(f"  Reprocessing {video['filename']}")
+            # Get existing crops for this video
+            crops = conn.execute("""
+                SELECT c.crop_path, d.id as det_id
+                FROM crops c
+                JOIN detections d ON c.detection_id = d.id
+                WHERE d.video_id = ?
+                ORDER BY c.quality_score DESC
+            """, (vid_id,)).fetchall()
+
+            if not crops:
+                log.info("    No crops — skipping")
+                clear_reprocess_flag(vid_id)
+                continue
+
+            # Run SpeciesNet on crop images
+            crop_paths = [r["crop_path"] for r in crops if os.path.exists(r["crop_path"])]
+            if not crop_paths:
+                log.info("    Crop files missing — skipping")
+                clear_reprocess_flag(vid_id)
+                continue
+
+            try:
+                preds = clf.predict_from_crops(crop_paths)
+            except Exception as e:
+                log.error(f"    SpeciesNet failed: {e}")
+                continue
+
+            # Update species records
+            for crop_row, pred in zip(crops, preds):
+                det_id  = crop_row["det_id"]
+                classes = pred.get("classifications", {}).get("classes", [])
+                scores  = pred.get("classifications", {}).get("scores", [])
+
+                top5 = []
+                for lbl, sc in zip(classes[:5], scores[:5]):
+                    sci_c, com_c = parse_label(lbl)
+                    top5.append({"label": lbl, "common_name": com_c,
+                                 "scientific_name": sci_c, "score": round(sc, 4)})
+                top5_json = _json.dumps(top5) if top5 else None
+
+                label = "Unknown species"
+                score = scores[0] if scores else 0.0
+                for lbl, sc in zip(classes, scores):
+                    if lbl in blacklisted:
+                        continue
+                    label = lbl if sc >= THRESHOLD else "Unknown species"
+                    score = sc
+                    break
+
+                sci, common = parse_label(label)
+                conn.execute("""
+                    UPDATE species SET label=?, common_name=?, scientific_name=?,
+                           confidence=?, top_candidates_json=?,
+                           user_common_name=NULL, user_scientific_name=NULL, corrected_at=NULL
+                    WHERE detection_id=?
+                """, (label, common, sci, score, top5_json, det_id))
+
+            conn.commit()
+            clear_reprocess_flag(vid_id)
+            log.info(f"    Done")
+
+        conn.close()
+        log.info("Reprocessing complete.")
+        sys.exit(0)
+
+    process_videos(args)
