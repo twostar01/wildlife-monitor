@@ -1,0 +1,25 @@
+name: Publish to Website
+
+"on":
+  workflow_dispatch:
+    inputs:
+      note:
+        description: 'What changed this publish (optional)'
+        required: false
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log publish note
+        if: ${{ inputs.note != '' }}
+        run: echo "Publishing note -- ${{ inputs.note }}"
+
+      - uses: twostar01/wp-sync@main
+        with:
+          wp_url: ${{ secrets.WP_URL }}
+          wp_user: ${{ secrets.WP_USER }}
+          wp_app_password: ${{ secrets.WP_APP_PASSWORD }}
