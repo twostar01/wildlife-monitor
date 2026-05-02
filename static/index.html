@@ -2433,6 +2433,7 @@ async function triggerRun() {
     return;
   }
   document.getElementById('runLog').style.display = 'block';
+  document.getElementById('runLog').textContent = 'Starting…';
   _activeLogEl    = 'runLog';
   _activeStatusEl = 'runStatusLabel';
   _activeBtnEl    = 'runBtn';
@@ -2461,6 +2462,7 @@ async function triggerBackfill() {
     return;
   }
   document.getElementById('backfillLog').style.display = 'block';
+  document.getElementById('backfillLog').textContent = 'Starting…';
   _activeLogEl    = 'backfillLog';
   _activeStatusEl = 'backfillStatusLabel';
   _activeBtnEl    = 'backfillBtn';

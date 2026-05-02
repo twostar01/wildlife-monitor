@@ -802,7 +802,7 @@ def api_trigger_run(body: RunRequest = RunRequest()):
                 args += ["--date-to", body.date_to]
         cmd = f'source "{venv_dir}/bin/activate" && bash "{sync_script}" {" ".join(args)}'
         log_path = Path(DATA_DIR) / "run_manual.log"
-        log_f = open(log_path, "w")
+        log_f = open(log_path, "w")  # "w" truncates immediately, clearing old content
         _run_process = subprocess.Popen(
             cmd, shell=True, executable="/bin/bash",
             stdout=log_f, stderr=subprocess.STDOUT,

@@ -618,21 +618,15 @@ if __name__ == "__main__":
         blacklisted = {e["label"] for e in get_blacklist()}
         THRESHOLD   = args.species_threshold
 
-        from speciesnet import SpeciesNetClassifier
-        classifier_kwargs = {}
-        if args.country:
-            classifier_kwargs["country"] = args.country
-        if args.admin1_region:
-            classifier_kwargs["admin1_region"] = args.admin1_region
-        clf = SpeciesNetClassifier(**classifier_kwargs)
-
+        from speciesnet import SpeciesNet, DEFAULT_MODEL as SN_DEFAULT_MODEL
+        if _speciesnet is None:
+            _speciesnet = SpeciesNet(SN_DEFAULT_MODEL)
         conn = _sqlite3.connect(os.path.join(args.data_dir, "wildlife.db"))
         conn.row_factory = _sqlite3.Row
 
         for video in queue:
             vid_id = video["id"]
             log.info(f"  Reprocessing {video['filename']}")
-            # Get existing crops for this video
             crops = conn.execute("""
                 SELECT c.crop_path, d.id as det_id
                 FROM crops c
@@ -646,24 +640,28 @@ if __name__ == "__main__":
                 clear_reprocess_flag(vid_id)
                 continue
 
-            # Run SpeciesNet on crop images
-            crop_paths = [r["crop_path"] for r in crops if os.path.exists(r["crop_path"])]
-            if not crop_paths:
+            # Filter to only crops with existing files, keep crop rows in sync
+            valid_crops = [(r, r["crop_path"]) for r in crops if os.path.exists(r["crop_path"])]
+            if not valid_crops:
                 log.info("    Crop files missing — skipping")
                 clear_reprocess_flag(vid_id)
                 continue
+            valid_crop_rows = [c[0] for c in valid_crops]
+            crop_paths      = [c[1] for c in valid_crops]
 
             try:
-                preds = clf.predict_from_crops(crop_paths)
+                kw = {"filepaths": crop_paths}
+                if args.country:       kw["country"]       = args.country
+                if args.admin1_region: kw["admin1_region"] = args.admin1_region
+                preds = _speciesnet.predict(**kw).get("predictions", [])
             except Exception as e:
                 log.error(f"    SpeciesNet failed: {e}")
                 continue
 
-            # Update species records
-            for crop_row, pred in zip(crops, preds):
+            for crop_row, pred in zip(valid_crop_rows, preds):
                 det_id  = crop_row["det_id"]
                 classes = pred.get("classifications", {}).get("classes", [])
-                scores  = pred.get("classifications", {}).get("scores", [])
+                scores  = pred.get("classifications", {}).get("scores",  [])
 
                 top5 = []
                 for lbl, sc in zip(classes[:5], scores[:5]):
