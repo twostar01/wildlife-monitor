@@ -25,3 +25,6 @@ Thumbs.db
 # Editor
 .vscode/
 .idea/
+
+# GSD planning (local-only)
+.planning/
