@@ -1,6 +1,11 @@
 name: Publish to Website
 
 "on":
+  push:
+    branches: [main]
+    paths:
+      - PROJECT.md
+      - BUILDLOG.md
   workflow_dispatch:
     inputs:
       note:

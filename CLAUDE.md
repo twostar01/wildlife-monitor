@@ -48,6 +48,16 @@ This project uses [Get Shit Done](https://github.com/anthropics/get-shit-done) f
 
 **Next step:** `/gsd-discuss-phase 1` — gather context and clarify approach for Phase 1.
 
+## Website Publishing (BUILDLOG.md)
+
+The repo has a GitHub Action (`wp-sync`) that watches `BUILDLOG.md`. When committed, it syncs the content to the project's WordPress page (slug: `wildlife-monitor`).
+
+**Write to BUILDLOG.md** at meaningful milestones — phase completions, significant decisions, interesting bugs fixed. Content should be engineering narrative: the *why* behind decisions, what was tried and rejected, what was surprising. Not a changelog — more like a project devlog for a technical audience.
+
+**Format:** Running log, newest entry at the top. Each commit replaces the entire WordPress page with the full BUILDLOG.md content, so the file accumulates all entries over time. Never truncate old entries.
+
+Commit `BUILDLOG.md` alongside the code changes it describes.
+
 ## Development Rules
 
 - **No build step** — frontend stays as a single HTML file; no npm, no bundler
