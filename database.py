@@ -11,6 +11,7 @@ from typing import Optional
 import logging
 
 log = logging.getLogger("wildlife_processor")
+_taxonomy_cache: list | None = None
 
 DB_PATH = "data/wildlife.db"
 
@@ -775,22 +776,24 @@ def search_taxonomy(
 ) -> list:
     """
     Search SpeciesNet taxonomy from cached classes JSON.
-    Filters by query string against common name and scientific name.
-    Region filtering is not applied here — SpeciesNet's geo-prior handles
-    filtering at classification time. The all_regions flag is accepted for
-    API compatibility but has no effect currently.
+    Parses speciesnet_classes.json once on first call and caches the result
+    for the lifetime of the process. Geographic filtering by country/admin1
+    is applied when those parameters are non-empty and all_regions is False.
     """
-    import json as _json
-    try:
-        with open(classes_path) as f:
-            classes = _json.load(f)
-    except (FileNotFoundError, ValueError):
-        return []
+    global _taxonomy_cache
+    if _taxonomy_cache is None:
+        try:
+            with open(classes_path) as f:
+                _taxonomy_cache = json.load(f)
+        except (FileNotFoundError, ValueError):
+            return []
 
     q = query.lower().strip()
-    results = []
+    if len(q) < 2:
+        return []
 
-    for entry in classes:
+    results = []
+    for entry in _taxonomy_cache:
         label      = entry.get("label", "")
         common     = (entry.get("common_name") or "").lower()
         scientific = (entry.get("scientific_name") or "").lower()
@@ -799,11 +802,18 @@ def search_taxonomy(
         if not label or label.endswith(";;;;;;blank") or label == "Unknown species":
             continue
 
-        # Text match — require at least 2 chars
-        if len(q) >= 2 and q not in common and q not in scientific:
+        # Text match
+        if q not in common and q not in scientific:
             continue
-        if len(q) < 2:
-            continue
+
+        # Geographic filtering — skip when all_regions=True or no filter params given
+        if not all_regions and (country or admin1):
+            entry_country = (entry.get("country") or "").upper()
+            entry_admin1  = (entry.get("admin1") or "").upper()
+            if country and entry_country and entry_country != country.upper():
+                continue
+            if admin1 and entry_admin1 and entry_admin1 != admin1.upper():
+                continue
 
         results.append({
             "label":           entry.get("label"),
