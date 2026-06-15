@@ -4,7 +4,8 @@ database.py — SQLite schema and query helpers for Wildlife Processor
 
 import sqlite3
 import json
-from datetime import datetime
+import re
+from datetime import datetime, date
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional
@@ -313,9 +314,8 @@ def parse_dual_lens_filename(filename: str) -> Optional[tuple]:
       "World Watch_00_20260327160902.mp4" → ("World Watch", 0, "20260327160902")
       "World Watch_01_20260327160902.mp4" → ("World Watch", 1, "20260327160902")
     """
-    import re as _re
     stem = Path(filename).stem
-    m = _re.match(r'^(.+)_(\d{2})_(\d{14})$', stem)
+    m = re.match(r'^(.+)_(\d{2})_(\d{14})$', stem)
     if m:
         return m.group(1), int(m.group(2)), m.group(3)
     return None
@@ -340,7 +340,6 @@ def link_lens_pair(video_id: int, filename: str) -> Optional[int]:
         ).fetchall()
 
         # Filter to only the other lens(es) for this camera base + timestamp
-        import re as _re
         pair_id = None
         for row in rows:
             p = parse_dual_lens_filename(row["filename"])
@@ -1288,16 +1287,13 @@ def get_timeline(
             where = "AND " + " AND ".join(conditions)
             # Calculate window size for granularity decision
             if date_from and date_to:
-                from datetime import date
                 d1 = date.fromisoformat(date_from)
                 d2 = date.fromisoformat(date_to)
                 window_days = (d2 - d1).days
             elif date_from:
-                from datetime import date
                 window_days = (date.today() - date.fromisoformat(date_from)).days
             else:
                 # Only date_to known — use a large sentinel so granularity defaults to month
-                from datetime import date
                 window_days = (date.fromisoformat(date_to) - date(2020, 1, 1)).days
         else:
             n = int(days or 30)
