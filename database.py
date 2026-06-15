@@ -336,7 +336,7 @@ def link_lens_pair(video_id: int, filename: str) -> Optional[int]:
         # Match on filename pattern: camera_base + any lens + same timestamp
         rows = conn.execute(
             "SELECT id, filename FROM videos WHERE id != ? AND filename LIKE ?",
-            (video_id, f"{camera_base}\\_%\\_{timestamp}%"),
+            (video_id, f"{camera_base}_%_{timestamp}%"),
         ).fetchall()
 
         # Filter to only the other lens(es) for this camera base + timestamp
