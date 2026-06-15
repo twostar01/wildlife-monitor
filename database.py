@@ -8,6 +8,9 @@ from datetime import datetime
 from pathlib import Path
 from contextlib import contextmanager
 from typing import Optional
+import logging
+
+log = logging.getLogger("wildlife_processor")
 
 DB_PATH = "data/wildlife.db"
 
