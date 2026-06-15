@@ -564,10 +564,11 @@ def purge_video_file(video_id: int) -> bool:
                 try:
                     p.unlink()
                     deleted = True
-                except OSError:
-                    pass
+                except OSError as exc:
+                    log.error("Failed to delete video file %s: %s", filepath, exc)
+                    return False
 
-        # Always null out filepath and record purge time
+        # Only mark as purged in DB if file was actually deleted (or didn't exist)
         conn.execute(
             "UPDATE videos SET filepath=NULL, file_purged_at=? WHERE id=?",
             (datetime.now().isoformat(), video_id),
