@@ -109,9 +109,9 @@ def _load_nas_config() -> dict:
             result["mounted"] = (r.returncode == 0)
     except Exception:
         pass
-    # Never expose SMB password
-    result.pop("NAS_SMB_PASS", None)
-    return result
+    # Allowlist: only expose status and mount path — not NAS_HOST, NAS_SMB_USER, etc.
+    _EXPOSE_NAS_KEYS = {"configured", "mounted", "NAS_MOUNT"}
+    return {k: v for k, v in result.items() if k in _EXPOSE_NAS_KEYS}
 
 
 # ── Port utilities ─────────────────────────────────────────────────────────────
