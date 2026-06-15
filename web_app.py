@@ -411,12 +411,21 @@ def api_video_detail(video_id: int):
     return result
 
 
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
 @app.get("/api/timeline")
 def api_timeline(
     days: int = Query(None, ge=1),
     date_from: str = Query(None),
     date_to: str = Query(None),
 ):
+    if date_from and not _DATE_RE.match(date_from):
+        raise HTTPException(400, "date_from must be YYYY-MM-DD")
+    if date_to and not _DATE_RE.match(date_to):
+        raise HTTPException(400, "date_to must be YYYY-MM-DD")
+    if date_from and date_to and date_from > date_to:
+        raise HTTPException(400, "date_from must be before date_to")
     return db.get_timeline(days=days, date_from=date_from, date_to=date_to)
 
 
