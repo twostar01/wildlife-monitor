@@ -1295,7 +1295,9 @@ def get_timeline(
                 from datetime import date
                 window_days = (date.today() - date.fromisoformat(date_from)).days
             else:
-                window_days = days or 30
+                # Only date_to known — use a large sentinel so granularity defaults to month
+                from datetime import date
+                window_days = (date.fromisoformat(date_to) - date(2020, 1, 1)).days
         else:
             n = int(days or 30)
             where = "AND v.recorded_at >= DATE('now', '-' || ? || ' days')"
