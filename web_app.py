@@ -835,16 +835,17 @@ def api_trigger_run(body: RunRequest = RunRequest()):
 @app.get("/api/run/status")
 def api_run_status():
     global _run_process, _run_log_f
-    running   = _run_process is not None and _run_process.poll() is None
-    exit_code = _run_process.poll() if _run_process is not None else None
+    with _run_lock:
+        running   = _run_process is not None and _run_process.poll() is None
+        exit_code = _run_process.poll() if _run_process is not None else None
 
-    # Close the log file handle once the process has exited (per D-09)
-    if not running and _run_log_f is not None:
-        try:
-            _run_log_f.close()
-        except OSError:
-            pass
-        _run_log_f = None
+        # Close the log file handle once the process has exited (per D-09)
+        if not running and _run_log_f is not None:
+            try:
+                _run_log_f.close()
+            except OSError:
+                pass
+            _run_log_f = None
 
     log_lines: list[str] = []
     log_path = Path(DATA_DIR) / "run_manual.log"
