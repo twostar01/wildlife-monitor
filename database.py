@@ -250,8 +250,8 @@ def init_db(db_path: Optional[str] = None):
                 FROM videos;
                 DROP TABLE videos;
                 ALTER TABLE videos_new RENAME TO videos;
-                PRAGMA foreign_keys=ON;
             """)
+            conn.execute("PRAGMA foreign_keys=ON")   # restore after executescript resets pragma state
             log.info("DB migration: filepath NOT NULL constraint removed")
 
 
