@@ -21,6 +21,7 @@ import argparse
 import configparser
 import json
 import os
+import re
 import subprocess
 import sys
 import socket
@@ -50,6 +51,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 DATA_DIR      = "./data"
 SETTINGS_FILE = "./data/settings.json"
 _run_process: subprocess.Popen | None = None
+_run_log_f = None   # file handle for the current manual run log; closed after process exits
 _run_lock = threading.Lock()
 
 DEFAULT_PROCESSING_SETTINGS = {
@@ -781,32 +783,51 @@ class RunRequest(BaseModel):
 
 @app.post("/api/run")
 def api_trigger_run(body: RunRequest = RunRequest()):
-    global _run_process
+    global _run_process, _run_log_f
     with _run_lock:
         if _run_process is not None and _run_process.poll() is None:
             return {"ok": False, "error": "A run is already in progress"}
-        settings   = _load_settings()
-        script_dir = Path(__file__).parent
+
+        # Validate date inputs before building the argument list (per D-08)
+        if body.date_from and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", body.date_from):
+            raise HTTPException(status_code=400, detail="date_from must be YYYY-MM-DD")
+        if body.date_to and not re.fullmatch(r"\d{4}-\d{2}-\d{2}", body.date_to):
+            raise HTTPException(status_code=400, detail="date_to must be YYYY-MM-DD")
+
+        script_dir  = Path(__file__).parent
         sync_script = script_dir / "nas_sync.sh"
         if not sync_script.exists():
             raise HTTPException(404, "nas_sync.sh not found alongside web_app.py")
-        venv_dir = Path.home() / "wildlife_env"
-        # Pass --data-dir so nas_sync.sh finds settings.json for country/region/sample-rate.
-        # Don't duplicate those here — nas_sync.sh reads settings.json automatically.
-        args = ["--then-process", "--data-dir", DATA_DIR]
-        # Date range overrides hours; otherwise nas_sync.sh reads hours from settings.json
-        if body.date_from or body.date_to:
-            if body.date_from:
-                args += ["--date-from", body.date_from]
-            if body.date_to:
-                args += ["--date-to", body.date_to]
-        cmd = f'source "{venv_dir}/bin/activate" && bash "{sync_script}" {" ".join(args)}'
+
+        # Build command as a list — never a shell string (per D-07)
+        # nas_sync.sh is a bash script, so we need bash to run it.
+        # Use bash with the script as a positional argument (shell=False).
+        # Since shell=False cannot source a venv, we prepend the venv bin to PATH
+        # via env and call bash directly with the script path.
+        cmd = [
+            "bash",
+            str(sync_script),
+            "--then-process",
+            "--data-dir", DATA_DIR,
+        ]
+        if body.date_from:
+            cmd += ["--date-from", body.date_from]
+        if body.date_to:
+            cmd += ["--date-to", body.date_to]
+
+        # Set PATH to include venv bin so Python calls inside nas_sync.sh use the venv
+        env = os.environ.copy()
+        env["PATH"] = str(Path.home() / "wildlife_env" / "bin") + ":" + env.get("PATH", "")
+
         log_path = Path(DATA_DIR) / "run_manual.log"
-        log_f = open(log_path, "w")  # "w" truncates immediately, clearing old content
+        _run_log_f = open(log_path, "w")  # truncates immediately, clearing old content
         _run_process = subprocess.Popen(
-            cmd, shell=True, executable="/bin/bash",
-            stdout=log_f, stderr=subprocess.STDOUT,
+            cmd,
+            shell=False,
+            stdout=_run_log_f,
+            stderr=subprocess.STDOUT,
             cwd=str(script_dir),
+            env=env,
         )
     return {"ok": True}
 
