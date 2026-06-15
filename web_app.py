@@ -535,7 +535,7 @@ def api_requeue_species(label: str):
 
 @app.get("/api/corrections")
 def api_get_corrections(video_id: int = Query(None)):
-    if video_id:
+    if video_id is not None:
         return db.get_video_corrections(video_id)
     # All corrections — for admin view
     with db.get_conn() as conn:
@@ -565,7 +565,8 @@ def api_delete_correction(correction_id: int):
 
 @app.get("/api/maintenance/reprocess_queue")
 def api_reprocess_queue():
-    return {"videos": db.get_reprocess_queue(), "count": len(db.get_reprocess_queue())}
+    queue = db.get_reprocess_queue()
+    return {"videos": queue, "count": len(queue)}
 
 
 
