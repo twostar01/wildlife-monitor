@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS videos (
     frame_count     INTEGER DEFAULT 0,
     file_purged_at  TEXT,           -- ISO datetime when video file was deleted (record kept)
     lens_index      INTEGER,        -- 0 = wide/fixed, 1 = telephoto/adjustable, NULL = unknown
-    paired_video_id INTEGER REFERENCES videos(id)  -- id of the other lens for dual-lens cameras
+    paired_video_id INTEGER REFERENCES videos(id),  -- id of the other lens for dual-lens cameras
+    needs_reprocess INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS detections (
@@ -81,7 +82,8 @@ CREATE TABLE IF NOT EXISTS species (
     confidence          REAL,
     user_common_name    TEXT,           -- human correction (overrides SpeciesNet)
     user_scientific_name TEXT,
-    corrected_at        TEXT            -- ISO datetime of last correction
+    corrected_at        TEXT,           -- ISO datetime of last correction
+    top_candidates_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS crops (
@@ -231,9 +233,20 @@ def init_db(db_path: Optional[str] = None):
                     frame_count     INTEGER,
                     file_purged_at  TEXT,
                     lens_index      INTEGER,
-                    paired_video_id INTEGER REFERENCES videos_new(id) ON DELETE SET NULL
+                    paired_video_id INTEGER REFERENCES videos_new(id) ON DELETE SET NULL,
+                    needs_reprocess INTEGER DEFAULT 0
                 );
-                INSERT INTO videos_new SELECT * FROM videos;
+                INSERT INTO videos_new (
+                    id, filename, filepath, camera_name, file_size_mb, duration_secs,
+                    recorded_at, processed_at, has_animal, has_person, kept, thumbnail_path,
+                    frame_count, file_purged_at, lens_index, paired_video_id, needs_reprocess
+                )
+                SELECT
+                    id, filename, filepath, camera_name, file_size_mb, duration_secs,
+                    recorded_at, processed_at, has_animal, has_person, kept, thumbnail_path,
+                    frame_count, file_purged_at, lens_index, paired_video_id,
+                    COALESCE(needs_reprocess, 0)
+                FROM videos;
                 DROP TABLE videos;
                 ALTER TABLE videos_new RENAME TO videos;
                 PRAGMA foreign_keys=ON;
@@ -823,44 +836,6 @@ def promote_paired_blanks() -> int:
         """)
         count = conn.total_changes
     return count
-
-
-
-    """Return storage usage broken out by blank vs kept vs purged videos."""
-    with get_conn() as conn:
-        blank = conn.execute("""
-            SELECT COUNT(*) as count,
-                   COALESCE(SUM(file_size_mb), 0) as total_mb
-            FROM videos
-            WHERE has_animal=0 AND has_person=0
-              AND kept=0
-              AND file_purged_at IS NULL
-        """).fetchone()
-
-        kept = conn.execute("""
-            SELECT COUNT(*) as count,
-                   COALESCE(SUM(file_size_mb), 0) as total_mb
-            FROM videos
-            WHERE (has_animal=1 OR has_person=1)
-              AND kept=1
-              AND file_purged_at IS NULL
-        """).fetchone()
-
-        purged = conn.execute("""
-            SELECT COUNT(*) as count,
-                   COALESCE(SUM(file_size_mb), 0) as total_mb
-            FROM videos WHERE file_purged_at IS NOT NULL
-        """).fetchone()
-
-    return {
-        "blank_videos":        blank["count"],
-        "blank_gb":            round(blank["total_mb"] / 1024, 2),
-        "kept_videos":         kept["count"],
-        "kept_gb":             round(kept["total_mb"] / 1024, 2),
-        "purged_videos":       purged["count"],
-        "purged_gb_reclaimed": round(purged["total_mb"] / 1024, 2),
-        "total_active_gb":     round((blank["total_mb"] + kept["total_mb"]) / 1024, 2),
-    }
 
 
 def get_storage_stats() -> dict:
