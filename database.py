@@ -1297,9 +1297,9 @@ def get_timeline(
             else:
                 window_days = days or 30
         else:
-            n = days or 30
-            where = f"AND v.recorded_at >= DATE('now', '-{n} days')"
-            params = []
+            n = int(days or 30)
+            where = "AND v.recorded_at >= DATE('now', '-' || ? || ' days')"
+            params = [str(n)]
             window_days = n
 
         # Choose granularity based on window size
