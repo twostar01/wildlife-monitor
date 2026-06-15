@@ -347,14 +347,14 @@ def api_cameras():
     return db.get_cameras()
 
 
-class CorrectionRequest(BaseModel):
+class SpeciesCorrectionRequest(BaseModel):
     detection_id:         int
     user_common_name:     str
     user_scientific_name: str
 
 
 @app.post("/api/species/correct")
-def api_correct_species(body: CorrectionRequest):
+def api_correct_species(body: SpeciesCorrectionRequest):
     """Save a human correction for a species detection."""
     db.correct_species(
         detection_id=body.detection_id,
@@ -894,7 +894,7 @@ def api_purge(dry_run: bool = Query(False)):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    global DATA_DIR
+    global DATA_DIR, SETTINGS_FILE
 
     parser = argparse.ArgumentParser(
         description="Wildlife Monitor Web Dashboard",
