@@ -122,6 +122,19 @@ CREATE TABLE IF NOT EXISTS video_corrections (
     note                 TEXT
 );
 
+CREATE TABLE IF NOT EXISTS runs (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_time            TEXT NOT NULL,
+    end_time              TEXT,                                -- NULL while running
+    status                TEXT,                                -- 'success'|'partial'|'failure'; NULL while running
+    "trigger"             TEXT NOT NULL DEFAULT 'scheduled',   -- 'manual'|'scheduled'
+    videos_processed      INTEGER DEFAULT 0,
+    detections_found      INTEGER DEFAULT 0,
+    error_summary         TEXT,
+    cameras_json          TEXT,                                -- {"CameraName": {"videos": n, "detections": n}, ...}
+    offline_cameras_json  TEXT                                 -- ["CameraName", ...] flagged as possibly offline this run
+);
+
 CREATE INDEX IF NOT EXISTS idx_videos_recorded_at ON videos(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_videos_camera ON videos(camera_name);
 CREATE INDEX IF NOT EXISTS idx_detections_video_id ON detections(video_id);
@@ -130,6 +143,7 @@ CREATE INDEX IF NOT EXISTS idx_crops_quality ON crops(quality_score DESC);
 CREATE INDEX IF NOT EXISTS idx_blacklist_label ON blacklist(label);
 CREATE INDEX IF NOT EXISTS idx_corrections_video ON video_corrections(video_id);
 CREATE INDEX IF NOT EXISTS idx_corrections_label ON video_corrections(original_label);
+CREATE INDEX IF NOT EXISTS idx_runs_start_time ON runs(start_time DESC);
 """
 
 # Migration: add camera_name to existing databases that predate this column
@@ -257,6 +271,44 @@ def init_db(db_path: Optional[str] = None):
 
 
 # ── Write helpers ──────────────────────────────────────────────────────────────
+
+# Attribution invariant (02-RESEARCH.md Pitfall 3): per-camera attribution in
+# record_run_end()'s cameras_json snapshot relies on videos.processed_at being a
+# reliable "which run touched this video" signal. That in turn depends on
+# nas_sync.sh deleting local staging copies after every normal run, so a video is
+# never re-scanned by a later run. A manual `--no-cleanup` run breaks that
+# invariant: the same local file can be rescanned and re-inserted (advancing
+# processed_at) on a subsequent run before it's archived, re-attributing it to
+# whichever run touched it last.
+def record_run_start(trigger: str) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO runs (start_time, "trigger") VALUES (?, ?)""",
+            (datetime.now().isoformat(), trigger),
+        )
+        return int(cur.lastrowid)
+
+
+def record_run_end(
+    run_id: int,
+    status: str,
+    videos_processed: int,
+    detections_found: int,
+    error_summary: Optional[str],
+    cameras_json: Optional[str],
+    offline_cameras_json: Optional[str],
+) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE runs SET end_time=?, status=?, videos_processed=?,
+               detections_found=?, error_summary=?, cameras_json=?, offline_cameras_json=?
+               WHERE id=?""",
+            (
+                datetime.now().isoformat(), status, videos_processed, detections_found,
+                error_summary, cameras_json, offline_cameras_json, run_id,
+            ),
+        )
+
 
 def insert_video(
     filename: str,
