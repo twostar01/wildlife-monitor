@@ -256,6 +256,8 @@
   }
   .gallery-toolbar select:focus, .gallery-toolbar input:focus { border-color: var(--accent); }
   .gallery-toolbar label { font-family: var(--font-mono); font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  .conf-slider { accent-color: var(--accent); }
+  #galleryMinConfValue { font-family: var(--font-mono); font-size: 12px; color: var(--accent); margin-left: 6px; }
 
   .gallery-grid { columns: 4; gap: 10px; }
   @media (max-width: 1200px) { .gallery-grid { columns: 3; } }
@@ -322,6 +324,25 @@
     color: var(--gold); background: rgba(200,168,75,0.12);
     border: 1px solid rgba(200,168,75,0.25);
   }
+
+  /* ── GALLERY FILTER CHIPS ──────────────────────────────── */
+  .filter-chip-row {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;
+  }
+  .filter-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.3px;
+    padding: 3px 8px; border-radius: 3px;
+    color: var(--accent); background: rgba(109,186,92,0.1);
+    border: 1px solid rgba(109,186,92,0.2);
+  }
+  .filter-chip-label {
+    max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .filter-chip-x {
+    flex-shrink: 0; cursor: pointer; color: inherit; opacity: 0.8;
+  }
+  .filter-chip-x:hover { opacity: 1; }
 
   /* ── SPECIES DETAIL MODAL ───────────────────────────── */
   .modal-overlay {
@@ -537,6 +558,22 @@
           <select id="gallerySpeciesFilter"><option value="">All Species</option></select>
         </div>
         <div>
+          <label>Camera</label><br>
+          <select id="galleryCameraFilter"><option value="">All Cameras</option></select>
+        </div>
+        <div>
+          <label>From</label><br>
+          <input type="date" id="galleryDateFrom">
+        </div>
+        <div>
+          <label>To</label><br>
+          <input type="date" id="galleryDateTo">
+        </div>
+        <div>
+          <label>Min. Confidence</label><br>
+          <input type="range" id="galleryMinConf" class="conf-slider" min="0" max="100" step="5" value="0"><span id="galleryMinConfValue">Any</span>
+        </div>
+        <div>
           <label>Sort by</label><br>
           <select id="gallerySort">
             <option value="quality">Best Quality First</option>
@@ -544,6 +581,7 @@
           </select>
         </div>
       </div>
+      <div id="galleryChipRow" class="filter-chip-row"></div>
       <div class="gallery-grid" id="galleryGrid"></div>
       <div class="pagination" id="galleryPagination"></div>
     </section>
@@ -992,6 +1030,7 @@
 // ── State ─────────────────────────────────────────────────────────────────────
 const state = {
   galleryPage: 1, gallerySpecies: '', gallerySort: 'quality',
+  galleryCamera: '', galleryDateFrom: '', galleryDateTo: '', galleryMinConf: '', galleryReqToken: 0,
   videoPage: 1, videoSpecies: '', videoSearch: '', videoCamera: '',
   videoDateFrom: '', videoDateTo: '',
   blankPage: 1,
@@ -1010,6 +1049,11 @@ function switchTab(tab) {
   if (btn) btn.classList.add('active');
   const section = document.getElementById('tab-' + tab);
   if (section) section.classList.add('active');
+  if (tab !== 'gallery' && location.hash.startsWith('#gallery')) {
+    // Leaving the gallery tab: drop the gallery hash so a reload on
+    // another tab does not silently bounce the operator back here.
+    history.replaceState(null, '', location.pathname + location.search);
+  }
   if (tab === 'runs')     loadRuns();
   if (tab === 'blanks')   { loadCameras(); loadBlanks(); }
   if (tab === 'timeline') loadTimeline();
@@ -1066,7 +1110,7 @@ document.querySelectorAll('nav button').forEach(btn => {
     const tab = btn.dataset.tab;
     switchTab(tab);
     if (tab === 'species') loadSpecies();
-    if (tab === 'gallery') loadGallery();
+    if (tab === 'gallery') { loadCameras(); loadGallery(); }
     if (tab === 'videos')  { loadCameras(); loadVideos(); }
   });
 });
@@ -1451,7 +1495,7 @@ async function openSpecies(label) {
     state.gallerySpecies = label; state.galleryPage = 1;
     const sel = document.getElementById('gallerySpeciesFilter');
     if (sel) sel.value = label;
-    switchTab('gallery'); loadGallery();
+    switchTab('gallery'); writeGalleryHash(); loadGallery();
   };
   document.getElementById('modalViewVideosBtn').onclick = () => {
     closeModal('speciesModal');
@@ -1491,6 +1535,123 @@ async function openSpecies(label) {
 }
 
 // ── Gallery ───────────────────────────────────────────────────────────────────
+
+// Reads a `#gallery` hash into state. Returns false (and leaves state
+// untouched) when the current hash is not a gallery hash. The hash is
+// untrusted input — a shared link can carry anything — so every value is
+// defaulted or clamped rather than trusted outright.
+function parseGalleryHash() {
+  if (!location.hash.startsWith('#gallery')) return false;
+  const raw = location.hash.slice('#gallery'.length).replace(/^\?/, '');
+  const params = new URLSearchParams(raw);
+  state.gallerySpecies  = params.get('species')   || '';
+  state.galleryCamera   = params.get('camera')    || '';
+  state.galleryDateFrom = params.get('date_from') || '';
+  state.galleryDateTo   = params.get('date_to')   || '';
+  const mc = parseInt(params.get('min_conf'), 10);
+  const clamped = Number.isFinite(mc) ? Math.max(0, Math.min(100, mc)) : 0;
+  state.galleryMinConf = (Number.isFinite(mc) && clamped > 0) ? String(clamped) : '';
+  state.galleryPage = 1;
+  return true;
+}
+
+// Rewrites location.hash from the current gallery filter state. Always
+// uses replaceState — a filter change refines the current view, it is
+// never a new destination — and always rebuilds the query string fresh,
+// which is what keeps repeated writes idempotent.
+function writeGalleryHash() {
+  const p = new URLSearchParams();
+  if (state.gallerySpecies)  p.set('species',   state.gallerySpecies);
+  if (state.galleryCamera)   p.set('camera',    state.galleryCamera);
+  if (state.galleryDateFrom) p.set('date_from', state.galleryDateFrom);
+  if (state.galleryDateTo)   p.set('date_to',   state.galleryDateTo);
+  if (state.galleryMinConf)  p.set('min_conf',  state.galleryMinConf);
+  const qs = p.toString();
+  history.replaceState(null, '', qs ? `#gallery?${qs}` : '#gallery');
+}
+
+// Writes the five gallery filter state fields back into the DOM controls.
+// Performs no fetch — callers issue loadGallery() themselves.
+function applyGalleryFiltersToControls() {
+  const specSel = document.getElementById('gallerySpeciesFilter');
+  if (specSel) specSel.value = state.gallerySpecies;
+  const camSel = document.getElementById('galleryCameraFilter');
+  if (camSel) camSel.value = state.galleryCamera;
+  const fromEl = document.getElementById('galleryDateFrom');
+  if (fromEl) fromEl.value = state.galleryDateFrom;
+  const toEl = document.getElementById('galleryDateTo');
+  if (toEl) toEl.value = state.galleryDateTo;
+  const sliderEl = document.getElementById('galleryMinConf');
+  if (sliderEl) sliderEl.value = state.galleryMinConf || 0;
+  const labelEl = document.getElementById('galleryMinConfValue');
+  if (labelEl) {
+    const v = parseInt(state.galleryMinConf, 10) || 0;
+    labelEl.textContent = v > 0 ? `≥${v}%` : 'Any';
+  }
+}
+
+// True when at least one of the four gallery filter dimensions is active.
+// Sort order is deliberately not consulted — it is not one of the four
+// filter dimensions the hash and chip row track.
+function anyGalleryFilterActive() {
+  return !!(state.gallerySpecies || state.galleryCamera || state.galleryDateFrom || state.galleryDateTo || state.galleryMinConf);
+}
+
+// Renders one removable chip per active filter dimension. The date range
+// is a single combined chip because it is presented as one filter type.
+// Renders nothing at all — no placeholder — when no filter is active.
+function renderGalleryChips() {
+  const row = document.getElementById('galleryChipRow');
+  if (!row) return;
+  if (!anyGalleryFilterActive()) { row.innerHTML = ''; return; }
+
+  const chip = (label, name) => `
+    <span class="filter-chip">
+      <span class="filter-chip-label" title="${escHtml(label)}">${escHtml(label)}</span>
+      <span class="filter-chip-x" onclick="clearGalleryFilter('${name}')" title="Remove filter">✕</span>
+    </span>`;
+
+  const chips = [];
+  if (state.gallerySpecies) chips.push(chip(`Species: ${state.gallerySpecies}`, 'species'));
+  if (state.galleryCamera) chips.push(chip(`Camera: ${state.galleryCamera}`, 'camera'));
+  if (state.galleryDateFrom || state.galleryDateTo) {
+    const from = state.galleryDateFrom || '…';
+    const to = state.galleryDateTo || '…';
+    chips.push(chip(`Date: ${from} → ${to}`, 'date'));
+  }
+  if (state.galleryMinConf) chips.push(chip(`Confidence: ≥${state.galleryMinConf}%`, 'conf'));
+
+  row.innerHTML = chips.join('');
+}
+
+// Clears a single filter dimension, re-syncs the toolbar controls, rewrites
+// the hash and reloads — the same clear-state-then-reload shape used by
+// clearVideoDateFilter().
+function clearGalleryFilter(name) {
+  if (name === 'species') state.gallerySpecies = '';
+  if (name === 'camera') state.galleryCamera = '';
+  if (name === 'date') { state.galleryDateFrom = ''; state.galleryDateTo = ''; }
+  if (name === 'conf') state.galleryMinConf = '';
+  state.galleryPage = 1;
+  applyGalleryFiltersToControls();
+  writeGalleryHash();
+  loadGallery();
+}
+
+// Clears every active gallery filter at once — the inline "Clear filters"
+// action offered from the filtered-to-zero empty state.
+function clearAllGalleryFilters() {
+  state.gallerySpecies = '';
+  state.galleryCamera = '';
+  state.galleryDateFrom = '';
+  state.galleryDateTo = '';
+  state.galleryMinConf = '';
+  state.galleryPage = 1;
+  applyGalleryFiltersToControls();
+  writeGalleryHash();
+  loadGallery();
+}
+
 async function loadGallery(page) {
   if (page !== undefined) state.galleryPage = page;
   const grid = document.getElementById('galleryGrid');
@@ -1498,16 +1659,40 @@ async function loadGallery(page) {
 
   const p = new URLSearchParams();
   if (state.gallerySpecies) p.set('species', state.gallerySpecies);
+  if (state.galleryCamera) p.set('camera', state.galleryCamera);
+  if (state.galleryDateFrom) p.set('date_from', state.galleryDateFrom);
+  if (state.galleryDateTo) p.set('date_to', state.galleryDateTo);
+  if (state.galleryMinConf) p.set('min_confidence', parseInt(state.galleryMinConf, 10) / 100);
   p.set('sort', state.gallerySort);
   p.set('page', state.galleryPage);
   p.set('per_page', 40);
 
-  const data = await api('/gallery?' + p);
+  const reqToken = ++state.galleryReqToken;
+  let data;
+  try {
+    data = await api('/gallery?' + p);
+  } catch (err) {
+    if (reqToken !== state.galleryReqToken) return;
+    grid.innerHTML = `<div class="empty"><span class="empty-icon">⚠</span>Couldn't load gallery — check the connection and try again.
+      <div style="margin-top:10px"><span class="btn-correct" style="cursor:pointer" onclick="loadGallery()">Retry</span></div></div>`;
+    document.getElementById('galleryPagination').innerHTML = '';
+    renderGalleryChips();
+    return;
+  }
+  if (reqToken !== state.galleryReqToken) return;
+
   document.getElementById('galleryCount').textContent = `${data.total} images`;
 
   if (!data.items.length) {
-    grid.innerHTML = '<div class="empty"><span class="empty-icon">📷</span>No images yet.</div>';
+    if (anyGalleryFilterActive()) {
+      grid.innerHTML = `<div class="empty"><span class="empty-icon">📷</span>No detections match these filters.
+        <div style="margin-top:6px;font-size:12px">Try widening the date range or lowering the confidence threshold.</div>
+        <div style="margin-top:10px"><span class="btn-correct" style="cursor:pointer" onclick="clearAllGalleryFilters()">Clear filters</span></div></div>`;
+    } else {
+      grid.innerHTML = '<div class="empty"><span class="empty-icon">📷</span>No images yet.</div>';
+    }
     document.getElementById('galleryPagination').innerHTML = '';
+    renderGalleryChips();
     return;
   }
 
@@ -1551,13 +1736,32 @@ async function loadGallery(page) {
   `}).join('');
 
   renderPagination('galleryPagination', data.page, data.pages, p => loadGallery(p));
+  renderGalleryChips();
 }
 
 document.getElementById('gallerySpeciesFilter').addEventListener('change', e => {
-  state.gallerySpecies = e.target.value; state.galleryPage = 1; loadGallery();
+  state.gallerySpecies = e.target.value; state.galleryPage = 1; writeGalleryHash(); loadGallery();
 });
 document.getElementById('gallerySort').addEventListener('change', e => {
   state.gallerySort = e.target.value; state.galleryPage = 1; loadGallery();
+});
+document.getElementById('galleryCameraFilter').addEventListener('change', e => {
+  state.galleryCamera = e.target.value; state.galleryPage = 1; writeGalleryHash(); loadGallery();
+});
+document.getElementById('galleryDateFrom').addEventListener('change', e => {
+  state.galleryDateFrom = e.target.value; state.galleryPage = 1; writeGalleryHash(); loadGallery();
+});
+document.getElementById('galleryDateTo').addEventListener('change', e => {
+  state.galleryDateTo = e.target.value; state.galleryPage = 1; writeGalleryHash(); loadGallery();
+});
+document.getElementById('galleryMinConf').addEventListener('input', e => {
+  const v = parseInt(e.target.value, 10) || 0;
+  document.getElementById('galleryMinConfValue').textContent = v > 0 ? `≥${v}%` : 'Any';
+});
+document.getElementById('galleryMinConf').addEventListener('change', e => {
+  const v = parseInt(e.target.value, 10) || 0;
+  state.galleryMinConf = v > 0 ? String(v) : '';
+  state.galleryPage = 1; writeGalleryHash(); loadGallery();
 });
 
 // ── Videos ────────────────────────────────────────────────────────────────────
@@ -1643,11 +1847,18 @@ async function loadCameras() {
   const cameras = await api('/cameras').catch(() => []);
   const sel = document.getElementById('videoCameraFilter');
   const blankSel = document.getElementById('blankCameraFilter');
+  const gallerySel = document.getElementById('galleryCameraFilter');
   if (!cameras.length) return;
   const opts = '<option value="">All Cameras</option>' +
     cameras.map(c => `<option value="${escHtml(c.camera_name)}">${escHtml(c.camera_name)} (${c.video_count})</option>`).join('');
-  sel.innerHTML = opts;
-  blankSel.innerHTML = opts;
+  if (sel) sel.innerHTML = opts;
+  if (blankSel) blankSel.innerHTML = opts;
+  if (gallerySel) {
+    gallerySel.innerHTML = opts;
+    // Rebuilding the options clears the selection, so re-apply the
+    // camera filter carried in state (e.g. restored from the URL hash).
+    gallerySel.value = state.galleryCamera;
+  }
 }
 
 async function loadBlanks(page = 1) {
@@ -2974,6 +3185,11 @@ async function submitCorrection(detectionId) {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 loadDashboard();
 loadCameras();
+if (parseGalleryHash()) {
+  switchTab('gallery');
+  applyGalleryFiltersToControls();
+  loadGallery();
+}
 </script>
 </body>
 </html>
