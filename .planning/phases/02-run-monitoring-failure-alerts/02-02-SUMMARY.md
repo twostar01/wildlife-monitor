@@ -130,3 +130,11 @@ None - no external service configuration required. This plan only creates the sh
 
 - `notifications.py`'s eight public symbols are ready for `wildlife_processor.py` to wire into the real-alert path (`decide_run_alert()` → `format_run_alert()` → `send_notification_email()`) and for `web_app.py` to wire into the settings save/load path and the new test-email endpoint (`POST /api/notifications/test`).
 - No blockers. This plan has zero dependency on plan 02-01 (database.py `runs` table work, executed in parallel in a sibling worktree) — `notifications.py`'s functions are pure/stdlib and only assume the run-dict *shape* documented in 02-01's plan file, not its actual implementation, so integration risk is limited to a shape mismatch that would surface immediately when the downstream wiring plan runs its own verification.
+
+## Self-Check: PASSED
+
+- FOUND: `notifications.py`
+- FOUND: `598460c` (Task 1 commit)
+- FOUND: `4ae0ef7` (Task 2 commit)
+- FOUND: `55b51cf` (Task 3 commit)
+- FOUND: `5a8ac55` (SUMMARY.md metadata commit)
