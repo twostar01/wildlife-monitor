@@ -60,6 +60,13 @@ _run_process: subprocess.Popen | None = None
 _run_log_f = None   # file handle for the current manual run log; closed after process exits
 _run_lock = threading.Lock()
 
+# Scheduling (SCHED-01/02/03) — module constants so a verification harness can
+# repoint the drop-in directory at a temporary path without patching function bodies.
+_HHMM_RE          = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+TIMER_UNIT        = "wildlife-analysis.timer"
+TIMER_DROPIN_DIR  = Path("/etc/systemd/system/wildlife-analysis.timer.d")
+TIMER_DROPIN_FILE = TIMER_DROPIN_DIR / "override.conf"
+
 DEFAULT_PROCESSING_SETTINGS = {
     "hours":                  24,
     "sample_rate":            30,
@@ -81,6 +88,8 @@ DEFAULT_PROCESSING_SETTINGS = {
     "smtp_password":            "",
     "smtp_recipient":           "",
     "alert_on_zero_detections": False,
+    # Scheduling — daily run time (SCHED-01)
+    "run_time_hhmm":            "06:00",
 }
 
 
@@ -101,6 +110,48 @@ def _save_settings(data: dict):
     Path(SETTINGS_FILE).parent.mkdir(parents=True, exist_ok=True)
     with open(SETTINGS_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+
+def _render_timer_override(hhmm: str) -> str:
+    """Render the complete text of the wildlife-analysis.timer.d drop-in file.
+
+    `hhmm` must already be validated against `_HHMM_RE` — this function does
+    no validation of its own.
+
+    The empty `OnCalendar=` line below is load-bearing and must never be
+    removed: OnCalendar is a list-accepting systemd directive, so a drop-in
+    that only *adds* a new OnCalendar value leaves the shipped unit's 06:00
+    trigger active alongside it, and the pipeline runs twice a day. Emitting
+    an empty OnCalendar= first resets the list before the new value is set.
+    """
+    hour, minute = hhmm.split(":")
+    lines = [
+        "[Timer]",
+        "OnCalendar=",
+        f"OnCalendar=*-*-* {hour}:{minute}:00",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _parse_next_elapse(stdout: str):
+    """Extract the value portion of a `systemctl show --property=...` line.
+
+    Returns the stripped right-hand side of the first `=`, or `None` when
+    the string is empty, has no `=`, or has an empty right-hand side.
+
+    Deliberately performs no numeric conversion. systemd emits this property
+    as an already human-formatted timestamp string (e.g.
+    "Wed 2026-07-29 06:00:00 UTC"), not a microsecond epoch — treating it as
+    a number and converting it (int(), datetime.fromtimestamp(), etc.) is
+    the single most likely way to break this feature at runtime.
+    """
+    if not stdout:
+        return None
+    key, sep, val = stdout.partition("=")
+    if not sep:
+        return None
+    val = val.strip()
+    return val or None
 
 
 def _load_nas_config() -> dict:
@@ -818,6 +869,7 @@ class ProcessingSettings(BaseModel):
     smtp_password:             str          = ""
     smtp_recipient:            str          = ""
     alert_on_zero_detections:  bool         = False
+    run_time_hhmm:             str          = "06:00"
 
 
 @app.get("/api/settings")
@@ -837,6 +889,11 @@ def api_save_settings(body: ProcessingSettings):
         error = validate_smtp_config(data)
         if error:
             raise HTTPException(400, detail=error)
+    # The general settings form posts every setting at once, so this is the
+    # second door into run_time_hhmm (the dedicated schedule endpoint is the
+    # first) and it must be guarded to the same standard (SCHED-01, T-03-07).
+    if not _HHMM_RE.fullmatch(data.get("run_time_hhmm", "")):
+        raise HTTPException(400, "run_time_hhmm must be HH:MM (24-hour)")
     _save_settings(data)
     return {"ok": True}
 
@@ -867,6 +924,80 @@ def api_test_email(body: TestEmailRequest):
     if not ok:
         return {"ok": False, "error": error}
     return {"ok": True, "recipient": cfg.get("smtp_recipient", "")}
+
+
+class ScheduleRequest(BaseModel):
+    run_time: str
+
+
+@app.post("/api/schedule")
+def api_save_schedule(body: ScheduleRequest):
+    # 1. Validate. Nothing below this line may run for an invalid value —
+    #    no settings write, no file write, no subprocess (T-03-01).
+    if not _HHMM_RE.fullmatch(body.run_time):
+        raise HTTPException(400, "run_time must be HH:MM (24-hour)")
+
+    # 2. Persist first (D-04): the operator's typed value must survive a
+    #    failed apply below, so it stays saved and retryable.
+    data = _load_settings()
+    data["run_time_hhmm"] = body.run_time
+    _save_settings(data)
+
+    # 3. Write the drop-in. Ordinary unprivileged filesystem calls — the
+    #    directory is pre-chowned to the app user by the one-time operator
+    #    setup (README), which is what keeps the sudoers rule to two lines.
+    try:
+        TIMER_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
+        TIMER_DROPIN_FILE.write_text(_render_timer_override(body.run_time))
+    except OSError as e:
+        raise HTTPException(
+            500,
+            f"Could not write timer override at {TIMER_DROPIN_FILE}: {e}",
+        )
+
+    # 4. Apply — exactly two fixed-argv sudo calls, no shell, no retry,
+    #    no reverting the settings write on failure (D-04).
+    reload_result = subprocess.run(
+        ["sudo", "systemctl", "daemon-reload"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if reload_result.returncode != 0:
+        raise HTTPException(
+            500,
+            f"Schedule saved but could not be applied (daemon-reload failed): "
+            f"{reload_result.stderr.strip()}",
+        )
+    restart_result = subprocess.run(
+        ["sudo", "systemctl", "restart", TIMER_UNIT],
+        capture_output=True, text=True, timeout=15,
+    )
+    if restart_result.returncode != 0:
+        raise HTTPException(
+            500,
+            f"Schedule saved but could not be applied (timer restart failed): "
+            f"{restart_result.stderr.strip()}",
+        )
+
+    return {"ok": True, "run_time": body.run_time}
+
+
+@app.get("/api/schedule/next-run")
+def api_next_run():
+    # Deliberately no sudo: this is a read-only property query any local
+    # user may issue, and wrapping it in sudo would widen the privileged
+    # surface for no reason.
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", TIMER_UNIT, "--property=NextElapseUSecRealtime"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"next_run": None, "error": str(e)}
+
+    if result.returncode != 0:
+        return {"next_run": None, "error": result.stderr.strip()}
+
+    return {"next_run": _parse_next_elapse(result.stdout)}
 
 
 class RunRequest(BaseModel):
