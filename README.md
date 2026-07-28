@@ -180,6 +180,8 @@ tail -f ~/wildlife_monitor/data/cron.log         # analysis output
 
 ### Changing the run time
 
+The dashboard's Schedule setting can change the run time without touching a terminal, once the one-time setup below has been completed. Until then — or as a fallback any time — you can edit the timer directly:
+
 ```bash
 sudo systemctl edit wildlife-analysis.timer
 ```
@@ -193,6 +195,28 @@ OnCalendar=*-*-* 06:00:00
 ```
 
 Then `sudo systemctl daemon-reload`.
+
+### One-time setup for dashboard schedule changes
+
+The dashboard can change the run time only after this one-time root setup has been performed. It is deliberately **not** automated by `setup.sh`, because it grants the dashboard limited root capability — read it before running it.
+
+```bash
+sudo mkdir -p /etc/systemd/system/wildlife-analysis.timer.d
+sudo chown nash:nash /etc/systemd/system/wildlife-analysis.timer.d
+
+sudo visudo -f /etc/sudoers.d/wildlife-monitor
+```
+
+In the file opened by `visudo`, add exactly these two lines:
+
+```
+nash ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
+nash ALL=(root) NOPASSWD: /usr/bin/systemctl restart wildlife-analysis.timer
+```
+
+The `chown` lets the unprivileged dashboard process write the drop-in override file with an ordinary file write. The two sudoers lines are what let it ask systemd to pick that file up. Both are exact-command grants with no wildcard — a wildcarded rule would let anyone who can reach the dashboard on the LAN run any `systemctl` subcommand as root, and that matters more than usual here because the dashboard has no authentication by design.
+
+If this setup has not been performed, saving a run time from the dashboard still stores the value but reports that it could not be applied, and the previous schedule keeps running until the operator completes the setup and saves again.
 
 ---
 
