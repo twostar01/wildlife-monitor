@@ -131,7 +131,7 @@ Country, region, and all other settings are read from data/settings.json automat
 
 ```bash
 source ~/wildlife_env/bin/activate
-python web_app.py --port 0 --host 0.0.0.0 --data-dir /home/nash/wildlife_monitor/data
+python web_app.py --port 0 --host 0.0.0.0 --data-dir /home/twostar/wildlife_monitor/data
 ```
 
 Open **http://localhost:8080** in a browser (or the auto-selected port shown in output). From another device on the same network: `http://<machine-ip>:<port>`.
@@ -202,7 +202,7 @@ The dashboard can change the run time only after this one-time root setup has be
 
 ```bash
 sudo mkdir -p /etc/systemd/system/wildlife-analysis.timer.d
-sudo chown nash:nash /etc/systemd/system/wildlife-analysis.timer.d
+sudo chown twostar:twostar /etc/systemd/system/wildlife-analysis.timer.d
 
 sudo visudo -f /etc/sudoers.d/wildlife-monitor
 ```
@@ -210,8 +210,8 @@ sudo visudo -f /etc/sudoers.d/wildlife-monitor
 In the file opened by `visudo`, add exactly these two lines:
 
 ```
-nash ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
-nash ALL=(root) NOPASSWD: /usr/bin/systemctl restart wildlife-analysis.timer
+twostar ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
+twostar ALL=(root) NOPASSWD: /usr/bin/systemctl restart wildlife-analysis.timer
 ```
 
 The `chown` lets the unprivileged dashboard process write the drop-in override file with an ordinary file write. The two sudoers lines are what let it ask systemd to pick that file up. Both are exact-command grants with no wildcard — a wildcarded rule would let anyone who can reach the dashboard on the LAN run any `systemctl` subcommand as root, and that matters more than usual here because the dashboard has no authentication by design.
