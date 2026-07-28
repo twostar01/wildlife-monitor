@@ -499,6 +499,10 @@
         <div id="lastRunBody">
           <div class="loading"><span class="spinner"></span>Loading…</div>
         </div>
+        <div id="nextRunRow" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
+          <span class="nas-key">Next scheduled run</span>
+          <span class="nas-val" id="nextRunValue" style="text-align:left;white-space:nowrap">—</span>
+        </div>
       </div>
       <div class="stat-grid" id="statGrid">
         <div class="loading"><span class="spinner"></span>Loading…</div>
@@ -1309,6 +1313,7 @@ async function loadDashboard() {
   // Last-run panel loads independently — a stalled/failing run-status fetch
   // must never delay or block the rest of the dashboard rendering above.
   loadLastRun();
+  loadNextRun();
 }
 
 // ── Run monitoring ────────────────────────────────────────────────────────────
@@ -1463,6 +1468,19 @@ async function loadLastRun() {
     `;
   } catch (e) {
     el.innerHTML = "<div style=\"color:var(--muted);font-size:12px\">Couldn't load the last run's status.</div>";
+  }
+}
+
+async function loadNextRun() {
+  const el = document.getElementById('nextRunValue');
+  if (!el) return;
+  try {
+    // The endpoint returns systemd's own pre-formatted timestamp precisely so this
+    // function has nothing to parse, reformat or localise (SCHED-02, D-03).
+    const data = await api('/schedule/next-run');
+    el.textContent = (data && data.next_run) ? data.next_run : 'Not scheduled (timer inactive)';
+  } catch (e) {
+    el.textContent = 'Not scheduled (timer inactive)';
   }
 }
 
