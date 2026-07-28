@@ -5,12 +5,12 @@ Wants=remote-fs.target
 
 [Service]
 Type=simple
-User=nash
-WorkingDirectory=/home/nash/wildlife_monitor
-ExecStart=/home/nash/wildlife_env/bin/python web_app.py \
+User=twostar
+WorkingDirectory=/home/twostar/wildlife_monitor
+ExecStart=/home/twostar/wildlife_env/bin/python web_app.py \
     --port 8080 \
     --host 0.0.0.0 \
-    --data-dir /home/nash/wildlife_monitor/data
+    --data-dir /home/twostar/wildlife_monitor/data
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

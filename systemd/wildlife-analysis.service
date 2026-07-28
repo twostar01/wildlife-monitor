@@ -5,15 +5,15 @@ Wants=remote-fs.target
 
 [Service]
 Type=oneshot
-User=nash
-WorkingDirectory=/home/nash/wildlife_monitor
+User=twostar
+WorkingDirectory=/home/twostar/wildlife_monitor
 ExecStart=/bin/bash -c '\
-    source /home/nash/wildlife_env/bin/activate && \
+    source /home/twostar/wildlife_env/bin/activate && \
     ./nas_sync.sh \
         --then-process \
-        --data-dir /home/nash/wildlife_monitor/data'
-StandardOutput=append:/home/nash/wildlife_monitor/data/cron.log
-StandardError=append:/home/nash/wildlife_monitor/data/cron.log
+        --data-dir /home/twostar/wildlife_monitor/data'
+StandardOutput=append:/home/twostar/wildlife_monitor/data/cron.log
+StandardError=append:/home/twostar/wildlife_monitor/data/cron.log
 TimeoutStartSec=14400
 
 [Install]
