@@ -43,6 +43,12 @@ from pydantic import BaseModel
 import uvicorn
 
 import database as db
+from notifications import (
+    validate_smtp_config,
+    send_notification_email,
+    redact_smtp_password,
+    merge_preserved_password,
+)
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Wildlife Monitor", docs_url=None, redoc_url=None)
@@ -68,6 +74,13 @@ DEFAULT_PROCESSING_SETTINGS = {
     # Retention — kept videos (animal/person detected)
     "kept_retention_days":    730,
     "kept_retention_gb":      500.0,
+    # Notifications — SMTP alerting (NOTIFY-03)
+    "smtp_server":              "",
+    "smtp_port":                None,
+    "smtp_username":            "",
+    "smtp_password":            "",
+    "smtp_recipient":           "",
+    "alert_on_zero_detections": False,
 }
 
 
@@ -791,12 +804,18 @@ class ProcessingSettings(BaseModel):
     blank_retention_gb:     float = 20.0
     kept_retention_days:    int   = 730
     kept_retention_gb:      float = 500.0
+    smtp_server:              str           = ""
+    smtp_port:                Optional[int] = None
+    smtp_username:             str          = ""
+    smtp_password:             str          = ""
+    smtp_recipient:            str          = ""
+    alert_on_zero_detections:  bool         = False
 
 
 @app.get("/api/settings")
 def api_get_settings():
     return {
-        "processing": _load_settings(),
+        "processing": redact_smtp_password(_load_settings()),
         "nas":        _load_nas_config(),
     }
 
@@ -804,7 +823,12 @@ def api_get_settings():
 @app.post("/api/settings")
 def api_save_settings(body: ProcessingSettings):
     data = body.dict()
+    data = merge_preserved_password(data, _load_settings())
     data["country"] = data["country"].upper().strip()
+    if data.get("smtp_server", "").strip():
+        error = validate_smtp_config(data)
+        if error:
+            raise HTTPException(400, detail=error)
     _save_settings(data)
     return {"ok": True}
 
