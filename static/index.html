@@ -352,6 +352,11 @@
     backdrop-filter: blur(6px);
   }
   .modal-overlay.open { display: flex; }
+  /* #correctionModal and #videoPlayerModal both share .modal-overlay, so
+     document order alone used to decide which one painted on top. The
+     correction popover is only ever opened as a layer over an
+     already-open video player, never the reverse, so it is the one raised. */
+  #correctionModal { z-index: 250; }
   .modal {
     background: var(--card); border: 1px solid var(--border);
     border-radius: 10px; width: 100%; max-width: 900px;
@@ -2474,33 +2479,33 @@ async function loadSystemStats() {
 
 // ── Species Correction ────────────────────────────────────────────────────────
 
-let _correctionContext = null; // {videoId, originalLabel, commonName, candidates}
+let _correctionContext = null; // {mode, videoId, originalLabel, commonName, detectionId}
 
-async function openCorrectionModal(videoId, originalLabel, commonName, candidatesJson) {
-  _correctionContext = { videoId, originalLabel, commonName };
-  let candidates = [];
-  try { candidates = JSON.parse(candidatesJson || '[]'); } catch {}
-
-  const body = document.getElementById('correctionModalBody');
-  body.innerHTML = `
-    <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
-      Correcting: <strong style="color:var(--text)">${escHtml(commonName || originalLabel)}</strong>
-      on this video only.
-    </div>
-
-    ${candidates.length ? `
+// Shared candidate-button markup for both the video-player and gallery entry
+// points. Takes an already-parsed candidate array and returns the "Top
+// Candidates" heading plus a wrapping button row, or '' for an empty/missing
+// list — the existing conditional behaviour is preserved as a return value
+// rather than an inline ternary so both entry points render identically.
+function renderCandidateButtons(candidates) {
+  if (!candidates || !candidates.length) return '';
+  return `
     <div style="margin-bottom:14px">
       <div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Top Candidates</div>
       <div style="display:flex;flex-wrap:wrap;gap:6px">
         ${candidates.map(c => `
-          <button onclick="applyCorrectionQuick('${escHtml(c.label)}','${escHtml(c.common_name||'')}','${escHtml(c.scientific_name||'')}',${videoId},'${escHtml(originalLabel)}')"
+          <button onclick="applyCorrectionQuick('${escHtml(c.label)}','${escHtml(c.common_name||'')}','${escHtml(c.scientific_name||'')}')"
             style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:4px;font-size:11px;cursor:pointer;text-align:left">
             ${escHtml(c.common_name || c.label)}
             <span style="color:var(--muted);font-size:10px"> ${(c.score*100).toFixed(0)}%</span>
           </button>`).join('')}
       </div>
-    </div>` : ''}
+    </div>`;
+}
 
+// Shared species-search section markup for both entry points — one field,
+// one results container, reused rather than duplicated per D-05.
+function renderCorrectionSearchSection() {
+  return `
     <div style="margin-bottom:14px">
       <div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">
         Search Species
@@ -2511,7 +2516,32 @@ async function openCorrectionModal(videoId, originalLabel, commonName, candidate
       <input id="corrSearchInput" class="setting-input" type="text" placeholder="Type species name…"
         oninput="searchSpeciesCorrection()" style="width:100%;margin-bottom:8px">
       <div id="corrSearchResults" style="max-height:200px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;display:none"></div>
+    </div>`;
+}
+
+// Shared save-failure surface for both entry points. Hidden until a save
+// fails; both applyCorrection and applyDetectionCorrection write into it.
+function renderCorrInlineError() {
+  return `<div id="corrInlineError" style="display:none;color:#e05c5c;font-size:12px;margin-bottom:10px"></div>`;
+}
+
+async function openCorrectionModal(videoId, originalLabel, commonName, candidatesJson) {
+  _correctionContext = { mode: 'video', videoId, originalLabel, commonName, detectionId: undefined };
+  let candidates = [];
+  try { candidates = JSON.parse(candidatesJson || '[]'); } catch {}
+
+  const body = document.getElementById('correctionModalBody');
+  body.innerHTML = `
+    <div style="font-size:12px;color:var(--muted);margin-bottom:12px">
+      Correcting: <strong style="color:var(--text)">${escHtml(commonName || originalLabel)}</strong>
+      on this video only.
     </div>
+
+    ${renderCandidateButtons(candidates)}
+
+    ${renderCorrectionSearchSection()}
+
+    ${renderCorrInlineError()}
 
     <div style="display:flex;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
       <button class="btn-run" style="background:rgba(224,92,92,0.15);border-color:#e05c5c;color:#e05c5c;font-size:12px;padding:7px 16px"
@@ -2541,7 +2571,7 @@ async function searchSpeciesCorrection() {
     }
     el.style.display = 'block';
     el.innerHTML = results.map(r => `
-      <div onclick="applyCorrectionQuick('${escHtml(r.label)}','${escHtml(r.common_name||'')}','${escHtml(r.scientific_name||'')}',${_correctionContext?.videoId},'${escHtml(_correctionContext?.originalLabel)}')"
+      <div onclick="applyCorrectionQuick('${escHtml(r.label)}','${escHtml(r.common_name||'')}','${escHtml(r.scientific_name||'')}')"
         style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:12px"
         onmouseover="this.style.background='var(--surface)'" onmouseout="this.style.background=''">
         <strong>${escHtml(r.common_name || r.label)}</strong>
@@ -2550,8 +2580,16 @@ async function searchSpeciesCorrection() {
   }, 350);
 }
 
-async function applyCorrectionQuick(label, common, scientific, videoId, originalLabel) {
-  await applyCorrection(videoId, originalLabel, label, common, scientific);
+// The single dispatch point between the two correction scopes. Everything
+// above this call is shared markup; everything below it is scope-specific —
+// the video-level applyCorrection() or the detection-level
+// applyDetectionCorrection(), chosen by _correctionContext.mode.
+async function applyCorrectionQuick(label, common, scientific) {
+  if (_correctionContext?.mode === 'detection') {
+    await applyDetectionCorrection(common, scientific);
+  } else {
+    await applyCorrection(_correctionContext?.videoId, _correctionContext?.originalLabel, label, common, scientific);
+  }
 }
 
 async function applyCorrection(videoId, originalLabel, correctedLabel, correctedCommon, correctedScientific) {
