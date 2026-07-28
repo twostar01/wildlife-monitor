@@ -2613,6 +2613,52 @@ async function applyCorrection(videoId, originalLabel, correctedLabel, corrected
       openVideo(videoId);
     }
     loadDashboard();
+    return;
+  }
+
+  const errEl = document.getElementById('corrInlineError');
+  if (errEl) {
+    errEl.textContent = "Couldn't save correction — try again.";
+    errEl.style.display = 'block';
+  }
+}
+
+// Detection-level save path for the gallery entry point. Saves exactly the
+// clicked crop through /api/species/correct, identified by detection_id —
+// never by video_id/original_label, which would relabel a whole video's
+// worth of detections instead of the one the operator clicked. On success it
+// updates only that grid node in place (no loadGallery/loadDashboard reload,
+// per D-07); on failure it reports inline and leaves everything else alone.
+async function applyDetectionCorrection(common, sci) {
+  const errEl = document.getElementById('corrInlineError');
+  if (errEl) { errEl.style.display = 'none'; errEl.textContent = ''; }
+
+  const detectionId = _correctionContext?.detectionId;
+  const res = await fetch('/api/species/correct', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      detection_id: detectionId,
+      user_common_name: common,
+      user_scientific_name: sci,
+    }),
+  }).then(r => r.json()).catch(() => null);
+
+  if (res && res.ok) {
+    closeModal('correctionModal');
+    const item = document.getElementById(`gitem-${detectionId}`);
+    if (item) {
+      const nameEl = item.querySelector('.gallery-item-name');
+      if (nameEl) nameEl.innerHTML = `${escHtml(common)} <span class="badge-corrected">✏ corrected</span>`;
+      item.dataset.common = common;
+      item.dataset.sci = sci;
+    }
+    return;
+  }
+
+  if (errEl) {
+    errEl.textContent = "Couldn't save correction — try again.";
+    errEl.style.display = 'block';
   }
 }
 
