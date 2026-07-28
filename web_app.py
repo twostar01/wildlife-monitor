@@ -926,6 +926,80 @@ def api_test_email(body: TestEmailRequest):
     return {"ok": True, "recipient": cfg.get("smtp_recipient", "")}
 
 
+class ScheduleRequest(BaseModel):
+    run_time: str
+
+
+@app.post("/api/schedule")
+def api_save_schedule(body: ScheduleRequest):
+    # 1. Validate. Nothing below this line may run for an invalid value —
+    #    no settings write, no file write, no subprocess (T-03-01).
+    if not _HHMM_RE.fullmatch(body.run_time):
+        raise HTTPException(400, "run_time must be HH:MM (24-hour)")
+
+    # 2. Persist first (D-04): the operator's typed value must survive a
+    #    failed apply below, so it stays saved and retryable.
+    data = _load_settings()
+    data["run_time_hhmm"] = body.run_time
+    _save_settings(data)
+
+    # 3. Write the drop-in. Ordinary unprivileged filesystem calls — the
+    #    directory is pre-chowned to the app user by the one-time operator
+    #    setup (README), which is what keeps the sudoers rule to two lines.
+    try:
+        TIMER_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
+        TIMER_DROPIN_FILE.write_text(_render_timer_override(body.run_time))
+    except OSError as e:
+        raise HTTPException(
+            500,
+            f"Could not write timer override at {TIMER_DROPIN_FILE}: {e}",
+        )
+
+    # 4. Apply — exactly two fixed-argv sudo calls, no shell, no retry,
+    #    no reverting the settings write on failure (D-04).
+    reload_result = subprocess.run(
+        ["sudo", "systemctl", "daemon-reload"],
+        capture_output=True, text=True, timeout=15,
+    )
+    if reload_result.returncode != 0:
+        raise HTTPException(
+            500,
+            f"Schedule saved but could not be applied (daemon-reload failed): "
+            f"{reload_result.stderr.strip()}",
+        )
+    restart_result = subprocess.run(
+        ["sudo", "systemctl", "restart", TIMER_UNIT],
+        capture_output=True, text=True, timeout=15,
+    )
+    if restart_result.returncode != 0:
+        raise HTTPException(
+            500,
+            f"Schedule saved but could not be applied (timer restart failed): "
+            f"{restart_result.stderr.strip()}",
+        )
+
+    return {"ok": True, "run_time": body.run_time}
+
+
+@app.get("/api/schedule/next-run")
+def api_next_run():
+    # Deliberately no sudo: this is a read-only property query any local
+    # user may issue, and wrapping it in sudo would widen the privileged
+    # surface for no reason.
+    try:
+        result = subprocess.run(
+            ["systemctl", "show", TIMER_UNIT, "--property=NextElapseUSecRealtime"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        return {"next_run": None, "error": str(e)}
+
+    if result.returncode != 0:
+        return {"next_run": None, "error": result.stderr.strip()}
+
+    return {"next_run": _parse_next_elapse(result.stdout)}
+
+
 class RunRequest(BaseModel):
     date_from: Optional[str] = None   # YYYY-MM-DD — if set, overrides --hours
     date_to:   Optional[str] = None   # YYYY-MM-DD
