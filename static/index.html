@@ -217,6 +217,10 @@
   .btn-save:hover { background: rgba(109,186,92,0.08); }
   .save-feedback { font-size: 12px; color: var(--accent); margin-left: 12px; opacity: 0; transition: opacity 0.4s; }
   .save-feedback.show { opacity: 1; }
+  .setting-error { font-size: 11px; color: #e05c5c; line-height: 1.4; display: none; margin-top: 2px; }
+  .setting-error.show { display: block; }
+  .notify-feedback { word-break: break-word; max-width: 480px; }
+  .notify-feedback.error { color: #e05c5c; }
   .species-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 16px; }
 
   .species-card {
@@ -778,6 +782,53 @@
           <span class="save-feedback" id="retentionFeedback"></span>
         </div>
         <div id="purgePreview" style="display:none;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)"></div>
+      </div>
+
+      <!-- Notifications -->
+      <div class="card" style="margin-top:20px">
+        <div class="card-title">Notifications</div>
+        <p style="font-size:13px;color:var(--muted);margin:10px 0 16px;line-height:1.6">
+          Configure the SMTP relay used to send failure and zero-detection alert emails. Server, port
+          and recipient are required — username and password may be left blank for a relay that does
+          not require authentication.
+        </p>
+        <div class="setting-row">
+          <label class="setting-label">SMTP Server</label>
+          <input class="setting-input" type="text" id="setSmtpServer" placeholder="smtp.gmail.com" style="max-width:320px">
+          <div class="setting-error" id="errSmtpServer"></div>
+        </div>
+        <div class="setting-row">
+          <label class="setting-label">Port</label>
+          <input class="setting-input" type="number" id="setSmtpPort" min="1" max="65535" placeholder="587" style="width:120px">
+          <div class="setting-error" id="errSmtpPort"></div>
+        </div>
+        <div class="setting-row">
+          <label class="setting-label">Username</label>
+          <input class="setting-input" type="text" id="setSmtpUsername" placeholder="alerts@example.com" style="max-width:320px">
+          <span class="setting-hint">Leave blank for a relay that does not require authentication.</span>
+        </div>
+        <div class="setting-row">
+          <label class="setting-label">Password</label>
+          <input class="setting-input" type="password" id="setSmtpPassword" style="max-width:320px">
+          <span class="setting-hint">The stored password is never sent back to this page. Leave blank to keep the existing one.</span>
+        </div>
+        <div class="setting-row">
+          <label class="setting-label">Recipient</label>
+          <input class="setting-input" type="text" id="setSmtpRecipient" placeholder="you@example.com" style="max-width:320px">
+          <div class="setting-error" id="errSmtpRecipient"></div>
+        </div>
+        <div class="setting-row">
+          <label class="setting-label" style="display:flex;align-items:center;gap:10px;cursor:pointer;flex-direction:row;text-transform:none;letter-spacing:0;font-size:13px;color:var(--text)">
+            <input type="checkbox" id="setAlertZeroDetections" style="width:auto;accent-color:var(--accent);transform:scale(1.2)">
+            Alert on zero detections
+          </label>
+          <span class="setting-hint">Email when a run processes videos but finds no detections. Does not fire on quiet nights with nothing new to sync.</span>
+        </div>
+        <div style="margin-top:18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <button class="btn-run" id="testEmailBtn" onclick="sendTestEmail()">▶ Send Test Email</button>
+          <button class="btn-save" id="saveNotifyBtn" onclick="saveNotificationSettings()">Save Notification Settings</button>
+          <span class="save-feedback notify-feedback" id="notifyFeedback"></span>
+        </div>
       </div>
 
       <!-- Storage Stats -->
@@ -2564,6 +2615,17 @@ async function loadSettings() {
   document.getElementById('setKeptDays').value         = p.kept_retention_days  ?? 730;
   document.getElementById('setKeptGb').value           = p.kept_retention_gb    ?? 500;
 
+  document.getElementById('setSmtpServer').value       = p.smtp_server    ?? '';
+  document.getElementById('setSmtpPort').value         = p.smtp_port      ?? '';
+  document.getElementById('setSmtpUsername').value     = p.smtp_username  ?? '';
+  document.getElementById('setSmtpRecipient').value    = p.smtp_recipient ?? '';
+  document.getElementById('setAlertZeroDetections').checked = !!p.alert_on_zero_detections;
+  const pwdInput = document.getElementById('setSmtpPassword');
+  pwdInput.value = '';
+  pwdInput.placeholder = p.smtp_password_set
+    ? 'Password saved — leave blank to keep it'
+    : 'No password set';
+
   renderNasStatus(data.nas || {});
   checkRunStatus();
 }
@@ -2605,8 +2667,11 @@ function renderNasStatus(nas) {
   `).join('');
 }
 
-async function saveSettings() {
-  const payload = {
+function collectSettingsPayload() {
+  const portRaw = document.getElementById('setSmtpPort').value;
+  const portParsed = parseInt(portRaw, 10);
+  const smtp_port = portRaw === '' ? null : (Number.isNaN(portParsed) ? null : portParsed);
+  return {
     hours:                parseInt(document.getElementById('setHours').value)      || 24,
     sample_rate:          parseInt(document.getElementById('setSampleRate').value)  || 30,
     md_threshold:         parseFloat(document.getElementById('setThreshold').value) || 0.2,
@@ -2618,7 +2683,17 @@ async function saveSettings() {
     blank_retention_gb:   parseFloat(document.getElementById('setBlankGb').value) || 0,
     kept_retention_days:  parseInt(document.getElementById('setKeptDays').value)  || 0,
     kept_retention_gb:    parseFloat(document.getElementById('setKeptGb').value)  || 0,
+    smtp_server:               document.getElementById('setSmtpServer').value.trim(),
+    smtp_port:                 smtp_port,
+    smtp_username:              document.getElementById('setSmtpUsername').value.trim(),
+    smtp_password:               document.getElementById('setSmtpPassword').value,
+    smtp_recipient:              document.getElementById('setSmtpRecipient').value.trim(),
+    alert_on_zero_detections:    document.getElementById('setAlertZeroDetections').checked,
   };
+}
+
+async function saveSettings() {
+  const payload = collectSettingsPayload();
   const res = await fetch('/api/settings', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
@@ -2628,6 +2703,129 @@ async function saveSettings() {
   fb.textContent = (res && res.ok) ? '✓ Settings saved' : '✗ Save failed';
   fb.classList.add('show');
   setTimeout(() => fb.classList.remove('show'), 2500);
+}
+
+function clearNotifyErrors() {
+  for (const id of ['errSmtpServer', 'errSmtpPort', 'errSmtpRecipient']) {
+    const el = document.getElementById(id);
+    el.textContent = '';
+    el.classList.remove('show');
+  }
+}
+
+function showNotifyFieldError(fieldId, message) {
+  const el = document.getElementById(fieldId);
+  el.innerHTML = escHtml(message);
+  el.classList.add('show');
+}
+
+function validateNotificationForm() {
+  clearNotifyErrors();
+  const server = document.getElementById('setSmtpServer').value.trim();
+  if (!server) {
+    showNotifyFieldError('errSmtpServer', 'SMTP server is required.');
+    return false;
+  }
+  const portRaw = document.getElementById('setSmtpPort').value;
+  const port = parseInt(portRaw, 10);
+  if (portRaw === '' || Number.isNaN(port) || port < 1 || port > 65535) {
+    showNotifyFieldError('errSmtpPort', 'Port must be between 1 and 65535.');
+    return false;
+  }
+  const recipient = document.getElementById('setSmtpRecipient').value.trim();
+  if (!recipient) {
+    showNotifyFieldError('errSmtpRecipient', 'Recipient is required.');
+    return false;
+  }
+  if (recipient.indexOf('@') === -1) {
+    showNotifyFieldError('errSmtpRecipient', 'Recipient must be a valid email address.');
+    return false;
+  }
+  return true;
+}
+
+async function saveNotificationSettings() {
+  if (!validateNotificationForm()) return;
+  const btn = document.getElementById('saveNotifyBtn');
+  const fb = document.getElementById('notifyFeedback');
+  const originalLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  try {
+    const res = await fetch('/api/settings', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(collectSettingsPayload()),
+    });
+    const data = await res.json().catch(() => null);
+    if (res.ok) {
+      fb.classList.remove('error');
+      fb.innerHTML = '✓ Notification settings saved';
+      fb.classList.add('show');
+    } else {
+      const detail = (data && data.detail) || 'Save failed.';
+      const fieldMap = {
+        'SMTP server is required.': 'errSmtpServer',
+        'Port must be between 1 and 65535.': 'errSmtpPort',
+        'Recipient is required.': 'errSmtpRecipient',
+        'Recipient must be a valid email address.': 'errSmtpRecipient',
+      };
+      if (fieldMap[detail]) {
+        showNotifyFieldError(fieldMap[detail], detail);
+      } else {
+        fb.classList.add('error');
+        fb.innerHTML = escHtml(detail);
+        fb.classList.add('show');
+      }
+    }
+  } catch (err) {
+    fb.classList.add('error');
+    fb.innerHTML = escHtml('Save failed: ' + (err && err.message ? err.message : 'network error'));
+    fb.classList.add('show');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+}
+
+async function sendTestEmail() {
+  if (!validateNotificationForm()) return;
+  const btn = document.getElementById('testEmailBtn');
+  const fb = document.getElementById('notifyFeedback');
+  const originalLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+  try {
+    const body = {
+      smtp_server:    document.getElementById('setSmtpServer').value.trim(),
+      smtp_port:      parseInt(document.getElementById('setSmtpPort').value, 10),
+      smtp_username:  document.getElementById('setSmtpUsername').value.trim(),
+      smtp_password:  document.getElementById('setSmtpPassword').value,
+      smtp_recipient: document.getElementById('setSmtpRecipient').value.trim(),
+    };
+    const res = await fetch('/api/notifications/test', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    }).then(r => r.json()).catch(() => null);
+    if (res && res.ok) {
+      fb.classList.remove('error');
+      fb.innerHTML = '✓ Test email sent to ' + escHtml(res.recipient || '');
+      fb.classList.add('show');
+    } else {
+      const message = (res && res.error) || 'unknown error';
+      fb.classList.add('error');
+      fb.innerHTML = '✕ Test email failed: ' + escHtml(message);
+      fb.classList.add('show');
+    }
+  } catch (err) {
+    fb.classList.add('error');
+    fb.innerHTML = '✕ Test email failed: ' + escHtml(err && err.message ? err.message : 'network error');
+    fb.classList.add('show');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
 }
 
 let _activeLogEl    = 'runLog';
