@@ -122,6 +122,19 @@ CREATE TABLE IF NOT EXISTS video_corrections (
     note                 TEXT
 );
 
+CREATE TABLE IF NOT EXISTS runs (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    start_time            TEXT NOT NULL,
+    end_time              TEXT,                                -- NULL while running
+    status                TEXT,                                -- 'success'|'partial'|'failure'; NULL while running
+    "trigger"             TEXT NOT NULL DEFAULT 'scheduled',   -- 'manual'|'scheduled'
+    videos_processed      INTEGER DEFAULT 0,
+    detections_found      INTEGER DEFAULT 0,
+    error_summary         TEXT,
+    cameras_json          TEXT,                                -- {"CameraName": {"videos": n, "detections": n}, ...}
+    offline_cameras_json  TEXT                                 -- ["CameraName", ...] flagged as possibly offline this run
+);
+
 CREATE INDEX IF NOT EXISTS idx_videos_recorded_at ON videos(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_videos_camera ON videos(camera_name);
 CREATE INDEX IF NOT EXISTS idx_detections_video_id ON detections(video_id);
@@ -130,6 +143,7 @@ CREATE INDEX IF NOT EXISTS idx_crops_quality ON crops(quality_score DESC);
 CREATE INDEX IF NOT EXISTS idx_blacklist_label ON blacklist(label);
 CREATE INDEX IF NOT EXISTS idx_corrections_video ON video_corrections(video_id);
 CREATE INDEX IF NOT EXISTS idx_corrections_label ON video_corrections(original_label);
+CREATE INDEX IF NOT EXISTS idx_runs_start_time ON runs(start_time DESC);
 """
 
 # Migration: add camera_name to existing databases that predate this column
@@ -257,6 +271,44 @@ def init_db(db_path: Optional[str] = None):
 
 
 # ── Write helpers ──────────────────────────────────────────────────────────────
+
+# Attribution invariant (02-RESEARCH.md Pitfall 3): per-camera attribution in
+# record_run_end()'s cameras_json snapshot relies on videos.processed_at being a
+# reliable "which run touched this video" signal. That in turn depends on
+# nas_sync.sh deleting local staging copies after every normal run, so a video is
+# never re-scanned by a later run. A manual `--no-cleanup` run breaks that
+# invariant: the same local file can be rescanned and re-inserted (advancing
+# processed_at) on a subsequent run before it's archived, re-attributing it to
+# whichever run touched it last.
+def record_run_start(trigger: str) -> int:
+    with get_conn() as conn:
+        cur = conn.execute(
+            """INSERT INTO runs (start_time, "trigger") VALUES (?, ?)""",
+            (datetime.now().isoformat(), trigger),
+        )
+        return int(cur.lastrowid)
+
+
+def record_run_end(
+    run_id: int,
+    status: str,
+    videos_processed: int,
+    detections_found: int,
+    error_summary: Optional[str],
+    cameras_json: Optional[str],
+    offline_cameras_json: Optional[str],
+) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE runs SET end_time=?, status=?, videos_processed=?,
+               detections_found=?, error_summary=?, cameras_json=?, offline_cameras_json=?
+               WHERE id=?""",
+            (
+                datetime.now().isoformat(), status, videos_processed, detections_found,
+                error_summary, cameras_json, offline_cameras_json, run_id,
+            ),
+        )
+
 
 def insert_video(
     filename: str,
@@ -1109,6 +1161,110 @@ def get_gallery(
             "per_page": per_page,
             "pages":    max(1, (total + per_page - 1) // per_page),
         }
+
+
+def _run_row_to_dict(row) -> dict:
+    """
+    Convert one sqlite3.Row from the runs table into the dict shape every reader
+    consumes: the raw columns plus three derived keys (duration_secs, cameras,
+    offline_cameras). A malformed historical cameras_json/offline_cameras_json
+    value never raises here — it just falls back to an empty container so one
+    bad row can't break a whole page of run history.
+    """
+    d = dict(row)
+
+    try:
+        if d.get("end_time"):
+            start = datetime.fromisoformat(d["start_time"])
+            end = datetime.fromisoformat(d["end_time"])
+            d["duration_secs"] = (end - start).total_seconds()
+        else:
+            d["duration_secs"] = None
+    except (TypeError, ValueError):
+        d["duration_secs"] = None
+
+    try:
+        d["cameras"] = json.loads(d["cameras_json"]) if d.get("cameras_json") else {}
+    except (TypeError, ValueError):
+        d["cameras"] = {}
+
+    try:
+        d["offline_cameras"] = json.loads(d["offline_cameras_json"]) if d.get("offline_cameras_json") else []
+    except (TypeError, ValueError):
+        d["offline_cameras"] = []
+
+    return d
+
+
+def get_recent_runs(limit: int = 30) -> list:
+    """Return the most recent runs, newest start_time first. limit is clamped to 1..100."""
+    limit = max(1, min(int(limit), 100))
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM runs ORDER BY start_time DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [_run_row_to_dict(r) for r in rows]
+
+
+def get_last_run() -> Optional[dict]:
+    """Return the most recently started run, or None if no run has ever been recorded."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM runs ORDER BY start_time DESC LIMIT 1"
+        ).fetchone()
+        return _run_row_to_dict(row) if row else None
+
+
+def get_run_by_id(run_id: int) -> Optional[dict]:
+    """Return the full run dict (including untruncated error_summary), or None if unknown."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        return _run_row_to_dict(row) if row else None
+
+
+def get_camera_offline_flags(current_cameras: dict, lookback: int = 5) -> list:
+    """
+    Compare this run's camera set against the last `lookback` completed runs.
+    Returns camera names present in that recent history but absent (zero videos)
+    this run — a possible-offline-camera signal (D-04).
+
+    `lookback` (default 5 completed runs) is the tunable knob for the tradeoff
+    between false positives (too small a window flags a camera after a single
+    quiet night) and detection delay (too large a window takes longer to notice
+    a genuinely offline camera) — see 02-RESEARCH.md assumption A5.
+
+    current_cameras may be either the {"name": {"videos": n, ...}} snapshot shape
+    or a bare {"name": n} shape; both are accepted.
+
+    A run that synced zero videos across every camera is a quiet night, not a
+    fleet of offline cameras (D-08 quiet-night semantics) — this returns []
+    immediately without querying in that case.
+    """
+    def _video_count(v):
+        if isinstance(v, dict):
+            return v.get("videos", 0) or 0
+        return v or 0
+
+    current = {name for name, v in current_cameras.items() if _video_count(v) > 0}
+    if not current:
+        return []
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT cameras_json FROM runs
+               WHERE status IS NOT NULL AND cameras_json IS NOT NULL
+               ORDER BY start_time DESC LIMIT ?""",
+            (lookback,),
+        ).fetchall()
+
+    recent_cameras: set = set()
+    for row in rows:
+        try:
+            recent_cameras |= set(json.loads(row["cameras_json"]).keys())
+        except (TypeError, ValueError):
+            continue
+
+    return sorted(recent_cameras - current)
 
 
 def get_cameras() -> list:
