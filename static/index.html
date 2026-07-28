@@ -256,6 +256,8 @@
   }
   .gallery-toolbar select:focus, .gallery-toolbar input:focus { border-color: var(--accent); }
   .gallery-toolbar label { font-family: var(--font-mono); font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  .conf-slider { accent-color: var(--accent); }
+  #galleryMinConfValue { font-family: var(--font-mono); font-size: 12px; color: var(--accent); margin-left: 6px; }
 
   .gallery-grid { columns: 4; gap: 10px; }
   @media (max-width: 1200px) { .gallery-grid { columns: 3; } }
@@ -535,6 +537,22 @@
         <div>
           <label>Species</label><br>
           <select id="gallerySpeciesFilter"><option value="">All Species</option></select>
+        </div>
+        <div>
+          <label>Camera</label><br>
+          <select id="galleryCameraFilter"><option value="">All Cameras</option></select>
+        </div>
+        <div>
+          <label>From</label><br>
+          <input type="date" id="galleryDateFrom">
+        </div>
+        <div>
+          <label>To</label><br>
+          <input type="date" id="galleryDateTo">
+        </div>
+        <div>
+          <label>Min. Confidence</label><br>
+          <input type="range" id="galleryMinConf" class="conf-slider" min="0" max="100" step="5" value="0"><span id="galleryMinConfValue">Any</span>
         </div>
         <div>
           <label>Sort by</label><br>
@@ -992,6 +1010,7 @@
 // ── State ─────────────────────────────────────────────────────────────────────
 const state = {
   galleryPage: 1, gallerySpecies: '', gallerySort: 'quality',
+  galleryCamera: '', galleryDateFrom: '', galleryDateTo: '', galleryMinConf: '', galleryReqToken: 0,
   videoPage: 1, videoSpecies: '', videoSearch: '', videoCamera: '',
   videoDateFrom: '', videoDateTo: '',
   blankPage: 1,
@@ -1066,7 +1085,7 @@ document.querySelectorAll('nav button').forEach(btn => {
     const tab = btn.dataset.tab;
     switchTab(tab);
     if (tab === 'species') loadSpecies();
-    if (tab === 'gallery') loadGallery();
+    if (tab === 'gallery') { loadCameras(); loadGallery(); }
     if (tab === 'videos')  { loadCameras(); loadVideos(); }
   });
 });
@@ -1498,6 +1517,10 @@ async function loadGallery(page) {
 
   const p = new URLSearchParams();
   if (state.gallerySpecies) p.set('species', state.gallerySpecies);
+  if (state.galleryCamera) p.set('camera', state.galleryCamera);
+  if (state.galleryDateFrom) p.set('date_from', state.galleryDateFrom);
+  if (state.galleryDateTo) p.set('date_to', state.galleryDateTo);
+  if (state.galleryMinConf) p.set('min_confidence', parseInt(state.galleryMinConf, 10) / 100);
   p.set('sort', state.gallerySort);
   p.set('page', state.galleryPage);
   p.set('per_page', 40);
@@ -1554,10 +1577,28 @@ async function loadGallery(page) {
 }
 
 document.getElementById('gallerySpeciesFilter').addEventListener('change', e => {
-  state.gallerySpecies = e.target.value; state.galleryPage = 1; loadGallery();
+  state.gallerySpecies = e.target.value; state.galleryPage = 1; writeGalleryHash(); loadGallery();
 });
 document.getElementById('gallerySort').addEventListener('change', e => {
   state.gallerySort = e.target.value; state.galleryPage = 1; loadGallery();
+});
+document.getElementById('galleryCameraFilter').addEventListener('change', e => {
+  state.galleryCamera = e.target.value; state.galleryPage = 1; writeGalleryHash(); loadGallery();
+});
+document.getElementById('galleryDateFrom').addEventListener('change', e => {
+  state.galleryDateFrom = e.target.value; state.galleryPage = 1; writeGalleryHash(); loadGallery();
+});
+document.getElementById('galleryDateTo').addEventListener('change', e => {
+  state.galleryDateTo = e.target.value; state.galleryPage = 1; writeGalleryHash(); loadGallery();
+});
+document.getElementById('galleryMinConf').addEventListener('input', e => {
+  const v = parseInt(e.target.value, 10) || 0;
+  document.getElementById('galleryMinConfValue').textContent = v > 0 ? `≥${v}%` : 'Any';
+});
+document.getElementById('galleryMinConf').addEventListener('change', e => {
+  const v = parseInt(e.target.value, 10) || 0;
+  state.galleryMinConf = v > 0 ? String(v) : '';
+  state.galleryPage = 1; writeGalleryHash(); loadGallery();
 });
 
 // ── Videos ────────────────────────────────────────────────────────────────────
@@ -1643,11 +1684,18 @@ async function loadCameras() {
   const cameras = await api('/cameras').catch(() => []);
   const sel = document.getElementById('videoCameraFilter');
   const blankSel = document.getElementById('blankCameraFilter');
+  const gallerySel = document.getElementById('galleryCameraFilter');
   if (!cameras.length) return;
   const opts = '<option value="">All Cameras</option>' +
     cameras.map(c => `<option value="${escHtml(c.camera_name)}">${escHtml(c.camera_name)} (${c.video_count})</option>`).join('');
-  sel.innerHTML = opts;
-  blankSel.innerHTML = opts;
+  if (sel) sel.innerHTML = opts;
+  if (blankSel) blankSel.innerHTML = opts;
+  if (gallerySel) {
+    gallerySel.innerHTML = opts;
+    // Rebuilding the options clears the selection, so re-apply the
+    // camera filter carried in state (e.g. restored from the URL hash).
+    gallerySel.value = state.galleryCamera;
+  }
 }
 
 async function loadBlanks(page = 1) {
