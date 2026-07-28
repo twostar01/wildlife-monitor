@@ -3145,6 +3145,66 @@ async function saveNotificationSettings() {
   }
 }
 
+function validateRunTimeForm() {
+  const input = document.getElementById('setRunTime');
+  const err = document.getElementById('errRunTime');
+  if (!/^([01]\d|2[0-3]):([0-5]\d)$/.test(input.value)) {
+    err.textContent = 'Enter a valid 24-hour time (HH:MM).';
+    err.classList.add('show');
+    return false;
+  }
+  err.textContent = '';
+  err.classList.remove('show');
+  document.getElementById('scheduleApplyError').textContent = '';
+  document.getElementById('scheduleApplyError').classList.remove('show');
+  return true;
+}
+
+async function saveRunTime() {
+  if (!validateRunTimeForm()) return;
+  const btn = document.getElementById('saveScheduleBtn');
+  const fb = document.getElementById('scheduleFeedback');
+  const applyErr = document.getElementById('scheduleApplyError');
+  const originalLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Saving…';
+  try {
+    const res = await fetch('/api/schedule', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ run_time: document.getElementById('setRunTime').value }),
+    });
+    const data = await res.json().catch(() => null);
+    if (res.ok) {
+      fb.textContent = '✓ Schedule saved';
+      fb.classList.add('show');
+      setTimeout(() => fb.classList.remove('show'), 2500);
+      loadNextRun();
+    } else if (res.status === 400) {
+      const detail = (data && data.detail) || 'Enter a valid 24-hour time (HH:MM).';
+      const errEl = document.getElementById('errRunTime');
+      errEl.innerHTML = escHtml(detail);
+      errEl.classList.add('show');
+    } else {
+      // A non-400 rejection means the value was already persisted server-side (D-04) and only
+      // the systemd apply step failed — the input must not be cleared or reverted, since it
+      // still reflects what was actually saved.
+      const detail = (data && data.detail) || 'unknown error';
+      applyErr.innerHTML = `Run time saved, but couldn't apply it to the schedule: ${escHtml(detail)}. ` +
+        `The previous schedule is still active — check sudoers setup and retry.`;
+      applyErr.classList.add('show');
+    }
+  } catch (err) {
+    const detail = (err && err.message) ? err.message : 'network error';
+    applyErr.innerHTML = `Run time saved, but couldn't apply it to the schedule: ${escHtml(detail)}. ` +
+      `The previous schedule is still active — check sudoers setup and retry.`;
+    applyErr.classList.add('show');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+}
+
 async function sendTestEmail() {
   if (!validateNotificationForm()) return;
   const btn = document.getElementById('testEmailBtn');
