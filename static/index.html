@@ -325,6 +325,25 @@
     border: 1px solid rgba(200,168,75,0.25);
   }
 
+  /* ── GALLERY FILTER CHIPS ──────────────────────────────── */
+  .filter-chip-row {
+    display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px;
+  }
+  .filter-chip {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.3px;
+    padding: 3px 8px; border-radius: 3px;
+    color: var(--accent); background: rgba(109,186,92,0.1);
+    border: 1px solid rgba(109,186,92,0.2);
+  }
+  .filter-chip-label {
+    max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .filter-chip-x {
+    flex-shrink: 0; cursor: pointer; color: inherit; opacity: 0.8;
+  }
+  .filter-chip-x:hover { opacity: 1; }
+
   /* ── SPECIES DETAIL MODAL ───────────────────────────── */
   .modal-overlay {
     position: fixed; inset: 0; background: rgba(0,0,0,0.8);
@@ -562,6 +581,7 @@
           </select>
         </div>
       </div>
+      <div id="galleryChipRow" class="filter-chip-row"></div>
       <div class="gallery-grid" id="galleryGrid"></div>
       <div class="pagination" id="galleryPagination"></div>
     </section>
@@ -1570,6 +1590,68 @@ function applyGalleryFiltersToControls() {
   }
 }
 
+// True when at least one of the four gallery filter dimensions is active.
+// Sort order is deliberately not consulted — it is not one of the four
+// filter dimensions the hash and chip row track.
+function anyGalleryFilterActive() {
+  return !!(state.gallerySpecies || state.galleryCamera || state.galleryDateFrom || state.galleryDateTo || state.galleryMinConf);
+}
+
+// Renders one removable chip per active filter dimension. The date range
+// is a single combined chip because it is presented as one filter type.
+// Renders nothing at all — no placeholder — when no filter is active.
+function renderGalleryChips() {
+  const row = document.getElementById('galleryChipRow');
+  if (!row) return;
+  if (!anyGalleryFilterActive()) { row.innerHTML = ''; return; }
+
+  const chip = (label, name) => `
+    <span class="filter-chip">
+      <span class="filter-chip-label" title="${escHtml(label)}">${escHtml(label)}</span>
+      <span class="filter-chip-x" onclick="clearGalleryFilter('${name}')" title="Remove filter">✕</span>
+    </span>`;
+
+  const chips = [];
+  if (state.gallerySpecies) chips.push(chip(`Species: ${state.gallerySpecies}`, 'species'));
+  if (state.galleryCamera) chips.push(chip(`Camera: ${state.galleryCamera}`, 'camera'));
+  if (state.galleryDateFrom || state.galleryDateTo) {
+    const from = state.galleryDateFrom || '…';
+    const to = state.galleryDateTo || '…';
+    chips.push(chip(`Date: ${from} → ${to}`, 'date'));
+  }
+  if (state.galleryMinConf) chips.push(chip(`Confidence: ≥${state.galleryMinConf}%`, 'conf'));
+
+  row.innerHTML = chips.join('');
+}
+
+// Clears a single filter dimension, re-syncs the toolbar controls, rewrites
+// the hash and reloads — the same clear-state-then-reload shape used by
+// clearVideoDateFilter().
+function clearGalleryFilter(name) {
+  if (name === 'species') state.gallerySpecies = '';
+  if (name === 'camera') state.galleryCamera = '';
+  if (name === 'date') { state.galleryDateFrom = ''; state.galleryDateTo = ''; }
+  if (name === 'conf') state.galleryMinConf = '';
+  state.galleryPage = 1;
+  applyGalleryFiltersToControls();
+  writeGalleryHash();
+  loadGallery();
+}
+
+// Clears every active gallery filter at once — the inline "Clear filters"
+// action offered from the filtered-to-zero empty state.
+function clearAllGalleryFilters() {
+  state.gallerySpecies = '';
+  state.galleryCamera = '';
+  state.galleryDateFrom = '';
+  state.galleryDateTo = '';
+  state.galleryMinConf = '';
+  state.galleryPage = 1;
+  applyGalleryFiltersToControls();
+  writeGalleryHash();
+  loadGallery();
+}
+
 async function loadGallery(page) {
   if (page !== undefined) state.galleryPage = page;
   const grid = document.getElementById('galleryGrid');
@@ -1585,12 +1667,32 @@ async function loadGallery(page) {
   p.set('page', state.galleryPage);
   p.set('per_page', 40);
 
-  const data = await api('/gallery?' + p);
+  const reqToken = ++state.galleryReqToken;
+  let data;
+  try {
+    data = await api('/gallery?' + p);
+  } catch (err) {
+    if (reqToken !== state.galleryReqToken) return;
+    grid.innerHTML = `<div class="empty"><span class="empty-icon">⚠</span>Couldn't load gallery — check the connection and try again.
+      <div style="margin-top:10px"><span class="btn-correct" style="cursor:pointer" onclick="loadGallery()">Retry</span></div></div>`;
+    document.getElementById('galleryPagination').innerHTML = '';
+    renderGalleryChips();
+    return;
+  }
+  if (reqToken !== state.galleryReqToken) return;
+
   document.getElementById('galleryCount').textContent = `${data.total} images`;
 
   if (!data.items.length) {
-    grid.innerHTML = '<div class="empty"><span class="empty-icon">📷</span>No images yet.</div>';
+    if (anyGalleryFilterActive()) {
+      grid.innerHTML = `<div class="empty"><span class="empty-icon">📷</span>No detections match these filters.
+        <div style="margin-top:6px;font-size:12px">Try widening the date range or lowering the confidence threshold.</div>
+        <div style="margin-top:10px"><span class="btn-correct" style="cursor:pointer" onclick="clearAllGalleryFilters()">Clear filters</span></div></div>`;
+    } else {
+      grid.innerHTML = '<div class="empty"><span class="empty-icon">📷</span>No images yet.</div>';
+    }
     document.getElementById('galleryPagination').innerHTML = '';
+    renderGalleryChips();
     return;
   }
 
@@ -1634,6 +1736,7 @@ async function loadGallery(page) {
   `}).join('');
 
   renderPagination('galleryPagination', data.page, data.pages, p => loadGallery(p));
+  renderGalleryChips();
 }
 
 document.getElementById('gallerySpeciesFilter').addEventListener('change', e => {
