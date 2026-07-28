@@ -345,11 +345,19 @@ def api_species_detail(label: str):
 @app.get("/api/gallery")
 def api_gallery(
     species: str = Query(None),
+    camera: str = Query(None),
+    date_from: str = Query(None),
+    date_to: str = Query(None),
+    min_confidence: float = Query(None, ge=0.0, le=1.0),
     sort: str = Query("quality"),
     page: int = Query(1, ge=1),
     per_page: int = Query(40, ge=1, le=100),
 ):
-    result = db.get_gallery(species_label=species, sort_by=sort, page=page, per_page=per_page)
+    result = db.get_gallery(
+        species_label=species, camera_name=camera, date_from=date_from,
+        date_to=date_to, min_confidence=min_confidence,
+        sort_by=sort, page=page, per_page=per_page,
+    )
     for item in result["items"]:
         if item.get("crop_path"):
             item["crop_path"] = Path(item["crop_path"]).name
