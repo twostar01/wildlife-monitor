@@ -208,6 +208,7 @@
   .status-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; margin-right: 6px; flex-shrink: 0; }
   .status-dot.green { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
   .status-dot.red   { background: #e05c5c; box-shadow: 0 0 6px #e05c5c; }
+  .status-dot.gold  { background: var(--gold); box-shadow: 0 0 6px var(--gold); }
   .run-log { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 14px; font-family: var(--font-mono); font-size: 11px; color: #a0c878; height: 320px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; margin-top: 14px; line-height: 1.5; }
   .btn-run { background: var(--accent); color: #0a1a07; border: none; padding: 10px 28px; border-radius: 4px; font-weight: 700; cursor: pointer; font-size: 13px; letter-spacing: 0.5px; }
   .btn-run:hover { filter: brightness(1.1); }
@@ -302,6 +303,20 @@
     padding: 2px 8px; border-radius: 3px;
     background: rgba(109,186,92,0.1); color: var(--accent);
     border: 1px solid rgba(109,186,92,0.2);
+  }
+
+  /* ── RUN MONITORING ───────────────────────────────────── */
+  .run-trigger {
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.3px;
+    padding: 2px 8px; border-radius: 3px;
+    color: var(--muted); background: var(--surface); border: 1px solid var(--border);
+  }
+  .camera-offline-chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+  .camera-offline-chip {
+    font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.3px;
+    padding: 2px 8px; border-radius: 3px;
+    color: var(--gold); background: rgba(200,168,75,0.12);
+    border: 1px solid rgba(200,168,75,0.25);
   }
 
   /* ── SPECIES DETAIL MODAL ───────────────────────────── */
@@ -429,6 +444,7 @@
 
     <nav>
       <button class="active" data-tab="dashboard">Dashboard</button>
+      <button data-tab="runs">Runs</button>
       <button data-tab="species">Species</button>
       <button data-tab="gallery">Gallery</button>
       <button data-tab="videos">Videos</button>
@@ -464,6 +480,20 @@
       <div class="card">
         <div class="card-title">Recent Detections</div>
         <div id="recentList" class="sighting-list" style="margin-top:12px"></div>
+      </div>
+    </section>
+
+    <!-- ── RUNS ─────────────────────────────────────────── -->
+    <section class="section" id="tab-runs">
+      <div class="section-header">
+        <div>
+          <div class="section-title">Runs</div>
+        </div>
+      </div>
+      <div class="card">
+        <div id="runsList">
+          <div class="loading"><span class="spinner"></span>Loading…</div>
+        </div>
       </div>
     </section>
 
@@ -881,6 +911,21 @@
     </div>
   </div>
 
+  <!-- RUN DETAIL MODAL -->
+  <div class="modal-overlay" id="runDetailModal">
+    <div class="modal" style="max-width:600px">
+      <div class="modal-header">
+        <div>
+          <div class="modal-title">Run Detail</div>
+        </div>
+        <button class="modal-close" onclick="closeModal('runDetailModal')">✕</button>
+      </div>
+      <div class="modal-body">
+        <div id="runDetailBody"></div>
+      </div>
+    </div>
+  </div>
+
 </div>
 
 <script>
@@ -905,6 +950,7 @@ function switchTab(tab) {
   if (btn) btn.classList.add('active');
   const section = document.getElementById('tab-' + tab);
   if (section) section.classList.add('active');
+  if (tab === 'runs')     loadRuns();
   if (tab === 'blanks')   { loadCameras(); loadBlanks(); }
   if (tab === 'timeline') loadTimeline();
   if (tab === 'settings') { loadSettings(); loadStorageStats(); loadSystemStats(); loadBlacklist(); }
@@ -1133,6 +1179,121 @@ async function loadDashboard() {
       ${v.has_person ? '<span class="badge badge-person">Person</span>' : ''}
     </div>`;
   }).join('') : '<div class="empty"><span class="empty-icon">📷</span>No detections yet. Run the processor to get started.</div>';
+}
+
+// ── Run monitoring ────────────────────────────────────────────────────────────
+function runStatusLabel(status) {
+  if (status === 'success') return 'Success';
+  if (status === 'partial') return 'Partial';
+  if (status === 'failure') return 'Failure';
+  return 'In Progress';
+}
+
+function runStatusDot(status) {
+  const cls = status === 'success' ? 'green' : status === 'partial' ? 'gold' : status === 'failure' ? 'red' : '';
+  return `<span class="status-dot ${cls}"></span>`;
+}
+
+function fmtRunDuration(secs) {
+  if (secs === null || secs === undefined) return 'In progress…';
+  const m = Math.floor(secs / 60), s = Math.floor(secs % 60);
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+function fmtRunTime(iso) {
+  if (!iso) return '—';
+  return new Date(iso).toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function truncateError(text) {
+  if (!text) return '';
+  return text.length <= 60 ? text : text.slice(0, 60) + '…';
+}
+
+function renderOfflineChips(cameras) {
+  if (!cameras || !cameras.length) return '';
+  const chips = cameras.map(c => `<span class="camera-offline-chip">⚠ ${escHtml(c)}: no video (active in prior runs)</span>`).join('');
+  return `<div class="camera-offline-chips">${chips}</div>`;
+}
+
+function renderRunRow(run) {
+  const offlineCount = (run.offline_cameras || []).length;
+  const warningMarker = offlineCount
+    ? `<span title="${escHtml(run.offline_cameras.join(', '))}" style="color:var(--gold)">⚠ offline</span>`
+    : '';
+  const errorNote = run.error_summary
+    ? `<span style="color:#e05c5c">${escHtml(truncateError(run.error_summary))}</span>`
+    : '';
+  const notes = [warningMarker, errorNote].filter(Boolean).join(' · ');
+  return `
+    <tr onclick="openRunDetail(${run.id})" style="cursor:pointer">
+      <td>${fmtRunTime(run.start_time)}</td>
+      <td><span class="run-trigger">${escHtml(run.trigger)}</span></td>
+      <td>${runStatusDot(run.status)}${escHtml(runStatusLabel(run.status))}</td>
+      <td>${fmtRunDuration(run.duration_secs)}</td>
+      <td>${run.videos_processed ?? 0}</td>
+      <td>${run.detections_found ?? 0}</td>
+      <td>${notes}</td>
+    </tr>
+  `;
+}
+
+async function loadRuns() {
+  const el = document.getElementById('runsList');
+  el.innerHTML = '<div class="loading"><span class="spinner"></span>Loading…</div>';
+  try {
+    const data = await api('/runs?limit=30');
+    const runs = data.runs || [];
+    if (!runs.length) {
+      el.innerHTML = `
+        <div class="empty">
+          <span class="empty-icon">🗒</span>
+          <div style="font-family:var(--font-serif);font-size:16px;color:var(--text);margin-bottom:6px">No runs yet</div>
+          <div>Run history will appear here after the first scheduled or manual pipeline run completes. Trigger one now from Settings → Manual Run.</div>
+        </div>`;
+      return;
+    }
+    el.innerHTML = `
+      <table class="update-table">
+        <thead>
+          <tr><th>Started</th><th>Trigger</th><th>Status</th><th>Duration</th><th>Videos</th><th>Detections</th><th>Notes</th></tr>
+        </thead>
+        <tbody>${runs.map(renderRunRow).join('')}</tbody>
+      </table>`;
+  } catch (e) {
+    el.innerHTML = "<div class=\"empty\">Couldn't load run history. Check the server connection and refresh the page.</div>";
+  }
+}
+
+async function openRunDetail(runId) {
+  const body = document.getElementById('runDetailBody');
+  body.innerHTML = '<div class="loading"><span class="spinner"></span>Loading…</div>';
+  document.getElementById('runDetailModal').classList.add('open');
+  try {
+    const run = await api('/runs/' + runId);
+    const cameraRows = Object.entries(run.cameras || {}).map(([name, c]) => `
+      <div class="nas-row">
+        <div class="nas-key">${escHtml(name)}</div>
+        <div class="nas-val">${(c && c.videos) || 0} videos · ${(c && c.detections) || 0} detections</div>
+      </div>`).join('');
+    const errorRow = run.error_summary
+      ? `<div class="nas-row"><div class="nas-key">Error</div><div class="nas-val" style="text-align:left;word-break:break-word;color:#e05c5c">${escHtml(run.error_summary)}</div></div>`
+      : '';
+    body.innerHTML = `
+      <div class="nas-row"><div class="nas-key">Trigger</div><div class="nas-val">${escHtml(run.trigger)}</div></div>
+      <div class="nas-row"><div class="nas-key">Status</div><div class="nas-val">${runStatusDot(run.status)}${escHtml(runStatusLabel(run.status))}</div></div>
+      <div class="nas-row"><div class="nas-key">Started</div><div class="nas-val">${fmtRunTime(run.start_time)}</div></div>
+      <div class="nas-row"><div class="nas-key">Ended</div><div class="nas-val">${run.end_time ? fmtRunTime(run.end_time) : 'In progress…'}</div></div>
+      <div class="nas-row"><div class="nas-key">Duration</div><div class="nas-val">${fmtRunDuration(run.duration_secs)}</div></div>
+      <div class="nas-row"><div class="nas-key">Videos processed</div><div class="nas-val">${run.videos_processed ?? 0}</div></div>
+      <div class="nas-row"><div class="nas-key">Detections found</div><div class="nas-val">${run.detections_found ?? 0}</div></div>
+      ${errorRow}
+      ${cameraRows ? `<div class="card-title" style="margin-top:16px">Cameras</div>${cameraRows}` : ''}
+      ${renderOfflineChips(run.offline_cameras)}
+    `;
+  } catch (e) {
+    body.innerHTML = "<div class=\"empty\">Couldn't load this run's details.</div>";
+  }
 }
 
 // ── Species ───────────────────────────────────────────────────────────────────
