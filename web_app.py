@@ -833,6 +833,34 @@ def api_save_settings(body: ProcessingSettings):
     return {"ok": True}
 
 
+class TestEmailRequest(BaseModel):
+    smtp_server:    str           = ""
+    smtp_port:      Optional[int] = None
+    smtp_username:  str           = ""
+    smtp_password:  str           = ""
+    smtp_recipient: str           = ""
+
+
+@app.post("/api/notifications/test")
+def api_test_email(body: TestEmailRequest):
+    # Merge first (D-13 + D-15): the operator tests whatever is currently typed
+    # in the form, but a blank password field (which is how the form always
+    # loads, per D-15) falls back to the stored password rather than
+    # guaranteeing an authentication failure.
+    cfg = merge_preserved_password(body.dict(), _load_settings())
+    error = validate_smtp_config(cfg)
+    if error:
+        return {"ok": False, "error": error}
+    ok, error = send_notification_email(
+        cfg,
+        "Wildlife Monitor — Test Email",
+        "This is a test message sent from the Wildlife Monitor dashboard to confirm your notification settings.",
+    )
+    if not ok:
+        return {"ok": False, "error": error}
+    return {"ok": True, "recipient": cfg.get("smtp_recipient", "")}
+
+
 class RunRequest(BaseModel):
     date_from: Optional[str] = None   # YYYY-MM-DD — if set, overrides --hours
     date_to:   Optional[str] = None   # YYYY-MM-DD
@@ -866,6 +894,7 @@ def api_trigger_run(body: RunRequest = RunRequest()):
             str(sync_script),
             "--then-process",
             "--data-dir", DATA_DIR,
+            "--trigger", "manual",
         ]
         if body.date_from:
             cmd += ["--date-from", body.date_from]
