@@ -182,3 +182,43 @@ def format_run_alert(kind: str, run: dict) -> tuple:
     # The body is passed to set_content() by the caller, so newlines are fine here.
     body = "\n".join(lines)
     return subject, body
+
+
+def redact_smtp_password(settings: dict) -> dict:
+    """
+    Return a shallow copy of `settings` with `smtp_password` forced to the empty
+    string and an added boolean `smtp_password_set` flag reporting whether the
+    original value was a non-empty string. Never mutates its argument.
+
+    D-15 read half: GET /api/settings sends this redacted copy so the browser can
+    render a blank password input with a "(unchanged)" affordance without ever
+    receiving the stored secret. D-10 accepts plaintext storage in settings.json
+    given the project's local-LAN, no-authentication posture (CLAUDE.md) — this
+    helper exists for transport hygiene, not to re-litigate storage encryption.
+    """
+    copy = dict(settings)
+    password_set = bool(copy.get("smtp_password"))
+    copy["smtp_password"] = ""
+    copy["smtp_password_set"] = password_set
+    return copy
+
+
+def merge_preserved_password(incoming: dict, stored: dict) -> dict:
+    """
+    Return a shallow copy of `incoming` with the display-only `smtp_password_set`
+    key discarded, and with `smtp_password` carried over from `stored` when the
+    incoming value is missing, None, or blank after stripping. A non-blank
+    incoming password always wins, so saving with the field left blank leaves the
+    stored password exactly as it was — there is deliberately no code path in
+    which a blank submission clears a previously saved password.
+
+    D-15 write half. D-10 accepts plaintext storage in settings.json given the
+    project's local-LAN, no-authentication posture (CLAUDE.md) — this helper
+    exists for round-trip hygiene, not to re-litigate storage encryption.
+    """
+    copy = dict(incoming)
+    copy.pop("smtp_password_set", None)
+    incoming_password = copy.get("smtp_password")
+    if incoming_password is None or not str(incoming_password).strip():
+        copy["smtp_password"] = stored.get("smtp_password", "")
+    return copy
