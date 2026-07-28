@@ -554,6 +554,10 @@ def parse_args():
     p.add_argument("--skip-speciesnet",    action="store_true")
     p.add_argument("--cpu",                action="store_true")
     p.add_argument("--dry-run",            action="store_true")
+    p.add_argument("--trigger",            choices=["manual", "scheduled"], default="scheduled",
+                   help="Tags the run row so the dashboard can distinguish a manual "
+                        "dashboard-triggered run from the nightly systemd run. The "
+                        "systemd unit passes no --trigger and inherits this default.")
     return p.parse_args()
 
 if __name__ == "__main__":

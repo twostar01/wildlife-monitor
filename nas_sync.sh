@@ -46,6 +46,7 @@ DRY_RUN=false
 COUNTRY=""
 DATE_FROM=""
 DATE_TO=""
+TRIGGER="scheduled"
 EXTRA_PROCESSOR_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -57,6 +58,11 @@ while [[ $# -gt 0 ]]; do
         --no-cleanup)     NO_CLEANUP=true; shift ;;
         --dry-run)        DRY_RUN=true; EXTRA_PROCESSOR_ARGS+=("--dry-run"); shift ;;
         --country)        COUNTRY="$2"; EXTRA_PROCESSOR_ARGS+=("--country" "$2"); shift 2 ;;
+        # Forwarded to both wildlife_processor.py invocations below via
+        # EXTRA_PROCESSOR_ARGS. The --reprocess-flagged pass also receives it,
+        # which is harmless: that branch exits before process_videos() runs, so
+        # it records no run row regardless of --trigger (02-RESEARCH.md Pitfall 5).
+        --trigger)        TRIGGER="$2"; EXTRA_PROCESSOR_ARGS+=("--trigger" "$2"); shift 2 ;;
         --skip-speciesnet) EXTRA_PROCESSOR_ARGS+=("--skip-speciesnet"); shift ;;
         --sample-rate)    EXTRA_PROCESSOR_ARGS+=("--sample-rate" "$2"); shift 2 ;;
         --admin1-region)  EXTRA_PROCESSOR_ARGS+=("--admin1-region" "$2"); shift 2 ;;
