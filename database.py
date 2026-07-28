@@ -1163,6 +1163,110 @@ def get_gallery(
         }
 
 
+def _run_row_to_dict(row) -> dict:
+    """
+    Convert one sqlite3.Row from the runs table into the dict shape every reader
+    consumes: the raw columns plus three derived keys (duration_secs, cameras,
+    offline_cameras). A malformed historical cameras_json/offline_cameras_json
+    value never raises here — it just falls back to an empty container so one
+    bad row can't break a whole page of run history.
+    """
+    d = dict(row)
+
+    try:
+        if d.get("end_time"):
+            start = datetime.fromisoformat(d["start_time"])
+            end = datetime.fromisoformat(d["end_time"])
+            d["duration_secs"] = (end - start).total_seconds()
+        else:
+            d["duration_secs"] = None
+    except (TypeError, ValueError):
+        d["duration_secs"] = None
+
+    try:
+        d["cameras"] = json.loads(d["cameras_json"]) if d.get("cameras_json") else {}
+    except (TypeError, ValueError):
+        d["cameras"] = {}
+
+    try:
+        d["offline_cameras"] = json.loads(d["offline_cameras_json"]) if d.get("offline_cameras_json") else []
+    except (TypeError, ValueError):
+        d["offline_cameras"] = []
+
+    return d
+
+
+def get_recent_runs(limit: int = 30) -> list:
+    """Return the most recent runs, newest start_time first. limit is clamped to 1..100."""
+    limit = max(1, min(int(limit), 100))
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT * FROM runs ORDER BY start_time DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [_run_row_to_dict(r) for r in rows]
+
+
+def get_last_run() -> Optional[dict]:
+    """Return the most recently started run, or None if no run has ever been recorded."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT * FROM runs ORDER BY start_time DESC LIMIT 1"
+        ).fetchone()
+        return _run_row_to_dict(row) if row else None
+
+
+def get_run_by_id(run_id: int) -> Optional[dict]:
+    """Return the full run dict (including untruncated error_summary), or None if unknown."""
+    with get_conn() as conn:
+        row = conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        return _run_row_to_dict(row) if row else None
+
+
+def get_camera_offline_flags(current_cameras: dict, lookback: int = 5) -> list:
+    """
+    Compare this run's camera set against the last `lookback` completed runs.
+    Returns camera names present in that recent history but absent (zero videos)
+    this run — a possible-offline-camera signal (D-04).
+
+    `lookback` (default 5 completed runs) is the tunable knob for the tradeoff
+    between false positives (too small a window flags a camera after a single
+    quiet night) and detection delay (too large a window takes longer to notice
+    a genuinely offline camera) — see 02-RESEARCH.md assumption A5.
+
+    current_cameras may be either the {"name": {"videos": n, ...}} snapshot shape
+    or a bare {"name": n} shape; both are accepted.
+
+    A run that synced zero videos across every camera is a quiet night, not a
+    fleet of offline cameras (D-08 quiet-night semantics) — this returns []
+    immediately without querying in that case.
+    """
+    def _video_count(v):
+        if isinstance(v, dict):
+            return v.get("videos", 0) or 0
+        return v or 0
+
+    current = {name for name, v in current_cameras.items() if _video_count(v) > 0}
+    if not current:
+        return []
+
+    with get_conn() as conn:
+        rows = conn.execute(
+            """SELECT cameras_json FROM runs
+               WHERE status IS NOT NULL AND cameras_json IS NOT NULL
+               ORDER BY start_time DESC LIMIT ?""",
+            (lookback,),
+        ).fetchall()
+
+    recent_cameras: set = set()
+    for row in rows:
+        try:
+            recent_cameras |= set(json.loads(row["cameras_json"]).keys())
+        except (TypeError, ValueError):
+            continue
+
+    return sorted(recent_cameras - current)
+
+
 def get_cameras() -> list:
     """Return all distinct camera names that have kept videos, sorted alphabetically."""
     with get_conn() as conn:
