@@ -21,6 +21,7 @@ from database import (
     link_lens_pair, parse_dual_lens_filename,
     record_run_start, record_run_end, get_camera_offline_flags, get_run_by_id,
 )
+from notifications import decide_run_alert, format_run_alert, send_notification_email
 from image_quality import score_image
 
 log = logging.getLogger("wildlife_processor")
@@ -343,6 +344,61 @@ def parse_label(label):
     if m:
         return m.group(1), m.group(2)
     return "", label
+
+def _load_notification_settings(data_dir) -> dict:
+    """
+    Read the six notification-related keys from settings.json in data_dir.
+
+    Mirrors the notification subset of web_app.py's DEFAULT_PROCESSING_SETTINGS
+    without importing web_app (02-RESEARCH.md anti-patterns) — the batch CLI has
+    no business pulling in FastAPI/uvicorn just to read a JSON file. Any failure
+    mode (missing file, unreadable file, malformed JSON, or a top-level value
+    that isn't a dict) falls back to these defaults rather than raising.
+    """
+    defaults = {
+        "smtp_server": "",
+        "smtp_port": None,
+        "smtp_username": "",
+        "smtp_password": "",
+        "smtp_recipient": "",
+        "alert_on_zero_detections": False,
+    }
+    try:
+        settings_path = os.path.join(data_dir, "settings.json")
+        with open(settings_path) as f:
+            parsed = _json.load(f)
+        if not isinstance(parsed, dict):
+            return dict(defaults)
+        return {**defaults, **{k: parsed[k] for k in defaults if k in parsed}}
+    except (OSError, ValueError, TypeError):
+        return dict(defaults)
+
+
+def _maybe_send_alerts(run, data_dir) -> None:
+    """
+    Fire the NOTIFY-01/NOTIFY-02 alert email for one closed run, if warranted.
+
+    NOTIFY-05 / D-12: this is wrapped in its own try/except in addition to
+    send_notification_email()'s internal guard, so a settings-parsing bug or a
+    formatter bug can never escape into the pipeline's control flow or change
+    the run's recorded status. All alert-firing policy lives in decide_run_alert
+    — this function does not duplicate the status check or the toggle check.
+    """
+    try:
+        settings = _load_notification_settings(data_dir)
+        kind = decide_run_alert(run, settings)
+        if not kind:
+            return
+        subject, body = format_run_alert(kind, run)
+        success, error = send_notification_email(settings, subject, body)
+        recipient = settings.get("smtp_recipient", "")
+        if success:
+            log.info(f"Alert email sent ({kind}) to {recipient}")
+        else:
+            log.error(f"Alert email failed ({kind}) to {recipient}: {error}")
+    except Exception as e:
+        log.error(f"Alert dispatch failed: {e}")
+
 
 def _finish_run(run_id, status, videos_processed, detections_found, error_summary,
                  cameras_seen, offline_cameras, data_dir):
