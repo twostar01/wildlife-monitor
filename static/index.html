@@ -824,6 +824,26 @@
         <div id="purgePreview" style="display:none;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)"></div>
       </div>
 
+      <!-- Schedule -->
+      <div class="card" style="margin-top:20px">
+        <div class="card-title">Schedule</div>
+        <p style="font-size:13px;color:var(--muted);margin:10px 0 16px;line-height:1.6">
+          The time of day the nightly pipeline runs. Changing this rewrites a systemd timer override and
+          restarts the timer, which requires the one-time setup documented in the README — a save made
+          before that setup is completed will still store the value here but will not take effect.
+        </p>
+        <div class="setting-row">
+          <label class="setting-label">Daily run time</label>
+          <input class="setting-input" type="time" id="setRunTime" style="width:120px">
+          <div class="setting-error" id="errRunTime"></div>
+        </div>
+        <div class="setting-error" id="scheduleApplyError" style="margin-top:8px"></div>
+        <div style="margin-top:18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+          <button class="btn-save" id="saveScheduleBtn" onclick="saveRunTime()">Save Run Time</button>
+          <span class="save-feedback" id="scheduleFeedback"></span>
+        </div>
+      </div>
+
       <!-- Notifications -->
       <div class="card" style="margin-top:20px">
         <div class="card-title">Notifications</div>
@@ -2940,6 +2960,12 @@ async function loadSettings() {
   document.getElementById('setKeptDays').value         = p.kept_retention_days  ?? 730;
   document.getElementById('setKeptGb').value           = p.kept_retention_gb    ?? 500;
 
+  document.getElementById('setRunTime').value          = p.run_time_hhmm ?? '06:00';
+  document.getElementById('errRunTime').textContent          = '';
+  document.getElementById('errRunTime').classList.remove('show');
+  document.getElementById('scheduleApplyError').textContent  = '';
+  document.getElementById('scheduleApplyError').classList.remove('show');
+
   document.getElementById('setSmtpServer').value       = p.smtp_server    ?? '';
   document.getElementById('setSmtpPort').value         = p.smtp_port      ?? '';
   document.getElementById('setSmtpUsername').value     = p.smtp_username  ?? '';
@@ -2997,6 +3023,12 @@ function collectSettingsPayload() {
   const portParsed = parseInt(portRaw, 10);
   const smtp_port = portRaw === '' ? null : (Number.isNaN(portParsed) ? null : portParsed);
   return {
+    // run_time_hhmm must be carried here even though this payload targets the general
+    // settings endpoint, not the schedule endpoint: that endpoint replaces the whole
+    // stored settings object, so a key missing from this body is refilled with its
+    // server-side default — omitting this line would silently reset the operator's
+    // saved schedule back to 06:00 on every unrelated settings save.
+    run_time_hhmm:        document.getElementById('setRunTime').value.trim() || '06:00',
     hours:                parseInt(document.getElementById('setHours').value)      || 24,
     sample_rate:          parseInt(document.getElementById('setSampleRate').value)  || 30,
     md_threshold:         parseFloat(document.getElementById('setThreshold').value) || 0.2,
