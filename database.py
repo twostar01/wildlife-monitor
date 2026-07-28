@@ -1116,6 +1116,10 @@ def get_species_detail(label: str) -> dict:
 
 def get_gallery(
     species_label: Optional[str] = None,
+    camera_name: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    min_confidence: Optional[float] = None,
     sort_by: str = "quality",
     page: int = 1,
     per_page: int = 40,
@@ -1128,12 +1132,29 @@ def get_gallery(
     if species_label:
         conditions.append("s.label = ?")
         params.append(species_label)
+    if camera_name:
+        conditions.append("v.camera_name = ?")
+        params.append(camera_name)
+    if date_from:
+        conditions.append("DATE(v.recorded_at) >= ?")
+        params.append(date_from)
+    if date_to:
+        conditions.append("DATE(v.recorded_at) <= ?")
+        params.append(date_to)
+    # min_confidence uses an explicit `is not None` guard (not truthiness) because
+    # 0.0 is a meaningful threshold. `s.confidence >= ?` is false for a NULL
+    # confidence, so min_confidence=0.0 excludes never-scored rows while
+    # min_confidence=None (the "no filter" case) includes them.
+    if min_confidence is not None:
+        conditions.append("s.confidence >= ?")
+        params.append(min_confidence)
     where = "WHERE " + " AND ".join(conditions)
 
     with get_conn() as conn:
         total = conn.execute(
             f"SELECT COUNT(*) FROM crops c JOIN detections d ON c.detection_id=d.id "
-            f"JOIN species s ON s.detection_id=d.id {where}", params
+            f"JOIN species s ON s.detection_id=d.id "
+            f"JOIN videos v ON d.video_id = v.id {where}", params
         ).fetchone()[0]
 
         rows = conn.execute(f"""
@@ -1143,6 +1164,8 @@ def get_gallery(
                    {DISPLAY_SCIENTIFIC} AS scientific_name,
                    s.common_name        AS ai_common_name,
                    s.detection_id,
+                   s.top_candidates_json,
+                   s.confidence          AS species_confidence,
                    CASE WHEN s.corrected_at IS NOT NULL THEN 1 ELSE 0 END AS has_correction,
                    v.id as video_id, v.filename, v.recorded_at
             FROM crops c
@@ -1150,7 +1173,7 @@ def get_gallery(
             JOIN species s ON s.detection_id = d.id
             JOIN videos v ON d.video_id = v.id
             {where}
-            ORDER BY {order}
+            ORDER BY {order}, c.id DESC
             LIMIT ? OFFSET ?
         """, params + [per_page, offset]).fetchall()
 
