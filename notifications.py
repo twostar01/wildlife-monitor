@@ -105,3 +105,80 @@ def send_notification_email(smtp_config: dict, subject: str, body: str) -> tuple
         # password cannot leak into the run log (T-02-06).
         log.error("SMTP send failed: %s", e)
         return False, str(e)
+
+
+def decide_run_alert(run: dict, settings: dict) -> Optional[str]:
+    """
+    Pure function over the run dict shape produced by database.py::_run_row_to_dict
+    and the merged settings dict.
+
+    Ordering is load-bearing: at most one alert kind is produced per run, so an
+    errored run that also happened to find nothing never also generates a
+    zero-detection email.
+    """
+    status = run.get("status")
+    if status in ("failure", "partial"):
+        # D-14: a degraded (partial) run is alert-worthy, not just a total failure.
+        return "error"
+
+    # D-09: .get() with no default means an absent toggle key behaves as off.
+    # D-08's quiet-night guard: videos_processed > 0 excludes runs where nothing
+    # new synced — that's mundane, not a broken camera.
+    if (
+        settings.get("alert_on_zero_detections")
+        and status == "success"
+        and int(run.get("videos_processed") or 0) > 0
+        and int(run.get("detections_found") or 0) == 0
+    ):
+        return "zero_detections"
+
+    return None
+
+
+def format_run_alert(kind: str, run: dict) -> tuple:
+    """
+    Build (subject, body) for a run alert. Free of I/O — no file reads, no network,
+    no database access — so this stays directly unit-testable.
+    """
+    trigger = run.get("trigger", "")
+    status = run.get("status", "")
+    if kind == "error":
+        subject = f"Wildlife Monitor — run {str(status).upper()} ({trigger})"
+    else:
+        subject = f"Wildlife Monitor — no detections ({trigger})"
+    # Pass the whole assembled subject through _header_safe so a malformed trigger
+    # or status value can never inject a header break.
+    subject = _header_safe(subject)
+
+    end_time = run.get("end_time") or "still in progress"
+    duration = run.get("duration_secs")
+    duration_str = f"{duration}s" if duration is not None else "-"
+
+    lines = [
+        f"Run ID: {run.get('id')}",
+        f"Trigger: {trigger}",
+        f"Status: {status}",
+        f"Started: {run.get('start_time')}",
+        f"Ended: {end_time}",
+        f"Duration: {duration_str}",
+        f"Videos processed: {run.get('videos_processed')}",
+        f"Detections found: {run.get('detections_found')}",
+        "",
+        "Cameras:",
+    ]
+    cameras = run.get("cameras") or {}
+    for name in sorted(cameras.keys()):
+        info = cameras.get(name) or {}
+        lines.append(f"  {name}: {info.get('videos', 0)} videos, {info.get('detections', 0)} detections")
+
+    offline = run.get("offline_cameras") or []
+    lines.append(f"Offline cameras: {', '.join(offline) if offline else 'none'}")
+
+    error_summary = run.get("error_summary")
+    if error_summary:
+        lines.append("")
+        lines.append(f"Error: {error_summary}")
+
+    # The body is passed to set_content() by the caller, so newlines are fine here.
+    body = "\n".join(lines)
+    return subject, body
