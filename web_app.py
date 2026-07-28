@@ -588,6 +588,29 @@ def api_search(q: str = Query(..., min_length=1)):
     return result
 
 
+# ── Run history ────────────────────────────────────────────────────────────────
+
+@app.get("/api/runs")
+def api_runs(limit: int = Query(30, ge=1, le=100)):
+    return {"runs": db.get_recent_runs(limit=limit)}
+
+
+@app.get("/api/runs/last")
+def api_last_run():
+    return db.get_last_run() or {}
+
+
+# Must stay declared after /api/runs/last — FastAPI resolves routes in
+# declaration order, so a parameterised {run_id} route declared first would
+# capture the literal "last" path segment and fail int coercion on it.
+@app.get("/api/runs/{run_id}")
+def api_run_detail(run_id: int):
+    run = db.get_run_by_id(run_id)
+    if not run:
+        raise HTTPException(404, "Run not found")
+    return run
+
+
 # ── Settings & run endpoints ───────────────────────────────────────────────────
 
 @app.get("/api/updates")
