@@ -16,8 +16,14 @@ from typing import Optional
 
 import cv2
 
-from database import init_db, insert_video, insert_detection, insert_species, insert_crop, link_lens_pair, parse_dual_lens_filename
+from database import (
+    init_db, insert_video, insert_detection, insert_species, insert_crop,
+    link_lens_pair, parse_dual_lens_filename,
+    record_run_start, record_run_end, get_camera_offline_flags, get_run_by_id,
+)
 from image_quality import score_image
+
+log = logging.getLogger("wildlife_processor")
 
 MD_ANIMAL, MD_PERSON = "1", "2"
 
@@ -338,6 +344,39 @@ def parse_label(label):
         return m.group(1), m.group(2)
     return "", label
 
+def _finish_run(run_id, status, videos_processed, detections_found, error_summary,
+                 cameras_seen, offline_cameras, data_dir):
+    """
+    Close the run row opened by record_run_start() and dispatch alerts.
+
+    This is the single choke point every process_videos() exit path calls
+    through (zero-videos, normal completion, fatal error), so a run row can
+    only ever be closed once per invocation (MONITOR-01, D-05). The
+    get_run_by_id()-plus-alert portion is wrapped in its own try/except so
+    nothing after record_run_end() can undo the recording that already
+    happened.
+    """
+    cameras_json = _json.dumps(cameras_seen)
+    offline_json = _json.dumps(offline_cameras)
+    record_run_end(run_id, status, videos_processed, detections_found, error_summary,
+                    cameras_json, offline_json)
+    try:
+        run = get_run_by_id(run_id)
+        if not run:
+            run = {
+                "id": run_id,
+                "status": status,
+                "videos_processed": videos_processed,
+                "detections_found": detections_found,
+                "error_summary": error_summary,
+                "cameras": cameras_seen,
+                "offline_cameras": offline_cameras,
+            }
+        _maybe_send_alerts(run, data_dir)
+    except Exception as e:
+        log.error(f"Alert dispatch failed after run {run_id}: {e}")
+
+
 def process_videos(args):
     Path(args.data_dir).mkdir(parents=True, exist_ok=True)
     for sub in ("crops", "thumbnails"):
@@ -350,174 +389,221 @@ def process_videos(args):
     init_db(db_path)
     log.info(f"DB: {db_path}")
 
-    videos = find_videos(
-        args.video_dir,
-        hours=args.hours,
-        date_from=args.date_from,
-        date_to=args.date_to,
-        filename_date_format=args.filename_date_format,
-    )
-    if not videos:
-        log.info("No videos found."); return
+    run_id = record_run_start(getattr(args, "trigger", "scheduled") or "scheduled")
+    # Attribution invariant (02-RESEARCH.md Pitfall 3): the per-camera tally below
+    # assumes nas_sync.sh deletes local staging copies after each run, so a video
+    # is never re-scanned by a later run. A manual --no-cleanup run breaks that
+    # invariant — the same local file can be rescanned and re-attributed to
+    # whichever run touched it last.
+    video_errors = 0
+    videos_done = 0
+    run_detections = 0
+    cameras_seen = {}
+    run_closed = False
 
-    # Load blacklist from DB once before processing loop
     try:
-        from database import get_blacklist
-        blacklisted_labels = {e["label"] for e in get_blacklist()}
-    except Exception:
-        blacklisted_labels = set()
-    if blacklisted_labels:
-        log.info(f"Blacklist loaded: {len(blacklisted_labels)} species suppressed")
-    if blacklisted_labels:
-        log.info(f"Blacklist loaded: {len(blacklisted_labels)} species suppressed")
+        videos = find_videos(
+            args.video_dir,
+            hours=args.hours,
+            date_from=args.date_from,
+            date_to=args.date_to,
+            filename_date_format=args.filename_date_format,
+        )
+        if not videos:
+            log.info("No videos found.")
+            # A quiet night is a successful run with zero counts and no offline
+            # flags — get_camera_offline_flags() is deliberately not consulted
+            # here, since a zero-video run must never flag the whole fleet (D-08).
+            _finish_run(run_id, "success", 0, 0, None, {}, [], args.data_dir)
+            run_closed = True
+            return
 
-    total = len(videos)
-    log.info(f"Found {total} video(s)")
-    log.info("Loading MegaDetector...")
-    detector = load_megadetector(args.megadetector_model, force_cpu=args.cpu)
-    log.info("MegaDetector ready")
+        # Load blacklist from DB once before processing loop
+        try:
+            from database import get_blacklist
+            blacklisted_labels = {e["label"] for e in get_blacklist()}
+        except Exception:
+            blacklisted_labels = set()
+        if blacklisted_labels:
+            log.info(f"Blacklist loaded: {len(blacklisted_labels)} species suppressed")
 
-    crops_dir = os.path.join(args.data_dir, "crops")
-    thumb_dir = os.path.join(args.data_dir, "thumbnails")
+        total = len(videos)
+        log.info(f"Found {total} video(s)")
+        log.info("Loading MegaDetector...")
+        detector = load_megadetector(args.megadetector_model, force_cpu=args.cpu)
+        log.info("MegaDetector ready")
 
-    for i, video_path in enumerate(videos, 1):
-        log.info(f"[{i}/{total}] → {video_path.name}")
-        file_size   = video_path.stat().st_size / 1_048_576
-        # Prefer filename-embedded date over mtime — mtime can be wrong after copy/move
-        video_date  = _video_date(video_path, args.filename_date_format or 'auto')
-        recorded_at = video_date.isoformat()
-        duration    = get_video_duration(video_path)
-        camera_name = extract_camera_name(video_path, args.video_dir)
-        if camera_name:
-            log.info(f"  Camera: {camera_name}")
-        thumb       = extract_thumbnail(video_path, thumb_dir, camera_name)
-        has_animal = has_person = False
+        crops_dir = os.path.join(args.data_dir, "crops")
+        thumb_dir = os.path.join(args.data_dir, "thumbnails")
 
-        with tempfile.TemporaryDirectory() as tmp:
-            frame_data = extract_frames(video_path, args.sample_rate, tmp)
-            if not frame_data:
-                log.warning("  No frames extracted — skipping")
-                lens_parsed_nf = parse_dual_lens_filename(video_path.name)
-                insert_video(video_path.name, str(video_path), camera_name, file_size, duration,
-                             recorded_at, False, False, False, thumb, 0,
-                             lens_index=lens_parsed_nf[1] if lens_parsed_nf else None)
-                continue
+        for i, video_path in enumerate(videos, 1):
+            video_detections = 0
+            video_failed = False
+            camera_name = None
+            try:
+                log.info(f"[{i}/{total}] → {video_path.name}")
+                file_size   = video_path.stat().st_size / 1_048_576
+                # Prefer filename-embedded date over mtime — mtime can be wrong after copy/move
+                video_date  = _video_date(video_path, args.filename_date_format or 'auto')
+                recorded_at = video_date.isoformat()
+                duration    = get_video_duration(video_path)
+                camera_name = extract_camera_name(video_path, args.video_dir)
+                if camera_name:
+                    log.info(f"  Camera: {camera_name}")
+                thumb       = extract_thumbnail(video_path, thumb_dir, camera_name)
+                has_animal = has_person = False
 
-            log.info(f"  {len(frame_data)} frames")
-            md_results = run_megadetector(detector, frame_data, threshold=args.md_threshold)
-
-            for fp, fn, ts in frame_data:
-                for det in md_results.get(fp, {}).get("detections", []):
-                    if _det_conf(det) < args.md_threshold:
+                with tempfile.TemporaryDirectory() as tmp:
+                    frame_data = extract_frames(video_path, args.sample_rate, tmp)
+                    if not frame_data:
+                        log.warning("  No frames extracted — skipping")
+                        lens_parsed_nf = parse_dual_lens_filename(video_path.name)
+                        insert_video(video_path.name, str(video_path), camera_name, file_size, duration,
+                                     recorded_at, False, False, False, thumb, 0,
+                                     lens_index=lens_parsed_nf[1] if lens_parsed_nf else None)
                         continue
-                    if det["category"] == MD_ANIMAL:
-                        has_animal = True
-                    elif det["category"] == MD_PERSON:
-                        has_person = True
 
-            kept = has_animal or has_person
-            log.info(f"  animal={has_animal} person={has_person} → {'KEEP' if kept else 'DELETE'}")
+                    log.info(f"  {len(frame_data)} frames")
+                    md_results = run_megadetector(detector, frame_data, threshold=args.md_threshold)
 
-            # Parse dual-lens info from filename
-            lens_parsed = parse_dual_lens_filename(video_path.name)
-            lens_index  = lens_parsed[1] if lens_parsed else None
-
-            vid_id = insert_video(video_path.name, str(video_path), camera_name, file_size, duration,
-                                  recorded_at, has_animal, has_person, kept, thumb, len(frame_data),
-                                  lens_index=lens_index)
-            # Link to paired lens if this is a dual-lens camera
-            link_lens_pair(vid_id, video_path.name)
-
-            # Person detections
-            for fp, fn, ts in frame_data:
-                for det in md_results.get(fp, {}).get("detections", []):
-                    if det["category"] == MD_PERSON and _det_conf(det) >= args.md_threshold:
-                        insert_detection(vid_id, fn, ts, "person", _det_conf(det), det["bbox"])
-
-            if has_animal:
-                saved = save_crops(frame_data, md_results, crops_dir, video_path.stem, args.md_threshold)
-                log.info(f"  {len(saved)} crops saved")
-
-                if not args.skip_speciesnet and saved:
-                    log.info("  Running SpeciesNet...")
-                    preds = run_speciesnet(
-                        [c["crop_path"] for c in saved],
-                        country=args.country,
-                        admin1_region=args.admin1_region,
-                    )
-                    if len(preds) != len(saved):
-                        log.warning(f"  SpeciesNet returned {len(preds)} predictions for {len(saved)} crops — pairing by index")
-
-                    # ── Deduplicate species per video ─────────────────────────────
-                    # Many crops may show the same animal. Rather than storing every
-                    # crop's prediction independently (which inflates counts and causes
-                    # multi-species noise), we:
-                    #   1. Apply the confidence threshold — below 0.7 → Unknown species
-                    #   2. Group crops by their top species label
-                    #   3. Keep only the highest-quality crop per species per video
-                    # This gives one clean representative detection per species per video.
-
-                    SPECIES_CONFIDENCE_THRESHOLD = args.species_threshold
-                    best_per_species = {}  # label → (crop, pred, score, quality)
-
-                    for crop, pred in zip(saved, preds):
-                        classes = pred.get("classifications", {}).get("classes", [])
-                        scores  = pred.get("classifications", {}).get("scores", [])
-
-                        # Build top-5 candidates (post geo-filter, pre blacklist)
-                        top5 = []
-                        for lbl, sc in zip(classes[:5], scores[:5]):
-                            sci_c, com_c = parse_label(lbl)
-                            top5.append({"label": lbl, "common_name": com_c,
-                                         "scientific_name": sci_c, "score": round(sc, 4)})
-                        top5_json = _json.dumps(top5) if top5 else None
-
-                        # Walk candidates — skip blacklisted, take first above threshold
-                        label = "Unknown species"
-                        score = scores[0] if scores else 0.0
-                        for lbl, sc in zip(classes, scores):
-                            if lbl in blacklisted_labels:
+                    for fp, fn, ts in frame_data:
+                        for det in md_results.get(fp, {}).get("detections", []):
+                            if _det_conf(det) < args.md_threshold:
                                 continue
-                            if sc >= SPECIES_CONFIDENCE_THRESHOLD:
-                                label = lbl
-                                score = sc
-                            else:
+                            if det["category"] == MD_ANIMAL:
+                                has_animal = True
+                            elif det["category"] == MD_PERSON:
+                                has_person = True
+
+                    kept = has_animal or has_person
+                    log.info(f"  animal={has_animal} person={has_person} → {'KEEP' if kept else 'DELETE'}")
+
+                    # Parse dual-lens info from filename
+                    lens_parsed = parse_dual_lens_filename(video_path.name)
+                    lens_index  = lens_parsed[1] if lens_parsed else None
+
+                    vid_id = insert_video(video_path.name, str(video_path), camera_name, file_size, duration,
+                                          recorded_at, has_animal, has_person, kept, thumb, len(frame_data),
+                                          lens_index=lens_index)
+                    # Link to paired lens if this is a dual-lens camera
+                    link_lens_pair(vid_id, video_path.name)
+
+                    # Person detections
+                    for fp, fn, ts in frame_data:
+                        for det in md_results.get(fp, {}).get("detections", []):
+                            if det["category"] == MD_PERSON and _det_conf(det) >= args.md_threshold:
+                                insert_detection(vid_id, fn, ts, "person", _det_conf(det), det["bbox"])
+                                video_detections += 1
+
+                    if has_animal:
+                        saved = save_crops(frame_data, md_results, crops_dir, video_path.stem, args.md_threshold)
+                        log.info(f"  {len(saved)} crops saved")
+
+                        if not args.skip_speciesnet and saved:
+                            log.info("  Running SpeciesNet...")
+                            preds = run_speciesnet(
+                                [c["crop_path"] for c in saved],
+                                country=args.country,
+                                admin1_region=args.admin1_region,
+                            )
+                            if len(preds) != len(saved):
+                                log.warning(f"  SpeciesNet returned {len(preds)} predictions for {len(saved)} crops — pairing by index")
+
+                            # ── Deduplicate species per video ─────────────────────────────
+                            # Many crops may show the same animal. Rather than storing every
+                            # crop's prediction independently (which inflates counts and causes
+                            # multi-species noise), we:
+                            #   1. Apply the confidence threshold — below 0.7 → Unknown species
+                            #   2. Group crops by their top species label
+                            #   3. Keep only the highest-quality crop per species per video
+                            # This gives one clean representative detection per species per video.
+
+                            SPECIES_CONFIDENCE_THRESHOLD = args.species_threshold
+                            best_per_species = {}  # label → (crop, pred, score, quality)
+
+                            for crop, pred in zip(saved, preds):
+                                classes = pred.get("classifications", {}).get("classes", [])
+                                scores  = pred.get("classifications", {}).get("scores", [])
+
+                                # Build top-5 candidates (post geo-filter, pre blacklist)
+                                top5 = []
+                                for lbl, sc in zip(classes[:5], scores[:5]):
+                                    sci_c, com_c = parse_label(lbl)
+                                    top5.append({"label": lbl, "common_name": com_c,
+                                                 "scientific_name": sci_c, "score": round(sc, 4)})
+                                top5_json = _json.dumps(top5) if top5 else None
+
+                                # Walk candidates — skip blacklisted, take first above threshold
                                 label = "Unknown species"
-                                score = sc
-                            break
+                                score = scores[0] if scores else 0.0
+                                for lbl, sc in zip(classes, scores):
+                                    if lbl in blacklisted_labels:
+                                        continue
+                                    if sc >= SPECIES_CONFIDENCE_THRESHOLD:
+                                        label = lbl
+                                        score = sc
+                                    else:
+                                        label = "Unknown species"
+                                        score = sc
+                                    break
 
-                        q = score_image(crop["crop_path"])
-                        quality = q["quality_score"] if q else 0.0
+                                q = score_image(crop["crop_path"])
+                                quality = q["quality_score"] if q else 0.0
 
-                        # Keep the highest-quality crop for each distinct species label
-                        if label not in best_per_species or quality > best_per_species[label][3]:
-                            best_per_species[label] = (crop, pred, score, quality, q, top5_json)
+                                # Keep the highest-quality crop for each distinct species label
+                                if label not in best_per_species or quality > best_per_species[label][3]:
+                                    best_per_species[label] = (crop, pred, score, quality, q, top5_json)
 
-                    # Store one detection + species + crop per distinct species
-                    for label, (crop, pred, score, quality, q, top5_json) in best_per_species.items():
-                        sci, common = parse_label(label)
-                        det_id = insert_detection(vid_id, crop["frame_number"], crop["timestamp_secs"],
-                                                  "animal", crop["confidence"], crop["bbox"])
-                        insert_species(det_id, label, common, sci, score, top5_json)
-                        if q:
-                            insert_crop(det_id, crop["crop_path"], **q)
-                        if label == "Unknown species":
-                            log.info(f"    Unknown species (best confidence: {score:.2f}, below threshold {SPECIES_CONFIDENCE_THRESHOLD})")
+                            # Store one detection + species + crop per distinct species
+                            for label, (crop, pred, score, quality, q, top5_json) in best_per_species.items():
+                                sci, common = parse_label(label)
+                                det_id = insert_detection(vid_id, crop["frame_number"], crop["timestamp_secs"],
+                                                          "animal", crop["confidence"], crop["bbox"])
+                                video_detections += 1
+                                insert_species(det_id, label, common, sci, score, top5_json)
+                                if q:
+                                    insert_crop(det_id, crop["crop_path"], **q)
+                                if label == "Unknown species":
+                                    log.info(f"    Unknown species (best confidence: {score:.2f}, below threshold {SPECIES_CONFIDENCE_THRESHOLD})")
+                                else:
+                                    log.info(f"    {common or label} ({sci}) confidence: {score:.2f} quality: {quality:.0f}/100")
                         else:
-                            log.info(f"    {common or label} ({sci}) confidence: {score:.2f} quality: {quality:.0f}/100")
-                else:
-                    for crop in saved:
-                        det_id = insert_detection(vid_id, crop["frame_number"], crop["timestamp_secs"],
-                                                  "animal", crop["confidence"], crop["bbox"])
-                        q = score_image(crop["crop_path"])
-                        if q:
-                            insert_crop(det_id, crop["crop_path"], **q)
+                            for crop in saved:
+                                det_id = insert_detection(vid_id, crop["frame_number"], crop["timestamp_secs"],
+                                                          "animal", crop["confidence"], crop["bbox"])
+                                video_detections += 1
+                                q = score_image(crop["crop_path"])
+                                if q:
+                                    insert_crop(det_id, crop["crop_path"], **q)
 
-        if not kept:
-            log.info("  No detections — will be archived to blanks folder")
+                if not kept:
+                    log.info("  No detections — will be archived to blanks folder")
+            except Exception as e:
+                log.error(f"  Failed to process {video_path.name}: {e}")
+                video_errors += 1
+                video_failed = True
+            finally:
+                if not video_failed:
+                    videos_done += 1
+                    run_detections += video_detections
+                    cam_key = camera_name or "(unknown)"
+                    cam_entry = cameras_seen.setdefault(cam_key, {"videos": 0, "detections": 0})
+                    cam_entry["videos"] += 1
+                    cam_entry["detections"] += video_detections
 
+        status = "success" if video_errors == 0 else ("failure" if video_errors == total else "partial")
+        error_summary = None if video_errors == 0 else f"{video_errors} of {total} video(s) failed to process."
+        offline = get_camera_offline_flags(cameras_seen, lookback=5)
+        _finish_run(run_id, status, videos_done, run_detections, error_summary, cameras_seen, offline, args.data_dir)
+        run_closed = True
 
-    log.info(f"Done. Launch dashboard: python web_app.py --data-dir {args.data_dir}")
+        log.info(f"Done. Launch dashboard: python web_app.py --data-dir {args.data_dir}")
+    except Exception as e:
+        log.error(f"Fatal error during processing: {e}")
+        if not run_closed:
+            _finish_run(run_id, "failure", videos_done, run_detections, str(e), cameras_seen, [], args.data_dir)
+            run_closed = True
+        raise
 
 def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
