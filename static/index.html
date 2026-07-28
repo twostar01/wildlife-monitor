@@ -1029,6 +1029,11 @@ function switchTab(tab) {
   if (btn) btn.classList.add('active');
   const section = document.getElementById('tab-' + tab);
   if (section) section.classList.add('active');
+  if (tab !== 'gallery' && location.hash.startsWith('#gallery')) {
+    // Leaving the gallery tab: drop the gallery hash so a reload on
+    // another tab does not silently bounce the operator back here.
+    history.replaceState(null, '', location.pathname + location.search);
+  }
   if (tab === 'runs')     loadRuns();
   if (tab === 'blanks')   { loadCameras(); loadBlanks(); }
   if (tab === 'timeline') loadTimeline();
@@ -1470,7 +1475,7 @@ async function openSpecies(label) {
     state.gallerySpecies = label; state.galleryPage = 1;
     const sel = document.getElementById('gallerySpeciesFilter');
     if (sel) sel.value = label;
-    switchTab('gallery'); loadGallery();
+    switchTab('gallery'); writeGalleryHash(); loadGallery();
   };
   document.getElementById('modalViewVideosBtn').onclick = () => {
     closeModal('speciesModal');
@@ -1510,6 +1515,61 @@ async function openSpecies(label) {
 }
 
 // ── Gallery ───────────────────────────────────────────────────────────────────
+
+// Reads a `#gallery` hash into state. Returns false (and leaves state
+// untouched) when the current hash is not a gallery hash. The hash is
+// untrusted input — a shared link can carry anything — so every value is
+// defaulted or clamped rather than trusted outright.
+function parseGalleryHash() {
+  if (!location.hash.startsWith('#gallery')) return false;
+  const raw = location.hash.slice('#gallery'.length).replace(/^\?/, '');
+  const params = new URLSearchParams(raw);
+  state.gallerySpecies  = params.get('species')   || '';
+  state.galleryCamera   = params.get('camera')    || '';
+  state.galleryDateFrom = params.get('date_from') || '';
+  state.galleryDateTo   = params.get('date_to')   || '';
+  const mc = parseInt(params.get('min_conf'), 10);
+  const clamped = Number.isFinite(mc) ? Math.max(0, Math.min(100, mc)) : 0;
+  state.galleryMinConf = (Number.isFinite(mc) && clamped > 0) ? String(clamped) : '';
+  state.galleryPage = 1;
+  return true;
+}
+
+// Rewrites location.hash from the current gallery filter state. Always
+// uses replaceState — a filter change refines the current view, it is
+// never a new destination — and always rebuilds the query string fresh,
+// which is what keeps repeated writes idempotent.
+function writeGalleryHash() {
+  const p = new URLSearchParams();
+  if (state.gallerySpecies)  p.set('species',   state.gallerySpecies);
+  if (state.galleryCamera)   p.set('camera',    state.galleryCamera);
+  if (state.galleryDateFrom) p.set('date_from', state.galleryDateFrom);
+  if (state.galleryDateTo)   p.set('date_to',   state.galleryDateTo);
+  if (state.galleryMinConf)  p.set('min_conf',  state.galleryMinConf);
+  const qs = p.toString();
+  history.replaceState(null, '', qs ? `#gallery?${qs}` : '#gallery');
+}
+
+// Writes the five gallery filter state fields back into the DOM controls.
+// Performs no fetch — callers issue loadGallery() themselves.
+function applyGalleryFiltersToControls() {
+  const specSel = document.getElementById('gallerySpeciesFilter');
+  if (specSel) specSel.value = state.gallerySpecies;
+  const camSel = document.getElementById('galleryCameraFilter');
+  if (camSel) camSel.value = state.galleryCamera;
+  const fromEl = document.getElementById('galleryDateFrom');
+  if (fromEl) fromEl.value = state.galleryDateFrom;
+  const toEl = document.getElementById('galleryDateTo');
+  if (toEl) toEl.value = state.galleryDateTo;
+  const sliderEl = document.getElementById('galleryMinConf');
+  if (sliderEl) sliderEl.value = state.galleryMinConf || 0;
+  const labelEl = document.getElementById('galleryMinConfValue');
+  if (labelEl) {
+    const v = parseInt(state.galleryMinConf, 10) || 0;
+    labelEl.textContent = v > 0 ? `≥${v}%` : 'Any';
+  }
+}
+
 async function loadGallery(page) {
   if (page !== undefined) state.galleryPage = page;
   const grid = document.getElementById('galleryGrid');
@@ -3022,6 +3082,11 @@ async function submitCorrection(detectionId) {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 loadDashboard();
 loadCameras();
+if (parseGalleryHash()) {
+  switchTab('gallery');
+  applyGalleryFiltersToControls();
+  loadGallery();
+}
 </script>
 </body>
 </html>
