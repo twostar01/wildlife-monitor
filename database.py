@@ -280,6 +280,17 @@ def init_db(db_path: Optional[str] = None):
             summary["linked"], summary["unlinked"], summary["ambiguous_groups"],
         )
 
+    # Pairing consistency check (D-06) runs AFTER the `with get_conn()` block
+    # exits — get_conn() opens a fresh connection per call, so calling this
+    # from inside the block above would read a pre-commit snapshot and log a
+    # stale count.
+    broken = check_pairing_consistency()
+    if broken:
+        log.warning(
+            "Pairing consistency check: %d video(s) have a broken/asymmetric paired_video_id",
+            broken,
+        )
+
 
 # ── Write helpers ──────────────────────────────────────────────────────────────
 
@@ -515,6 +526,22 @@ def _repair_lens_pairings(conn) -> dict:
                 ambiguous_groups += 1
 
     return {"linked": linked, "unlinked": unlinked, "ambiguous_groups": ambiguous_groups}
+
+
+def check_pairing_consistency() -> int:
+    """
+    Count videos whose paired_video_id doesn't point back symmetrically.
+    Returns the broken-pointer count; callers log a warning if > 0.
+    No schema change — read-only SELECT (D-06).
+    """
+    with get_conn() as conn:
+        row = conn.execute("""
+            SELECT COUNT(*) FROM videos v1
+            LEFT JOIN videos v2 ON v1.paired_video_id = v2.id
+            WHERE v1.paired_video_id IS NOT NULL
+              AND (v2.id IS NULL OR v2.paired_video_id IS NULL OR v2.paired_video_id != v1.id)
+        """).fetchone()
+        return row[0]
 
 
 def insert_detection(
