@@ -1112,6 +1112,16 @@ def api_trigger_run(body: RunRequest = RunRequest()):
         env["PATH"] = str(Path.home() / "wildlife_env" / "bin") + ":" + env.get("PATH", "")
 
         log_path = Path(DATA_DIR) / "run_manual.log"
+        # Close any handle left open by a prior run that completed without
+        # anything ever polling /api/run/status (a non-browser API caller, or
+        # the page being closed/reloaded before the first poll fires) — the
+        # module global is otherwise silently reassigned below, leaking the
+        # file descriptor (WR-08).
+        if _run_log_f is not None:
+            try:
+                _run_log_f.close()
+            except OSError:
+                pass
         _run_log_f = open(log_path, "w")  # truncates immediately, clearing old content
         _run_process = subprocess.Popen(
             cmd,
