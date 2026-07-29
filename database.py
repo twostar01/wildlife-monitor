@@ -477,10 +477,15 @@ def correct_species(
     detection_id: int,
     user_common_name: str,
     user_scientific_name: str,
-):
-    """Save a human correction for a species detection. Pass empty strings to clear a correction."""
+) -> int:
+    """
+    Save a human correction for a species detection. Pass empty strings to
+    clear a correction. Returns the number of rows updated (0 for an unknown
+    detection_id) so the API layer can distinguish "nothing to update" from
+    success instead of always reporting {"ok": True} (IN-02).
+    """
     with get_conn() as conn:
-        conn.execute(
+        cur = conn.execute(
             """UPDATE species
                SET user_common_name=?, user_scientific_name=?, corrected_at=?
                WHERE detection_id=?""",
@@ -491,6 +496,7 @@ def correct_species(
                 detection_id,
             ),
         )
+        return cur.rowcount
 def get_kept_video_paths() -> list:
     """
     Return id and filepath for all kept videos that are currently stored locally
@@ -762,9 +768,18 @@ def save_video_correction(
     corrected_common: Optional[str],
     corrected_scientific: Optional[str],
     note: str = "",
-) -> int:
-    """Save or update a video-level species correction."""
+) -> Optional[int]:
+    """
+    Save or update a video-level species correction. Returns the new
+    correction's row id, or None if video_id doesn't reference an existing
+    video — the INSERT itself would otherwise always "succeed" for any
+    video_id, giving the API layer no signal that nothing meaningful
+    happened for a nonexistent video (IN-02).
+    """
     with get_conn() as conn:
+        exists = conn.execute("SELECT 1 FROM videos WHERE id=?", (video_id,)).fetchone()
+        if not exists:
+            return None
         # Replace existing correction for same video+original_label
         conn.execute("""
             DELETE FROM video_corrections

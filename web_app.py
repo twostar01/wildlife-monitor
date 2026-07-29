@@ -470,11 +470,16 @@ class SpeciesCorrectionRequest(BaseModel):
 @app.post("/api/species/correct")
 def api_correct_species(body: SpeciesCorrectionRequest):
     """Save a human correction for a species detection."""
-    db.correct_species(
+    rowcount = db.correct_species(
         detection_id=body.detection_id,
         user_common_name=body.user_common_name,
         user_scientific_name=body.user_scientific_name,
     )
+    # A request matching zero rows previously still returned {"ok": True},
+    # giving no signal that nothing happened for an unknown detection_id
+    # (IN-02).
+    if rowcount == 0:
+        raise HTTPException(404, "Detection not found")
     return {"ok": True}
 
 
@@ -685,6 +690,11 @@ def api_save_correction(req: CorrectionRequest):
         req.video_id, req.original_label, req.corrected_label,
         req.corrected_common, req.corrected_scientific, req.note or ""
     )
+    # None means video_id didn't reference an existing video — previously
+    # this still returned {"ok": True} with no signal that nothing
+    # meaningful happened (IN-02).
+    if correction_id is None:
+        raise HTTPException(404, "Video not found")
     return {"ok": True, "id": correction_id}
 
 
