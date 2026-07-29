@@ -1063,6 +1063,10 @@ const state = {
   timelineDays: 30, timelineDateFrom: '', timelineDateTo: '',
   currentVideoId: null,
   speciesList: [],
+  // Last-loaded/last-saved run_time_hhmm value, used by collectSettingsPayload()
+  // so the general/notification settings saves never fall back to a hardcoded
+  // default (WR-03) — see collectSettingsPayload() below.
+  loadedRunTimeHhmm: null,
 };
 
 let activityChartInst, topSpeciesChartInst, timelineChartInst, speciesTrendChartInst;
@@ -3042,6 +3046,7 @@ async function loadSettings() {
   document.getElementById('setKeptGb').value           = p.kept_retention_gb    ?? 500;
 
   document.getElementById('setRunTime').value          = p.run_time_hhmm ?? '06:00';
+  state.loadedRunTimeHhmm = p.run_time_hhmm ?? '06:00';
   document.getElementById('errRunTime').textContent          = '';
   document.getElementById('errRunTime').classList.remove('show');
   document.getElementById('scheduleApplyError').textContent  = '';
@@ -3109,7 +3114,20 @@ function collectSettingsPayload() {
     // stored settings object, so a key missing from this body is refilled with its
     // server-side default — omitting this line would silently reset the operator's
     // saved schedule back to 06:00 on every unrelated settings save.
-    run_time_hhmm:        document.getElementById('setRunTime').value.trim() || '06:00',
+    //
+    // Always re-sends the last-loaded/last-saved value (state.loadedRunTimeHhmm)
+    // rather than whatever is currently sitting in the live <input>, and never
+    // falls back to a hardcoded '06:00' unless nothing has loaded yet (WR-03).
+    // Two failure modes this closes:
+    //  1. Editing the field and clicking "Save Settings"/"Save Notification
+    //     Settings" instead of "Save Run Time" no longer silently persists an
+    //     un-applied schedule change — POST /api/settings never rewrites the
+    //     systemd timer, only saveRunTime()'s /api/schedule flow does.
+    //  2. If the <input type="time"> is ever empty when an unrelated save
+    //     fires (cleared field, odd browser rendering), the general save no
+    //     longer overwrites the operator's actual configured schedule with a
+    //     hardcoded default.
+    run_time_hhmm:        state.loadedRunTimeHhmm || document.getElementById('setRunTime').value.trim() || '06:00',
     hours:                parseInt(document.getElementById('setHours').value)      || 24,
     sample_rate:          parseInt(document.getElementById('setSampleRate').value)  || 30,
     md_threshold:         parseFloat(document.getElementById('setThreshold').value) || 0.2,
@@ -3260,6 +3278,7 @@ async function saveRunTime() {
       fb.textContent = '✓ Schedule saved';
       fb.classList.add('show');
       setTimeout(() => fb.classList.remove('show'), 2500);
+      state.loadedRunTimeHhmm = document.getElementById('setRunTime').value;
       loadNextRun();
     } else if (res.status === 400) {
       const detail = (data && data.detail) || 'Enter a valid 24-hour time (HH:MM).';
@@ -3269,8 +3288,10 @@ async function saveRunTime() {
     } else {
       // A non-400 rejection means the value was already persisted server-side (D-04) and only
       // the systemd apply step failed — the input must not be cleared or reverted, since it
-      // still reflects what was actually saved.
+      // still reflects what was actually saved. Keep the cached fallback (WR-03) in sync with
+      // it for the same reason.
       const detail = (data && data.detail) || 'unknown error';
+      state.loadedRunTimeHhmm = document.getElementById('setRunTime').value;
       applyErr.innerHTML = `Run time saved, but couldn't apply it to the schedule: ${escHtml(detail)}. ` +
         `The previous schedule is still active — check sudoers setup and retry.`;
       applyErr.classList.add('show');
