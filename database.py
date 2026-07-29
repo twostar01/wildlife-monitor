@@ -525,6 +525,19 @@ def _repair_lens_pairings(conn) -> dict:
             if len(members) > 1:
                 ambiguous_groups += 1
 
+    # Rows whose filename never parsed as dual-lens (so they never joined a
+    # group above) but which still carry a stray paired_video_id — e.g. set by
+    # some future write path other than link_lens_pair()/this function — must
+    # also be cleared to actually live up to the "ALL" in this function's
+    # docstring, rather than being silently left broken forever (WR-02).
+    grouped_ids = {vid for members in groups.values() for (vid, _, _) in members}
+    for r in rows:
+        if r["id"] not in grouped_ids and r["paired_video_id"] is not None:
+            conn.execute(
+                "UPDATE videos SET paired_video_id=NULL WHERE id=?", (r["id"],)
+            )
+            unlinked += 1
+
     return {"linked": linked, "unlinked": unlinked, "ambiguous_groups": ambiguous_groups}
 
 
