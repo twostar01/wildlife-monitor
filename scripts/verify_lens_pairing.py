@@ -91,7 +91,9 @@ def suite_link():
         # 2. link/ambiguous-group-left-unpaired
         case_id = "link/ambiguous-group-left-unpaired"
         with _fixture_db() as db_path:
-            _insert_video("World Watch_00_20260327160902.mp4", f"{db_path}.v0a.mp4")
+            id0a = _insert_video(
+                "World Watch_00_20260327160902.mp4", f"{db_path}.v0a.mp4"
+            )
             id0b = _insert_video(
                 "World Watch_00_20260327160902.mp4", f"{db_path}.v0b.mp4"
             )
@@ -104,13 +106,14 @@ def suite_link():
                     "SELECT lens_index, paired_video_id FROM videos WHERE id=?", (id1,)
                 ).fetchone()
                 rows0 = conn.execute(
-                    "SELECT paired_video_id FROM videos WHERE lens_index=0 OR id=?",
-                    (id0b,),
+                    "SELECT id, paired_video_id FROM videos WHERE id IN (?, ?)",
+                    (id0a, id0b),
                 ).fetchall()
             ok = (
                 result is None
                 and row1["paired_video_id"] is None
                 and row1["lens_index"] == 1
+                and len(rows0) == 2
                 and all(r["paired_video_id"] is None for r in rows0)
             )
             _check(case_id, ok, f"result={result}, row1={dict(row1)}")
