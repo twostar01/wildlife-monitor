@@ -2073,7 +2073,7 @@ async function openVideo(id) {
           dst.pause();
         } else {
           armSuppress(dst);
-          dst.play().catch(() => showAutoplayWarning(dst));  // D-11
+          dst.play().catch(() => showAutoplayWarning(dst, src));  // D-11
         }
       }
 
@@ -2367,13 +2367,16 @@ document.addEventListener('keydown', e => {
 });
 
 // ── Dual-lens autoplay-blocked warning (D-11) ─────────────────────────────────
-function showAutoplayWarning(blockedEl) {
+function showAutoplayWarning(blockedEl, partnerEl) {
   const wrap = blockedEl.closest('div');
   if (wrap.querySelector('.autoplay-warning')) return; // don't stack duplicates
   const banner = document.createElement('div');
   banner.className = 'autoplay-warning';
   banner.innerHTML = 'Playback blocked by browser — <button class="btn-correct" style="padding:2px 8px;font-size:10px">Resync</button>';
   banner.querySelector('button').addEventListener('click', () => {
+    // Re-align to the partner's current position before resuming — the blocked
+    // player may have fallen behind (or ahead) while play() kept failing.
+    if (partnerEl) blockedEl.currentTime = partnerEl.currentTime;
     blockedEl.play().then(() => banner.remove()).catch(() => {});
   });
   wrap.appendChild(banner);
