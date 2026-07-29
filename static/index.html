@@ -2070,6 +2070,7 @@ async function openVideo(id) {
       function mirrorPlayPause(src, dst) {
         if (consumeSuppress(src)) return;
         if (src.paused) {
+          armSuppress(dst);
           dst.pause();
         } else {
           armSuppress(dst);
