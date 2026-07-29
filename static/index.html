@@ -2487,32 +2487,6 @@ async function applyUpdate(id, action, actionArg) {
   }
 }
 
-// ── Storage & retention ───────────────────────────────────────────────────────
-async function loadStorageStats() {
-  const el = document.getElementById('storageStats');
-  if (!el) return;
-  const data = await fetch('/api/maintenance/storage').then(r => r.json()).catch(() => null);
-  if (!data) { el.innerHTML = '<div style="color:var(--muted);font-size:12px">Unavailable</div>'; return; }
-  el.innerHTML = `
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px">
-      <div class="storage-stat">
-        <div class="storage-label">Blank Videos</div>
-        <div class="storage-value">${data.blank_gb ?? 0} GB</div>
-        <div class="storage-sub">${data.blank_videos ?? 0} files</div>
-      </div>
-      <div class="storage-stat">
-        <div class="storage-label">Kept Videos</div>
-        <div class="storage-value">${data.kept_gb ?? 0} GB</div>
-        <div class="storage-sub">${data.kept_videos ?? 0} files</div>
-      </div>
-      <div class="storage-stat">
-        <div class="storage-label">Purged</div>
-        <div class="storage-value">${data.purged_gb_reclaimed ?? 0} GB</div>
-        <div class="storage-sub">${data.purged_videos ?? 0} records</div>
-      </div>
-    </div>`;
-}
-
 async function loadSystemStats() {
   const el = document.getElementById('systemStats');
   if (!el) return;
