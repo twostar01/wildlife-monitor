@@ -59,6 +59,11 @@ SETTINGS_FILE = "./data/settings.json"
 _run_process: subprocess.Popen | None = None
 _run_log_f = None   # file handle for the current manual run log; closed after process exits
 _run_lock = threading.Lock()
+# Guards api_save_schedule()'s multi-step write (settings.json + timer
+# drop-in + daemon-reload + restart) against interleaving from two
+# concurrent POST /api/schedule requests (WR-06) — a dedicated lock rather
+# than reusing _run_lock, since the two guard unrelated critical sections.
+_schedule_lock = threading.Lock()
 
 # Scheduling (SCHED-01/02/03) — module constants so a verification harness can
 # repoint the drop-in directory at a temporary path without patching function bodies.
@@ -975,64 +980,72 @@ def api_save_schedule(body: ScheduleRequest):
     if not _HHMM_RE.fullmatch(body.run_time):
         raise HTTPException(400, "run_time must be HH:MM (24-hour)")
 
-    # 2. Persist first (D-04): the operator's typed value must survive a
-    #    failed apply below, so it stays saved and retryable.
-    data = _load_settings()
-    data["run_time_hhmm"] = body.run_time
-    _save_settings(data)
+    # Steps 2-4 are a single critical section (WR-06): two concurrent
+    # POST /api/schedule requests (two open dashboard tabs, a double-click
+    # before the button's disabled state takes effect) could otherwise
+    # interleave the drop-in write and the settings.json write from
+    # different requests, and race the two daemon-reload/restart pairs —
+    # leaving the on-disk drop-in and settings.json disagreeing about the
+    # run time.
+    with _schedule_lock:
+        # 2. Persist first (D-04): the operator's typed value must survive a
+        #    failed apply below, so it stays saved and retryable.
+        data = _load_settings()
+        data["run_time_hhmm"] = body.run_time
+        _save_settings(data)
 
-    # 3. Write the drop-in. Ordinary unprivileged filesystem calls — the
-    #    directory is pre-chowned to the app user by the one-time operator
-    #    setup (README), which is what keeps the sudoers rule to two lines.
-    try:
-        TIMER_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
-        TIMER_DROPIN_FILE.write_text(_render_timer_override(body.run_time))
-    except OSError as e:
-        raise HTTPException(
-            500,
-            f"Could not write timer override at {TIMER_DROPIN_FILE}: {e}",
-        )
+        # 3. Write the drop-in. Ordinary unprivileged filesystem calls — the
+        #    directory is pre-chowned to the app user by the one-time operator
+        #    setup (README), which is what keeps the sudoers rule to two lines.
+        try:
+            TIMER_DROPIN_DIR.mkdir(parents=True, exist_ok=True)
+            TIMER_DROPIN_FILE.write_text(_render_timer_override(body.run_time))
+        except OSError as e:
+            raise HTTPException(
+                500,
+                f"Could not write timer override at {TIMER_DROPIN_FILE}: {e}",
+            )
 
-    # 4. Apply — exactly two fixed-argv sudo calls, no shell, no retry,
-    #    no reverting the settings write on failure (D-04). Both calls are
-    #    wrapped the same way api_next_run() below wraps its own subprocess
-    #    call: a missing sudoers NOPASSWD entry (sudo blocks trying to prompt
-    #    for a password with no TTY) raises subprocess.TimeoutExpired, and a
-    #    missing `sudo` binary raises OSError/FileNotFoundError — both would
-    #    otherwise propagate as an unhandled 500 with no actionable detail
-    #    (WR-04).
-    try:
-        reload_result = subprocess.run(
-            ["sudo", "systemctl", "daemon-reload"],
-            capture_output=True, text=True, timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError) as e:
-        raise HTTPException(
-            500, f"Schedule saved but could not be applied (daemon-reload): {e}"
-        )
-    if reload_result.returncode != 0:
-        raise HTTPException(
-            500,
-            f"Schedule saved but could not be applied (daemon-reload failed): "
-            f"{reload_result.stderr.strip()}",
-        )
-    try:
-        restart_result = subprocess.run(
-            ["sudo", "systemctl", "restart", TIMER_UNIT],
-            capture_output=True, text=True, timeout=15,
-        )
-    except (OSError, subprocess.SubprocessError) as e:
-        raise HTTPException(
-            500, f"Schedule saved but could not be applied (timer restart): {e}"
-        )
-    if restart_result.returncode != 0:
-        raise HTTPException(
-            500,
-            f"Schedule saved but could not be applied (timer restart failed): "
-            f"{restart_result.stderr.strip()}",
-        )
+        # 4. Apply — exactly two fixed-argv sudo calls, no shell, no retry,
+        #    no reverting the settings write on failure (D-04). Both calls are
+        #    wrapped the same way api_next_run() below wraps its own subprocess
+        #    call: a missing sudoers NOPASSWD entry (sudo blocks trying to prompt
+        #    for a password with no TTY) raises subprocess.TimeoutExpired, and a
+        #    missing `sudo` binary raises OSError/FileNotFoundError — both would
+        #    otherwise propagate as an unhandled 500 with no actionable detail
+        #    (WR-04).
+        try:
+            reload_result = subprocess.run(
+                ["sudo", "systemctl", "daemon-reload"],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            raise HTTPException(
+                500, f"Schedule saved but could not be applied (daemon-reload): {e}"
+            )
+        if reload_result.returncode != 0:
+            raise HTTPException(
+                500,
+                f"Schedule saved but could not be applied (daemon-reload failed): "
+                f"{reload_result.stderr.strip()}",
+            )
+        try:
+            restart_result = subprocess.run(
+                ["sudo", "systemctl", "restart", TIMER_UNIT],
+                capture_output=True, text=True, timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            raise HTTPException(
+                500, f"Schedule saved but could not be applied (timer restart): {e}"
+            )
+        if restart_result.returncode != 0:
+            raise HTTPException(
+                500,
+                f"Schedule saved but could not be applied (timer restart failed): "
+                f"{restart_result.stderr.strip()}",
+            )
 
-    return {"ok": True, "run_time": body.run_time}
+        return {"ok": True, "run_time": body.run_time}
 
 
 @app.get("/api/schedule/next-run")
