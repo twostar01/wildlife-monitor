@@ -555,12 +555,21 @@ def get_purgeable_videos(
     def should_purge_by_age(row, max_days):
         if not max_days:
             return False
+        # A row with recorded_at NULL/malformed previously fell through to
+        # the `except` below and was silently treated as "never old enough
+        # to purge" — such rows could only ever be purged via the storage-
+        # size limit, and would accumulate forever if an operator configures
+        # only a day-based limit (IN-05). Fall back to processed_at (always
+        # NOT NULL) so the row is still subject to age-based purging.
         try:
             dt = datetime.fromisoformat(row["recorded_at"])
-            age_days = (datetime.now() - dt).days
-            return age_days > max_days
         except (ValueError, TypeError):
-            return False
+            try:
+                dt = datetime.fromisoformat(row["processed_at"])
+            except (ValueError, TypeError):
+                return False
+        age_days = (datetime.now() - dt).days
+        return age_days > max_days
 
     def apply_limits(rows, max_days, max_gb):
         """Return rows that should be purged based on age and/or storage limits."""
