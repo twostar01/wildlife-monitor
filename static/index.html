@@ -2341,14 +2341,21 @@ function chartOpts({ legend = false } = {}) {
 }
 
 // ── Pagination ────────────────────────────────────────────────────────────────
-function renderPagination(containerId, page, pages, cb) {
+function renderPagination(containerId, page, pages, onPage) {
   const el = document.getElementById(containerId);
   if (pages <= 1) { el.innerHTML = ''; return; }
+  // Never re-serialize a callback's source into HTML (cb.toString() inside
+  // onclick="..."): that only happened to be safe for tiny arrow-function
+  // callbacks with no embedded quotes. The Blanks tab passes a large named
+  // function full of double-quoted template-literal strings, which corrupts
+  // the rendered markup as soon as there's more than one page (CR-03).
   el.innerHTML = `
-    <button ${page<=1?'disabled':''} onclick="(${cb.toString()})(${page-1})">← Prev</button>
+    <button data-page="${page-1}" ${page<=1?'disabled':''}>← Prev</button>
     <span class="page-info">Page ${page} of ${pages}</span>
-    <button ${page>=pages?'disabled':''} onclick="(${cb.toString()})(${page+1})">Next →</button>
+    <button data-page="${page+1}" ${page>=pages?'disabled':''}>Next →</button>
   `;
+  el.querySelectorAll('button[data-page]').forEach(btn =>
+    btn.addEventListener('click', () => onPage(parseInt(btn.dataset.page, 10))));
 }
 
 // ── Species filter population ─────────────────────────────────────────────────
