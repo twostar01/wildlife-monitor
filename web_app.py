@@ -39,7 +39,7 @@ except ImportError:
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import uvicorn
 
 import database as db
@@ -421,10 +421,30 @@ def api_cameras():
     return db.get_cameras()
 
 
+# Baseline defense-in-depth for the unauthenticated correction/blacklist
+# write endpoints (see REVIEW.md CR-01): reject raw control characters in
+# free-text fields that get rendered back into the dashboard. This does not
+# by itself make embedding these values in onclick="..." attributes safe —
+# the frontend also had to stop building those from untrusted strings — but
+# it closes off the bluntest injection payloads at the API boundary.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
+def _reject_control_chars(value: Optional[str]) -> Optional[str]:
+    if value and _CONTROL_CHAR_RE.search(value):
+        raise ValueError("must not contain control characters")
+    return value
+
+
 class SpeciesCorrectionRequest(BaseModel):
     detection_id:         int
     user_common_name:     str
     user_scientific_name: str
+
+    @field_validator("user_common_name", "user_scientific_name")
+    @classmethod
+    def _no_control_chars(cls, v):
+        return _reject_control_chars(v)
 
 
 @app.post("/api/species/correct")
@@ -575,6 +595,11 @@ class BlacklistEntry(BaseModel):
     note:            Optional[str] = ""
     requeue:         bool = False   # if True, also requeue affected videos
 
+    @field_validator("label", "common_name", "scientific_name", "note")
+    @classmethod
+    def _no_control_chars(cls, v):
+        return _reject_control_chars(v)
+
 
 class CorrectionRequest(BaseModel):
     video_id:            int
@@ -583,6 +608,11 @@ class CorrectionRequest(BaseModel):
     corrected_common:    Optional[str] = None
     corrected_scientific: Optional[str] = None
     note:                Optional[str] = ""
+
+    @field_validator("original_label", "corrected_label", "corrected_common", "corrected_scientific", "note")
+    @classmethod
+    def _no_control_chars(cls, v):
+        return _reject_control_chars(v)
 
 
 @app.get("/api/blacklist")

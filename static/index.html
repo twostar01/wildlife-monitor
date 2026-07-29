@@ -1292,7 +1292,7 @@ async function loadDashboard() {
           // Find the full label for this common name so we can open the species modal
           const match = state.speciesList.find(s => (s.common_name||'').toLowerCase() === trimmed.toLowerCase());
           return match
-            ? `<span class="species-chip" onclick="event.stopPropagation();openSpecies('${escHtml(match.label)}')">${escHtml(trimmed)}</span>`
+            ? `<span class="species-chip" data-species-label="${escHtml(match.label)}">${escHtml(trimmed)}</span>`
             : `<span>${escHtml(trimmed)}</span>`;
         }).join(', ')
       : (v.has_animal ? 'Animal detected' : 'Person detected');
@@ -1309,6 +1309,16 @@ async function loadDashboard() {
       ${v.has_person ? '<span class="badge badge-person">Person</span>' : ''}
     </div>`;
   }).join('') : '<div class="empty"><span class="empty-icon">📷</span>No detections yet. Run the processor to get started.</div>';
+
+  // Species label rides as a data-* attribute rather than being interpolated
+  // into an inline onclick="..." string — see CR-01. stopPropagation keeps
+  // a chip click from also triggering the parent .sighting-item's openVideo.
+  document.getElementById('recentList').querySelectorAll('[data-species-label]').forEach(el => {
+    el.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openSpecies(el.dataset.speciesLabel);
+    });
+  });
 
   // Last-run panel loads independently — a stalled/failing run-status fetch
   // must never delay or block the rest of the dashboard rendering above.
@@ -1499,7 +1509,7 @@ async function loadSpecies() {
   }
 
   grid.innerHTML = data.map(s => `
-    <div class="species-card" onclick="openSpecies('${escHtml(s.label)}')">
+    <div class="species-card" data-species-label="${escHtml(s.label)}">
       ${s.best_crop
         ? `<img class="species-img" src="${cropUrl(s.best_crop)}" loading="lazy" alt="${escHtml(s.common_name||s.label)}">`
         : `<div class="species-img-placeholder">🦎</div>`}
@@ -1517,6 +1527,11 @@ async function loadSpecies() {
       </div>
     </div>
   `).join('');
+  // Species label rides as a data-* attribute rather than being interpolated
+  // into an inline onclick="..." string — see CR-01.
+  grid.querySelectorAll('[data-species-label]').forEach(el => {
+    el.addEventListener('click', () => openSpecies(el.dataset.speciesLabel));
+  });
 }
 
 async function openSpecies(label) {
@@ -2069,11 +2084,22 @@ async function openVideo(id) {
             · ${fmtDuration(det.timestamp_secs)}
           </span>
           ${det.label ? `<span class="chip-correct-btn" title="Correct species"
-            onclick="event.stopPropagation();openCorrectionModal(${state.currentVideoId},'${escHtml(det.label)}','${escHtml(det.common_name||det.category||'')}',window._detectionCandidates['${escHtml(det.label)}']||'[]')"
+            data-chip-correct data-label="${escHtml(det.label)}" data-common="${escHtml(det.common_name||det.category||'')}"
             style="margin-left:4px;opacity:0.5;cursor:pointer;font-size:10px">✏</span>` : ''}
         </div>
       `).join('')
     : '';
+
+  // Label/common-name values ride as data-* attributes (decoded via .dataset
+  // below) rather than being interpolated into an inline onclick="..."
+  // string — see CR-01.
+  document.getElementById('detectionChips').querySelectorAll('[data-chip-correct]').forEach(el => {
+    el.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      const label = el.dataset.label;
+      openCorrectionModal(state.currentVideoId, label, el.dataset.common, window._detectionCandidates[label] || '[]');
+    });
+  });
 }
 
 function seekVideosTo(secs) {
@@ -2222,7 +2248,7 @@ document.getElementById('globalSearch').addEventListener('input', e => {
     if (data.species.length) {
       html += '<div class="search-section-title">Species</div>';
       html += data.species.map(s => `
-        <div class="search-result-item" onclick="openSpecies('${escHtml(s.label)}');closeSearch()">
+        <div class="search-result-item" data-search-species="${escHtml(s.label)}">
           <span style="font-size:20px">🦎</span>
           <div>
             <div class="search-result-text">${escHtml(s.common_name || s.label)}</div>
@@ -2233,7 +2259,7 @@ document.getElementById('globalSearch').addEventListener('input', e => {
     if (data.videos.length) {
       html += '<div class="search-section-title">Videos</div>';
       html += data.videos.map(v => `
-        <div class="search-result-item" onclick="openVideo(${v.id});closeSearch()">
+        <div class="search-result-item" data-search-video="${v.id}">
           <span style="font-size:20px">🎥</span>
           <div>
             <div class="search-result-text">${escHtml(v.filename)}</div>
@@ -2244,6 +2270,14 @@ document.getElementById('globalSearch').addEventListener('input', e => {
     if (!html) html = '<div class="search-result-item" style="color:var(--muted)">No results found.</div>';
     el.innerHTML = html;
     el.classList.add('open');
+    // Species label rides as a data-* attribute rather than being
+    // interpolated into an inline onclick="..." string — see CR-01.
+    el.querySelectorAll('[data-search-species]').forEach(node => {
+      node.addEventListener('click', () => { openSpecies(node.dataset.searchSpecies); closeSearch(); });
+    });
+    el.querySelectorAll('[data-search-video]').forEach(node => {
+      node.addEventListener('click', () => { openVideo(parseInt(node.dataset.searchVideo, 10)); closeSearch(); });
+    });
   }, 250);
 });
 
@@ -2326,7 +2360,10 @@ function populateSpeciesFilters(speciesList) {
 }
 
 // ── Util ──────────────────────────────────────────────────────────────────────
-function escHtml(s) { return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function escHtml(s) {
+  return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+                .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
 
 // ── Software & Models update checker ─────────────────────────────────────────
 async function checkUpdates() {
@@ -2517,18 +2554,36 @@ let _correctionContext = null; // {mode, videoId, originalLabel, commonName, det
 // rather than an inline ternary so both entry points render identically.
 function renderCandidateButtons(candidates) {
   if (!candidates || !candidates.length) return '';
+  // Candidate label/common/scientific values are carried as data-* attributes
+  // (read back via .dataset in wireCorrectionButtons) rather than interpolated
+  // into an inline onclick="..." string — a value containing a quote can't
+  // break out of an HTML attribute into executable JS this way.
   return `
     <div style="margin-bottom:14px">
       <div style="font-family:var(--font-mono);font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:1px;margin-bottom:8px">Top Candidates</div>
       <div style="display:flex;flex-wrap:wrap;gap:6px">
         ${candidates.map(c => `
-          <button onclick="applyCorrectionQuick('${escHtml(c.label)}','${escHtml(c.common_name||'')}','${escHtml(c.scientific_name||'')}')"
+          <button data-corr-quick data-label="${escHtml(c.label)}" data-common="${escHtml(c.common_name||'')}" data-sci="${escHtml(c.scientific_name||'')}"
             style="background:var(--surface);border:1px solid var(--border);color:var(--text);padding:5px 10px;border-radius:4px;font-size:11px;cursor:pointer;text-align:left">
             ${escHtml(c.common_name || c.label)}
             <span style="color:var(--muted);font-size:10px"> ${(c.score*100).toFixed(0)}%</span>
           </button>`).join('')}
       </div>
     </div>`;
+}
+
+// Delegated click handler for candidate/search-result buttons rendered by
+// renderCandidateButtons() and searchSpeciesCorrection(). Must be called
+// after any innerHTML write that (re)renders those buttons, since they carry
+// untrusted label/common/scientific text as data-* attributes rather than
+// inline onclick="..." strings (see CR-01).
+function wireCorrectionButtons(container) {
+  if (!container) return;
+  container.querySelectorAll('[data-corr-quick]').forEach(el => {
+    el.addEventListener('click', () => {
+      applyCorrectionQuick(el.dataset.label, el.dataset.common, el.dataset.sci);
+    });
+  });
 }
 
 // Shared species-search section markup for both entry points — one field,
@@ -2573,12 +2628,19 @@ async function openCorrectionModal(videoId, originalLabel, commonName, candidate
     ${renderCorrInlineError()}
 
     <div style="display:flex;gap:10px;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
-      <button class="btn-run" style="background:rgba(224,92,92,0.15);border-color:#e05c5c;color:#e05c5c;font-size:12px;padding:7px 16px"
-        onclick="applyCorrection(${videoId},'${escHtml(originalLabel)}',null,null,null)">
+      <button class="btn-run" data-corr-suppress data-video-id="${videoId}" data-label="${escHtml(originalLabel)}"
+        style="background:rgba(224,92,92,0.15);border-color:#e05c5c;color:#e05c5c;font-size:12px;padding:7px 16px">
         ⛔ Suppress this species
       </button>
       <button class="btn-save" onclick="closeModal('correctionModal')">Cancel</button>
     </div>`;
+
+  wireCorrectionButtons(body);
+  body.querySelectorAll('[data-corr-suppress]').forEach(el => {
+    el.addEventListener('click', () => {
+      applyCorrection(parseInt(el.dataset.videoId, 10), el.dataset.label, null, null, null);
+    });
+  });
 
   document.getElementById('correctionModal').classList.add('open');
 }
@@ -2600,12 +2662,13 @@ async function searchSpeciesCorrection() {
     }
     el.style.display = 'block';
     el.innerHTML = results.map(r => `
-      <div onclick="applyCorrectionQuick('${escHtml(r.label)}','${escHtml(r.common_name||'')}','${escHtml(r.scientific_name||'')}')"
+      <div data-corr-quick data-label="${escHtml(r.label)}" data-common="${escHtml(r.common_name||'')}" data-sci="${escHtml(r.scientific_name||'')}"
         style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:12px"
         onmouseover="this.style.background='var(--surface)'" onmouseout="this.style.background=''">
         <strong>${escHtml(r.common_name || r.label)}</strong>
         <span style="color:var(--muted);font-size:11px;margin-left:6px">${escHtml(r.scientific_name || '')}</span>
       </div>`).join('');
+    wireCorrectionButtons(el);
   }, 350);
 }
 
@@ -2687,6 +2750,8 @@ function openDetectionCorrection(itemEl) {
       <button class="btn-save" onclick="closeModal('correctionModal')">Cancel</button>
     </div>`;
 
+  wireCorrectionButtons(body);
+
   document.getElementById('correctionModal').classList.add('open');
   document.getElementById('correctionModal').querySelector('.modal-title').textContent = 'Correct Species Identification';
 }
@@ -2758,16 +2823,26 @@ async function loadBlacklist() {
             <td style="padding:8px;text-align:right;color:var(--muted)">${e.affected_count} video(s)</td>
             <td style="padding:8px;text-align:right">
               ${e.affected_count > 0 ? `
-                <button onclick="requeueBlacklisted('${escHtml(e.label)}')" class="btn-save" style="font-size:11px;padding:4px 10px;margin-right:6px">
+                <button data-blacklist-action="requeue" data-label="${escHtml(e.label)}" class="btn-save" style="font-size:11px;padding:4px 10px;margin-right:6px">
                   Requeue ${e.affected_count}
                 </button>` : ''}
-              <button onclick="removeBlacklist('${escHtml(e.label)}')" style="background:transparent;border:1px solid #e05c5c;color:#e05c5c;padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer">
+              <button data-blacklist-action="remove" data-label="${escHtml(e.label)}" style="background:transparent;border:1px solid #e05c5c;color:#e05c5c;padding:4px 10px;border-radius:4px;font-size:11px;cursor:pointer">
                 Remove
               </button>
             </td>
           </tr>`).join('')}
       </tbody>
     </table>`;
+  // Untrusted label values are passed through as button attributes (escaped)
+  // rather than interpolated into inline onclick="..." strings, so a label
+  // containing a quote can't break out of an attribute into executable JS.
+  el.querySelectorAll('button[data-blacklist-action]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const label = btn.dataset.label;
+      if (btn.dataset.blacklistAction === 'requeue') requeueBlacklisted(label);
+      else removeBlacklist(label);
+    });
+  });
 }
 
 function openAddBlacklist() {
@@ -2817,12 +2892,19 @@ async function searchBlacklistAdd() {
     const el = document.getElementById('blAddResults');
     el.style.display = 'block';
     el.innerHTML = results.map(r => `
-      <div onclick="selectBlacklistSpecies('${escHtml(r.label)}','${escHtml(r.common_name||'')}','${escHtml(r.scientific_name||'')}')"
+      <div data-bl-select data-label="${escHtml(r.label)}" data-common="${escHtml(r.common_name||'')}" data-sci="${escHtml(r.scientific_name||'')}"
         style="padding:8px 12px;cursor:pointer;border-bottom:1px solid var(--border);font-size:12px"
         onmouseover="this.style.background='var(--surface)'" onmouseout="this.style.background=''">
         <strong>${escHtml(r.common_name || r.label)}</strong>
         <span style="color:var(--muted);font-size:11px;margin-left:6px">${escHtml(r.scientific_name||'')}</span>
       </div>`).join('') || '<div style="padding:10px;font-size:12px;color:var(--muted)">No results</div>';
+    // Label/common/scientific values ride as data-* attributes rather than
+    // being interpolated into an inline onclick="..." string — see CR-01.
+    el.querySelectorAll('[data-bl-select]').forEach(node => {
+      node.addEventListener('click', () => {
+        selectBlacklistSpecies(node.dataset.label, node.dataset.common, node.dataset.sci);
+      });
+    });
   }, 350);
 }
 
