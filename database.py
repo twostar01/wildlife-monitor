@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS videos (
     frame_count     INTEGER DEFAULT 0,
     file_purged_at  TEXT,           -- ISO datetime when video file was deleted (record kept)
     lens_index      INTEGER,        -- 0 = wide/fixed, 1 = telephoto/adjustable, NULL = unknown
-    paired_video_id INTEGER REFERENCES videos(id),  -- id of the other lens for dual-lens cameras
+    paired_video_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,  -- id of the other lens for dual-lens cameras
     needs_reprocess INTEGER DEFAULT 0
 );
 
@@ -163,7 +163,7 @@ ALTER TABLE videos ADD COLUMN file_purged_at TEXT;
 
 MIGRATION_ADD_LENS = """
 ALTER TABLE videos ADD COLUMN lens_index INTEGER;
-ALTER TABLE videos ADD COLUMN paired_video_id INTEGER REFERENCES videos(id);
+ALTER TABLE videos ADD COLUMN paired_video_id INTEGER REFERENCES videos(id) ON DELETE SET NULL;
 """
 
 MIGRATION_ADD_REPROCESS = """
