@@ -3297,9 +3297,12 @@ async function saveRunTime() {
       applyErr.classList.add('show');
     }
   } catch (err) {
+    // Unlike the non-400 branch above, fetch() itself rejected here — the
+    // request never completed a round trip, so the server may never have
+    // received it at all. Don't claim the value was saved (WR-05).
     const detail = (err && err.message) ? err.message : 'network error';
-    applyErr.innerHTML = `Run time saved, but couldn't apply it to the schedule: ${escHtml(detail)}. ` +
-      `The previous schedule is still active — check sudoers setup and retry.`;
+    applyErr.innerHTML = `Could not reach the server to save the run time: ${escHtml(detail)}. ` +
+      `Nothing was saved — check your connection and retry.`;
     applyErr.classList.add('show');
   } finally {
     btn.disabled = false;
