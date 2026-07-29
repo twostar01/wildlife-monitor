@@ -866,12 +866,14 @@ def api_apply_update(body: UpdateRequest):
 
     elif body.action == "clear_model_cache":
         import shutil
-        cache_path = Path(body.action_arg)
-        # Safety check — only allow deletion inside home dir cache paths
-        home_cache = Path.home() / ".cache"
-        try:
-            cache_path.relative_to(home_cache)
-        except ValueError:
+        # Resolve both sides before validating — Path.relative_to() is a
+        # purely lexical comparison of path parts and does not resolve ".."
+        # segments, so a value like "~/.cache/../.ssh" would previously pass
+        # the containment check even though it escapes ~/.cache once the OS
+        # resolves it (CR-02).
+        cache_path = Path(body.action_arg).expanduser().resolve()
+        home_cache = (Path.home() / ".cache").resolve()
+        if cache_path != home_cache and home_cache not in cache_path.parents:
             raise HTTPException(400, "Cache path must be inside ~/.cache")
         if cache_path.exists():
             shutil.rmtree(cache_path)
