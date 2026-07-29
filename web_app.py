@@ -994,21 +994,37 @@ def api_save_schedule(body: ScheduleRequest):
         )
 
     # 4. Apply — exactly two fixed-argv sudo calls, no shell, no retry,
-    #    no reverting the settings write on failure (D-04).
-    reload_result = subprocess.run(
-        ["sudo", "systemctl", "daemon-reload"],
-        capture_output=True, text=True, timeout=15,
-    )
+    #    no reverting the settings write on failure (D-04). Both calls are
+    #    wrapped the same way api_next_run() below wraps its own subprocess
+    #    call: a missing sudoers NOPASSWD entry (sudo blocks trying to prompt
+    #    for a password with no TTY) raises subprocess.TimeoutExpired, and a
+    #    missing `sudo` binary raises OSError/FileNotFoundError — both would
+    #    otherwise propagate as an unhandled 500 with no actionable detail
+    #    (WR-04).
+    try:
+        reload_result = subprocess.run(
+            ["sudo", "systemctl", "daemon-reload"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        raise HTTPException(
+            500, f"Schedule saved but could not be applied (daemon-reload): {e}"
+        )
     if reload_result.returncode != 0:
         raise HTTPException(
             500,
             f"Schedule saved but could not be applied (daemon-reload failed): "
             f"{reload_result.stderr.strip()}",
         )
-    restart_result = subprocess.run(
-        ["sudo", "systemctl", "restart", TIMER_UNIT],
-        capture_output=True, text=True, timeout=15,
-    )
+    try:
+        restart_result = subprocess.run(
+            ["sudo", "systemctl", "restart", TIMER_UNIT],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        raise HTTPException(
+            500, f"Schedule saved but could not be applied (timer restart): {e}"
+        )
     if restart_result.returncode != 0:
         raise HTTPException(
             500,
