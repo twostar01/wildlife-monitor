@@ -1085,9 +1085,17 @@ def get_species_detail(label: str) -> dict:
             GROUP BY day ORDER BY day
         """, (label,)).fetchall()
 
-        crops = conn.execute("""
+        # Selects the same detection-identifying columns as get_gallery() (label,
+        # detection_id, top_candidates_json, corrected common/scientific name) so
+        # the frontend can route this grid through the same openDetectionCorrection
+        # entry point the main Gallery tab uses, instead of a plain video-open
+        # click — see WR-07.
+        crops = conn.execute(f"""
             SELECT c.crop_path, c.quality_score, v.id as video_id,
-                   v.filename, v.recorded_at
+                   v.filename, v.recorded_at,
+                   s.label, s.detection_id, s.top_candidates_json,
+                   {DISPLAY_COMMON}     AS common_name,
+                   {DISPLAY_SCIENTIFIC} AS scientific_name
             FROM crops c
             JOIN detections d ON c.detection_id = d.id
             JOIN species s ON s.detection_id = d.id

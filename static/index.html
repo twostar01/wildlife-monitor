@@ -1572,11 +1572,25 @@ async function openSpecies(label) {
     options: chartOpts({ legend: false }),
   });
 
-  // Crops gallery
+  // Crops gallery — uses the same openDetectionCorrection entry point (with
+  // its own hover play affordance) as the main Gallery tab's identical-looking
+  // grid, rather than a plain "click opens the video" handler (WR-07): the
+  // same visually identical .gallery-item markup previously did two different
+  // things depending on where it was rendered.
   document.getElementById('modalGallery').innerHTML = d.crops.length
     ? d.crops.slice(0,24).map(c => `
-        <div class="gallery-item" onclick="openVideo(${c.video_id})">
-          <img src="${cropUrl(c.crop_path)}" loading="lazy">
+        <div class="gallery-item" id="gitem-${c.detection_id}"
+             data-detection-id="${escHtml(String(c.detection_id))}"
+             data-label="${escHtml(c.label||'')}"
+             data-common="${escHtml(c.common_name||'')}"
+             data-sci="${escHtml(c.scientific_name||'')}"
+             data-candidates="${escHtml(c.top_candidates_json||'[]')}">
+          <img src="${cropUrl(c.crop_path)}" loading="lazy"
+               onclick="openDetectionCorrection(this.closest('.gallery-item'))">
+          <div class="gallery-item-actions">
+            <button class="btn-correct" title="Play video"
+                    onclick="event.stopPropagation();openVideo(${c.video_id})">▶</button>
+          </div>
           <div class="gallery-item-meta">
             <div>
               <div class="quality-bar"><div class="quality-bar-fill" style="width:${c.quality_score||0}%"></div></div>
