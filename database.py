@@ -5,6 +5,7 @@ database.py — SQLite schema and query helpers for Wildlife Processor
 import sqlite3
 import json
 import re
+from collections import defaultdict
 from datetime import datetime, date
 from pathlib import Path
 from contextlib import contextmanager
@@ -269,6 +270,16 @@ def init_db(db_path: Optional[str] = None):
             conn.execute("PRAGMA foreign_keys=ON")   # restore after executescript resets pragma state
             log.info("DB migration: filepath NOT NULL constraint removed")
 
+        # Dual-lens pairing repair (SYNC-04, D-01/D-03/D-04): re-validates ALL
+        # paired_video_id values on every init_db() call, inside this same
+        # transaction, so a mid-pass failure rolls back as a unit.
+        summary = _repair_lens_pairings(conn)
+        log.info(
+            "Dual-lens pairing repair: %d pair(s) linked/fixed, %d value(s) unlinked, "
+            "%d group(s) left ambiguous (no auto-safe match)",
+            summary["linked"], summary["unlinked"], summary["ambiguous_groups"],
+        )
+
 
 # ── Write helpers ──────────────────────────────────────────────────────────────
 
@@ -450,6 +461,60 @@ def link_lens_pair(video_id: int, filename: str) -> Optional[int]:
                 (p2[1], pair_id),
             )
         return pair_id
+
+
+def _repair_lens_pairings(conn) -> dict:
+    """
+    Re-validate ALL videos.paired_video_id values against camera_base+timestamp+
+    lens_index derived from filenames (D-04). Only links a pair when the group is
+    unambiguous (exactly 2 members, differing lens). Never overwrites an existing
+    correct link; never guesses among 3+ candidates. Returns summary counts for
+    the startup log line (D-03).
+
+    Takes an already-open connection so it participates in init_db()'s
+    transaction — it never opens its own.
+    """
+    rows = conn.execute(
+        "SELECT id, filename, lens_index, paired_video_id FROM videos"
+    ).fetchall()
+
+    groups = defaultdict(list)
+    for r in rows:
+        p = parse_dual_lens_filename(r["filename"])
+        if p:
+            camera_base, lens_index, timestamp = p
+            groups[(camera_base, timestamp)].append(
+                (r["id"], lens_index, r["paired_video_id"])
+            )
+
+    linked = unlinked = ambiguous_groups = 0
+
+    for members in groups.values():
+        if len(members) == 2 and members[0][1] != members[1][1]:
+            (id1, lens1, pv1), (id2, lens2, pv2) = members
+            if pv1 == id2 and pv2 == id1:
+                continue  # already correct — no-op, keeps the pass idempotent
+            conn.execute(
+                "UPDATE videos SET paired_video_id=? WHERE id=?", (id2, id1)
+            )
+            conn.execute(
+                "UPDATE videos SET paired_video_id=? WHERE id=?", (id1, id2)
+            )
+            linked += 1
+        else:
+            # Not a clean 2-member cross-lens group. Any member currently
+            # pointing somewhere is wrong (or ambiguous) — clear it rather
+            # than guess.
+            for (vid, lens, pv) in members:
+                if pv is not None:
+                    conn.execute(
+                        "UPDATE videos SET paired_video_id=NULL WHERE id=?", (vid,)
+                    )
+                    unlinked += 1
+            if len(members) > 1:
+                ambiguous_groups += 1
+
+    return {"linked": linked, "unlinked": unlinked, "ambiguous_groups": ambiguous_groups}
 
 
 def insert_detection(
