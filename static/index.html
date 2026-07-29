@@ -2039,41 +2039,44 @@ async function openVideo(id) {
       const vTele = document.getElementById('videoTelephoto');
       const SEEK_TOLERANCE = 0.3; // seconds — D-09
 
-      let suppressEchoOn = null;   // the <video> element whose NEXT event we should ignore
-      let suppressTimer = null;
+      // Separate suppress slots per event category (seek vs. play/pause) so a
+      // seek-echo and a play/pause-echo in flight at the same time on the same
+      // element can't clobber each other's armed suppression (WR-03).
+      let suppressEchoOn = { seek: null, playpause: null };   // the <video> element whose NEXT event of this kind we should ignore
+      let suppressTimer = { seek: null, playpause: null };
 
-      function armSuppress(target) {
-        suppressEchoOn = target;
-        clearTimeout(suppressTimer);
+      function armSuppress(kind, target) {
+        suppressEchoOn[kind] = target;
+        clearTimeout(suppressTimer[kind]);
         // Fallback: if the target never fires the expected event (e.g. it errors,
         // or the browser doesn't fire `seeked` because currentTime didn't actually
         // change), don't leave future real user actions permanently blocked.
-        suppressTimer = setTimeout(() => { suppressEchoOn = null; }, 800);
+        suppressTimer[kind] = setTimeout(() => { suppressEchoOn[kind] = null; }, 800);
       }
 
-      function consumeSuppress(el) {
-        if (suppressEchoOn === el) {
-          suppressEchoOn = null;
-          clearTimeout(suppressTimer);
+      function consumeSuppress(kind, el) {
+        if (suppressEchoOn[kind] === el) {
+          suppressEchoOn[kind] = null;
+          clearTimeout(suppressTimer[kind]);
           return true; // this event was our own echo — caller should stop here
         }
         return false;
       }
 
       function mirrorSeek(src, dst) {
-        if (consumeSuppress(src)) return;         // this was the echo we caused — done
+        if (consumeSuppress('seek', src)) return;  // this was the echo we caused — done
         if (Math.abs(dst.currentTime - src.currentTime) < SEEK_TOLERANCE) return; // D-09
-        armSuppress(dst);
+        armSuppress('seek', dst);
         dst.currentTime = src.currentTime;
       }
 
       function mirrorPlayPause(src, dst) {
-        if (consumeSuppress(src)) return;
+        if (consumeSuppress('playpause', src)) return;
         if (src.paused) {
-          armSuppress(dst);
+          armSuppress('playpause', dst);
           dst.pause();
         } else {
-          armSuppress(dst);
+          armSuppress('playpause', dst);
           dst.play().catch(() => showAutoplayWarning(dst, src));  // D-11
         }
       }
