@@ -169,6 +169,7 @@
   .dual-video-wrap video { width: 100%; border-radius: 6px; background: #000; }
   .single-video-wrap video { width: 100%; border-radius: 6px; background: #000; max-height: 480px; }
   .lens-label { font-family: var(--font-mono); font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+  .autoplay-warning { font-size: 11px; color: var(--danger); margin-top: 4px; font-family: var(--font-mono); }
   @media (max-width: 600px) { .dual-video-wrap { grid-template-columns: 1fr; } }
   .btn-correct { background: transparent; color: var(--accent); border: 1px solid var(--accent); padding: 5px 12px; border-radius: 4px; font-size: 11px; cursor: pointer; font-family: var(--font-mono); }
   .btn-correct:hover { background: rgba(109,186,92,0.1); }
@@ -2036,20 +2037,52 @@ async function openVideo(id) {
     if (!widePurged && !telePurged) {
       const vWide = document.getElementById('videoWide');
       const vTele = document.getElementById('videoTelephoto');
-      let syncing = false;
-      function syncVideos(src, dst) {
-        if (syncing) return;
-        syncing = true;
-        dst.currentTime = src.currentTime;
-        src.paused ? dst.pause() : dst.play().catch(() => {});
-        syncing = false;
+      const SEEK_TOLERANCE = 0.3; // seconds — D-09
+
+      let suppressEchoOn = null;   // the <video> element whose NEXT event we should ignore
+      let suppressTimer = null;
+
+      function armSuppress(target) {
+        suppressEchoOn = target;
+        clearTimeout(suppressTimer);
+        // Fallback: if the target never fires the expected event (e.g. it errors,
+        // or the browser doesn't fire `seeked` because currentTime didn't actually
+        // change), don't leave future real user actions permanently blocked.
+        suppressTimer = setTimeout(() => { suppressEchoOn = null; }, 800);
       }
-      vWide.addEventListener('play',   () => { syncing=false; vTele.play().catch(()=>{}); });
-      vWide.addEventListener('pause',  () => { syncing=false; vTele.pause(); });
-      vWide.addEventListener('seeked', () => syncVideos(vWide, vTele));
-      vTele.addEventListener('play',   () => { syncing=false; vWide.play().catch(()=>{}); });
-      vTele.addEventListener('pause',  () => { syncing=false; vWide.pause(); });
-      vTele.addEventListener('seeked', () => syncVideos(vTele, vWide));
+
+      function consumeSuppress(el) {
+        if (suppressEchoOn === el) {
+          suppressEchoOn = null;
+          clearTimeout(suppressTimer);
+          return true; // this event was our own echo — caller should stop here
+        }
+        return false;
+      }
+
+      function mirrorSeek(src, dst) {
+        if (consumeSuppress(src)) return;         // this was the echo we caused — done
+        if (Math.abs(dst.currentTime - src.currentTime) < SEEK_TOLERANCE) return; // D-09
+        armSuppress(dst);
+        dst.currentTime = src.currentTime;
+      }
+
+      function mirrorPlayPause(src, dst) {
+        if (consumeSuppress(src)) return;
+        if (src.paused) {
+          dst.pause();
+        } else {
+          armSuppress(dst);
+          dst.play().catch(() => showAutoplayWarning(dst));  // D-11
+        }
+      }
+
+      vWide.addEventListener('seeked', () => mirrorSeek(vWide, vTele));
+      vTele.addEventListener('seeked', () => mirrorSeek(vTele, vWide));
+      vWide.addEventListener('play',   () => mirrorPlayPause(vWide, vTele));
+      vWide.addEventListener('pause',  () => mirrorPlayPause(vWide, vTele));
+      vTele.addEventListener('play',   () => mirrorPlayPause(vTele, vWide));
+      vTele.addEventListener('pause',  () => mirrorPlayPause(vTele, vWide));
     }
 
   } else {
@@ -2332,6 +2365,19 @@ document.querySelectorAll('.modal-overlay').forEach(el => {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') document.querySelectorAll('.modal-overlay.open').forEach(m => closeModal(m.id));
 });
+
+// ── Dual-lens autoplay-blocked warning (D-11) ─────────────────────────────────
+function showAutoplayWarning(blockedEl) {
+  const wrap = blockedEl.closest('div');
+  if (wrap.querySelector('.autoplay-warning')) return; // don't stack duplicates
+  const banner = document.createElement('div');
+  banner.className = 'autoplay-warning';
+  banner.innerHTML = 'Playback blocked by browser — <button class="btn-correct" style="padding:2px 8px;font-size:10px">Resync</button>';
+  banner.querySelector('button').addEventListener('click', () => {
+    blockedEl.play().then(() => banner.remove()).catch(() => {});
+  });
+  wrap.appendChild(banner);
+}
 
 // ── Chart defaults ────────────────────────────────────────────────────────────
 function chartOpts({ legend = false } = {}) {
