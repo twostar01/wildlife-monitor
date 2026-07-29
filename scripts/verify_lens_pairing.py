@@ -22,12 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import database
 
-_results = []
-
 
 def _check(case_id, condition, detail=""):
     """Record a test assertion. Prints immediately on failure, silent on success."""
-    _results.append((case_id, bool(condition)))
     if not condition:
         print(f"FAIL: {case_id} — {detail}")
 
