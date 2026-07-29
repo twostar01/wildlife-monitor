@@ -377,6 +377,8 @@ def link_lens_pair(video_id: int, filename: str) -> Optional[int]:
     """
     After inserting a video, find its paired lens and link both rows.
     Returns the paired video's id if a pair was found and linked, else None.
+    Only links when exactly one unambiguous candidate exists (D-02/D-07) —
+    never guesses among multiple matches.
     """
     parsed = parse_dual_lens_filename(filename)
     if parsed is None:
@@ -384,30 +386,53 @@ def link_lens_pair(video_id: int, filename: str) -> Optional[int]:
     camera_base, lens_index, timestamp = parsed
 
     with get_conn() as conn:
-        # Find a video with the same camera_base + timestamp but different lens
-        # Match on filename pattern: camera_base + any lens + same timestamp
+        # timestamp is guaranteed digit-only by the \d{14} regex in
+        # parse_dual_lens_filename — no LIKE metacharacters possible, so no
+        # escaping is needed (Pitfall 4). camera_base is intentionally NOT
+        # part of the SQL pattern; the Python-side check below does that
+        # exact match, same safety net as before.
         rows = conn.execute(
-            "SELECT id, filename FROM videos WHERE id != ? AND filename LIKE ?",
-            (video_id, f"{camera_base}_%_{timestamp}%"),
+            "SELECT id, filename, paired_video_id FROM videos WHERE id != ? AND filename LIKE ?",
+            (video_id, f"%_{timestamp}%"),
         ).fetchall()
 
-        # Filter to only the other lens(es) for this camera base + timestamp
-        pair_id = None
-        for row in rows:
-            p = parse_dual_lens_filename(row["filename"])
-            if p and p[0] == camera_base and p[2] == timestamp and p[1] != lens_index:
-                pair_id = row["id"]
-                break
+        candidates = [
+            row for row in rows
+            if (p := parse_dual_lens_filename(row["filename"]))
+            and p[0] == camera_base and p[2] == timestamp and p[1] != lens_index
+        ]
 
-        if pair_id is None:
-            # Store lens_index anyway so we know which lens this is
+        if len(candidates) != 1:
+            # 0 candidates: no partner recorded yet (normal, Pitfall 2).
+            # >1 candidates: ambiguous — almost certainly duplicate rows
+            # (Pitfall 1). Don't guess. Still record lens_index so the video
+            # is identifiable, but leave pairing alone.
             conn.execute(
-                "UPDATE videos SET lens_index=? WHERE id=?",
-                (lens_index, video_id),
+                "UPDATE videos SET lens_index=? WHERE id=?", (lens_index, video_id)
+            )
+            if len(candidates) > 1:
+                log.info(
+                    "link_lens_pair: %d ambiguous candidates for %s (camera=%s, ts=%s) — left unpaired",
+                    len(candidates), filename, camera_base, timestamp,
+                )
+            return None
+
+        candidate = candidates[0]
+        pair_id = candidate["id"]
+
+        # Guard: only claim this candidate if it isn't already linked to a
+        # DIFFERENT video. Without this check, a duplicate-row rescan could
+        # silently overwrite one side of an already-correct pair (D-06 concern).
+        if candidate["paired_video_id"] not in (None, video_id):
+            log.info(
+                "link_lens_pair: candidate %s for %s already paired elsewhere — left unpaired",
+                pair_id, filename,
+            )
+            conn.execute(
+                "UPDATE videos SET lens_index=? WHERE id=?", (lens_index, video_id)
             )
             return None
 
-        # Link both rows to each other
         conn.execute(
             "UPDATE videos SET paired_video_id=?, lens_index=? WHERE id=?",
             (pair_id, lens_index, video_id),
@@ -416,10 +441,9 @@ def link_lens_pair(video_id: int, filename: str) -> Optional[int]:
             "UPDATE videos SET paired_video_id=? WHERE id=? AND paired_video_id IS NULL",
             (video_id, pair_id),
         )
-        # Also set lens_index on the pair if not already set
-        p2 = parse_dual_lens_filename(
-            conn.execute("SELECT filename FROM videos WHERE id=?", (pair_id,)).fetchone()["filename"]
-        )
+        # Also set lens_index on the pair if not already set, sourced from the
+        # already-fetched candidate row (no extra round-trip).
+        p2 = parse_dual_lens_filename(candidate["filename"])
         if p2:
             conn.execute(
                 "UPDATE videos SET lens_index=? WHERE id=? AND lens_index IS NULL",
