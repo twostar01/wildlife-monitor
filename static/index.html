@@ -169,6 +169,7 @@
   .dual-video-wrap video { width: 100%; border-radius: 6px; background: #000; }
   .single-video-wrap video { width: 100%; border-radius: 6px; background: #000; max-height: 480px; }
   .lens-label { font-family: var(--font-mono); font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; margin-bottom: 4px; }
+  .autoplay-warning { font-size: 11px; color: var(--danger); margin-top: 4px; font-family: var(--font-mono); }
   @media (max-width: 600px) { .dual-video-wrap { grid-template-columns: 1fr; } }
   .btn-correct { background: transparent; color: var(--accent); border: 1px solid var(--accent); padding: 5px 12px; border-radius: 4px; font-size: 11px; cursor: pointer; font-family: var(--font-mono); }
   .btn-correct:hover { background: rgba(109,186,92,0.1); }
@@ -2364,6 +2365,19 @@ document.querySelectorAll('.modal-overlay').forEach(el => {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') document.querySelectorAll('.modal-overlay.open').forEach(m => closeModal(m.id));
 });
+
+// ── Dual-lens autoplay-blocked warning (D-11) ─────────────────────────────────
+function showAutoplayWarning(blockedEl) {
+  const wrap = blockedEl.closest('div');
+  if (wrap.querySelector('.autoplay-warning')) return; // don't stack duplicates
+  const banner = document.createElement('div');
+  banner.className = 'autoplay-warning';
+  banner.innerHTML = 'Playback blocked by browser — <button class="btn-correct" style="padding:2px 8px;font-size:10px">Resync</button>';
+  banner.querySelector('button').addEventListener('click', () => {
+    blockedEl.play().then(() => banner.remove()).catch(() => {});
+  });
+  wrap.appendChild(banner);
+}
 
 // ── Chart defaults ────────────────────────────────────────────────────────────
 function chartOpts({ legend = false } = {}) {
