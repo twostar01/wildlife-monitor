@@ -173,8 +173,14 @@ def _load_nas_config() -> dict:
             result["mounted"] = (r.returncode == 0)
     except Exception:
         pass
-    # Allowlist: only expose status and mount path — not NAS_HOST, NAS_SMB_USER, etc.
-    _EXPOSE_NAS_KEYS = {"configured", "mounted", "NAS_MOUNT"}
+    # Allowlist: protocol/host/share/subdirs describe the connection, not a
+    # credential, so the read-only dashboard card can show them (WR-02) —
+    # only the SMB username (and any password field) stays withheld.
+    _EXPOSE_NAS_KEYS = {
+        "configured", "mounted", "NAS_MOUNT",
+        "NAS_PROTOCOL", "NAS_HOST", "NAS_SHARE",
+        "NAS_VIDEO_SUBDIR", "NAS_ARCHIVE_SUBDIR",
+    }
     return {k: v for k, v in result.items() if k in _EXPOSE_NAS_KEYS}
 
 
