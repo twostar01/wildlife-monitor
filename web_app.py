@@ -213,7 +213,6 @@ def find_free_port(host: str, start: int = 8080, attempts: int = 20) -> int:
 def get_process_on_port(port: int) -> str:
     """Try to identify what's using a port (best-effort, Linux only)."""
     try:
-        import subprocess
         result = subprocess.run(
             ["ss", "-tlnp", f"sport = :{port}"],
             capture_output=True, text=True, timeout=3
@@ -221,7 +220,6 @@ def get_process_on_port(port: int) -> str:
         lines = [l for l in result.stdout.splitlines() if str(port) in l]
         if lines:
             # Extract process name from ss output if available
-            import re
             m = re.search(r'users:\(\("([^"]+)"', lines[0])
             if m:
                 return m.group(1)
