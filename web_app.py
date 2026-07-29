@@ -942,7 +942,7 @@ def api_get_settings():
 
 @app.post("/api/settings")
 def api_save_settings(body: ProcessingSettings):
-    data = body.dict()
+    data = body.model_dump()
     data = merge_preserved_password(data, _load_settings())
     data["country"] = data["country"].upper().strip()
     if data.get("smtp_server", "").strip():
@@ -972,7 +972,7 @@ def api_test_email(body: TestEmailRequest):
     # in the form, but a blank password field (which is how the form always
     # loads, per D-15) falls back to the stored password rather than
     # guaranteeing an authentication failure.
-    cfg = merge_preserved_password(body.dict(), _load_settings())
+    cfg = merge_preserved_password(body.model_dump(), _load_settings())
     error = validate_smtp_config(cfg)
     if error:
         return {"ok": False, "error": error}
