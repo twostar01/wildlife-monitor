@@ -32,6 +32,25 @@ example: `id=18518` (`filepath=NULL`, `processed_at=2026-04-24T12:10:21`) and `i
 `processed_at=2026-04-25T11:45:55`) share the identical filename — two DB rows for one physical
 file, ~23.5 hours apart.
 
+## Post-deploy update: this is a routine daily occurrence, not an occasional edge case
+
+Task 3's production checkpoint (2026-07-29) surfaced that this defect is far more frequent than
+the "manual catch-up run" framing above implied. A day-by-day count of duplicated filenames for
+`worldwatch` (the only dual-lens camera in production — `backwall` and the rest are traditional
+single-lens setups, confirmed by operator) shows **100-500+ duplicated filenames every day for
+months** (e.g. 237 on 2026-07-27, 274 on 2026-07-26, 510 on 2026-07-20), not an occasional
+catch-up artifact. Sampling the most recent `worldwatch` videos as of 2026-07-29 found every
+single one sitting in a 4-member group (2 duplicate rows per lens — one archived under a
+`blanks/` path, one under the main archive path), so the exactly-two-members rule correctly
+leaves them all unpaired.
+
+Practical consequence: a large fraction of `worldwatch` videos — especially recent ones — will
+show only one lens player in the dashboard until this is fixed, not as a bug but as the correct,
+safe behavior given dirty upstream data. The pairing code itself was verified working correctly
+against clean data (a duplicate-free pair from 2026-07-20 rendered both players as expected).
+This raises the practical priority of the suggested follow-up below, even though it remains out
+of phase 4's scope.
+
 ## Why it's out of scope for phase 4
 
 The defect never touches `paired_video_id` — it's upstream of the dual-lens pairing code paths
