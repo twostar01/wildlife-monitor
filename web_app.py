@@ -415,6 +415,15 @@ def api_gallery(
     page: int = Query(1, ge=1),
     per_page: int = Query(40, ge=1, le=100),
 ):
+    # Validated the same way api_timeline() validates its date_from/date_to
+    # (IN-01): this phase added a hash-routable gallery filter surface
+    # (#gallery?date_from=...) that operators can hand-edit or bookmark, so a
+    # typo'd date should return a clear 400 rather than silently producing
+    # "No detections match these filters".
+    if date_from and not _DATE_RE.match(date_from):
+        raise HTTPException(400, "date_from must be YYYY-MM-DD")
+    if date_to and not _DATE_RE.match(date_to):
+        raise HTTPException(400, "date_to must be YYYY-MM-DD")
     result = db.get_gallery(
         species_label=species, camera_name=camera, date_from=date_from,
         date_to=date_to, min_confidence=min_confidence,
