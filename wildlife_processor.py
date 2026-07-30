@@ -663,6 +663,7 @@ def process_videos(args):
         _finish_run(run_id, status, videos_done, run_detections, error_summary, cameras_seen, offline, args.data_dir)
         run_closed = True
 
+        log.info(f"  {duplicates_skipped} already-archived video(s) recognized, skipped.")
         log.info(f"Done. Launch dashboard: python web_app.py --data-dir {args.data_dir}")
     except Exception as e:
         log.error(f"Fatal error during processing: {e}")
