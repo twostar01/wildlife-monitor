@@ -246,10 +246,17 @@ def suite_storage_ui():
     if ok:
         passed += 1
 
-    # G2: fetches /api/runs/last in addition to /api/maintenance/storage.
+    # G2: fetches /api/runs/last (either the literal path or via the api()
+    # helper with the runs-last path) in addition to /api/maintenance/storage.
     case_id = "storage_ui/G2-runs-last-fetch"
-    ok = "/api/runs/last" in load_stats_body and "/api/maintenance/storage" in load_stats_body
-    _check(case_id, ok, f"runs_last_found={'/api/runs/last' in load_stats_body}, storage_found={'/api/maintenance/storage' in load_stats_body}")
+    runs_last_found = (
+        "/api/runs/last" in load_stats_body
+        or "api('/runs/last')" in load_stats_body
+        or 'api("/runs/last")' in load_stats_body
+    )
+    storage_found = "/api/maintenance/storage" in load_stats_body
+    ok = runs_last_found and storage_found
+    _check(case_id, ok, f"runs_last_found={runs_last_found}, storage_found={storage_found}")
     if ok:
         passed += 1
 
@@ -266,23 +273,32 @@ def suite_storage_ui():
         passed += 1
 
     # G4: never-ran branch uses a null-aware comparison on raw_cleanup_removed,
-    # not a falsy 0-is-never-ran check.
+    # not a falsy 0-is-never-ran check. Scan every occurrence (code may assign
+    # raw_cleanup_removed to an intermediate variable first, so the null-aware
+    # comparison may sit a line or two below the raw key rather than adjacent
+    # to it) and accept if any occurrence has a null-aware comparison nearby.
     case_id = "storage_ui/G4-null-aware-never-ran"
-    null_aware_patterns = [
-        "raw_cleanup_removed == null",
-        "raw_cleanup_removed === null",
-        "raw_cleanup_removed == undefined",
-        "raw_cleanup_removed === undefined",
-        "raw_cleanup_removed === null || ",
-        "== null",
-    ]
-    # Look for a null-aware check specifically tied to raw_cleanup_removed within
-    # a reasonable window of text.
-    removed_idx = load_stats_body.find("raw_cleanup_removed")
-    window = load_stats_body[max(0, removed_idx - 80):removed_idx + 120] if removed_idx != -1 else ""
-    has_null_aware = ("== null" in window) or ("=== null" in window) or ("=== undefined" in window) or ("== undefined" in window)
-    ok = removed_idx != -1 and has_null_aware
-    _check(case_id, ok, f"removed_idx={removed_idx}, window={window!r}")
+    occurrences = []
+    search_from = 0
+    while True:
+        idx = load_stats_body.find("raw_cleanup_removed", search_from)
+        if idx == -1:
+            break
+        occurrences.append(idx)
+        search_from = idx + 1
+    has_null_aware = False
+    checked_window = ""
+    for idx in occurrences:
+        window = load_stats_body[max(0, idx - 40):idx + 200]
+        if ("== null" in window) or ("=== null" in window) or ("=== undefined" in window) or ("== undefined" in window):
+            has_null_aware = True
+            checked_window = window
+            break
+    # Also require that no branch instead treats a 0 removed count as never-ran
+    # via a bare falsy check like `!rawRemoved` or `!run.raw_cleanup_removed`.
+    no_falsy_never_ran = "!rawRemoved" not in load_stats_body and "!run.raw_cleanup_removed" not in load_stats_body
+    ok = len(occurrences) > 0 and has_null_aware and no_falsy_never_ran
+    _check(case_id, ok, f"occurrences={occurrences}, has_null_aware={has_null_aware}, no_falsy_never_ran={no_falsy_never_ran}, checked_window={checked_window!r}")
     if ok:
         passed += 1
 

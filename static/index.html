@@ -3013,8 +3013,19 @@ async function requeueBlacklisted(label) {
 async function loadStorageStats() {
   const el = document.getElementById('storageStats');
   el.innerHTML = '<div class="loading"><span class="spinner"></span>Loading…</div>';
-  const s = await fetch('/api/maintenance/storage').then(r => r.json()).catch(() => null);
+  const [s, run] = await Promise.all([
+    fetch('/api/maintenance/storage').then(r => r.json()).catch(() => null),
+    api('/runs/last').catch(() => null),
+  ]);
   if (!s) { el.innerHTML = '<div style="color:#e05c5c;font-size:12px">Failed to load storage stats.</div>'; return; }
+
+  // raw_cleanup_removed is NULL on every run row until raw cleanup has executed
+  // at least once, so this must be a null-aware check — a 0-removed clean run
+  // is a distinct, valid state from never-ran and must not fall into this branch.
+  const rawRemoved = run ? run.raw_cleanup_removed : null;
+  const rawCleanupNote = (rawRemoved === null || rawRemoved === undefined)
+    ? 'Raw recordings cleanup has not run yet.'
+    : `Last run: removed ${rawRemoved} raw file(s), reclaimed ${(run.raw_cleanup_gb || 0).toFixed(1)} GB, skipped ${run.raw_cleanup_skipped || 0}.`;
 
   el.innerHTML = `
     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px">
@@ -3034,7 +3045,12 @@ async function loadStorageStats() {
         <div class="stat-value" style="font-size:22px;color:var(--muted)">${s.purged_gb_reclaimed.toFixed(1)} GB</div>
         <div class="stat-label">Reclaimed (${s.purged_videos} purged)</div>
       </div>
-    </div>`;
+      <div class="stat-card" style="padding:14px">
+        <div class="stat-value" style="font-size:22px;color:var(--muted)">${s.raw_gb_reclaimed.toFixed(1)} GB</div>
+        <div class="stat-label">Raw recordings purged (${s.raw_purged_videos})</div>
+      </div>
+    </div>
+    <div id="rawCleanupNote" style="font-size:11px;color:var(--muted);margin-top:6px">${escHtml(rawCleanupNote)}</div>`;
 }
 
 async function previewPurge() {
