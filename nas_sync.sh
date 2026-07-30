@@ -430,7 +430,7 @@ rows = conn.execute(
     "SELECT id, filepath, camera_name, recorded_at, filename FROM videos WHERE kept=1"
 ).fetchall()
 
-archived = skipped = failed = already_archived = 0
+archived = duplicate_recognized = skipped = failed = already_archived = 0
 
 for row in rows:
     if not row["filepath"]:
@@ -469,10 +469,12 @@ for row in rows:
     # If destination already exists, just update the DB path — don't re-move
     if dest_path.exists():
         # Clear any other record pointing here first to avoid UNIQUE conflict
-        conn.execute(
+        collision_cur = conn.execute(
             "UPDATE videos SET filepath=NULL, file_purged_at=? WHERE filepath=? AND id!=?",
             (datetime.now().isoformat(), str(dest_path), row["id"]),
         )
+        if collision_cur.rowcount > 0:
+            duplicate_recognized += collision_cur.rowcount
         conn.execute("UPDATE videos SET filepath=? WHERE id=?",
                      (str(dest_path), row["id"]))
         conn.commit()
@@ -486,10 +488,12 @@ for row in rows:
         src_atime = src_stat.st_atime
         shutil.move(str(local_path), str(dest_path))
         os.utime(str(dest_path), (src_atime, dt.timestamp()))
-        conn.execute(
+        collision_cur = conn.execute(
             "UPDATE videos SET filepath=NULL, file_purged_at=? WHERE filepath=? AND id!=?",
             (datetime.now().isoformat(), str(dest_path), row["id"]),
         )
+        if collision_cur.rowcount > 0:
+            duplicate_recognized += collision_cur.rowcount
         conn.execute("UPDATE videos SET filepath=? WHERE id=?",
                      (str(dest_path), row["id"]))
         conn.commit()
@@ -502,7 +506,7 @@ for row in rows:
 
 conn.close()
 
-print(f"\n  Archived: {archived}   Already done: {already_archived}   Skipped: {skipped}   Failed: {failed}")
+print(f"\n  Archived: {archived}   Already done: {already_archived}   Skipped: {skipped}   Failed: {failed}   Duplicates reconciled: {duplicate_recognized}")
 if failed:
     sys.exit(1)
 PYEOF
@@ -545,7 +549,7 @@ rows = conn.execute("""
       AND file_purged_at IS NULL
 """).fetchall()
 
-archived = skipped = failed = already_archived = 0
+archived = duplicate_recognized = skipped = failed = already_archived = 0
 
 for row in rows:
     if not row["filepath"]:
@@ -577,10 +581,12 @@ for row in rows:
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     if dest_path.exists():
-        conn.execute(
+        collision_cur = conn.execute(
             "UPDATE videos SET filepath=NULL, file_purged_at=? WHERE filepath=? AND id!=?",
             (datetime.now().isoformat(), str(dest_path), row["id"]),
         )
+        if collision_cur.rowcount > 0:
+            duplicate_recognized += collision_cur.rowcount
         conn.execute("UPDATE videos SET filepath=? WHERE id=?",
                      (str(dest_path), row["id"]))
         conn.commit()
@@ -593,10 +599,12 @@ for row in rows:
         src_atime = src_stat.st_atime
         shutil.move(str(local_path), str(dest_path))
         os.utime(str(dest_path), (src_atime, dt.timestamp()))
-        conn.execute(
+        collision_cur = conn.execute(
             "UPDATE videos SET filepath=NULL, file_purged_at=? WHERE filepath=? AND id!=?",
             (datetime.now().isoformat(), str(dest_path), row["id"]),
         )
+        if collision_cur.rowcount > 0:
+            duplicate_recognized += collision_cur.rowcount
         conn.execute("UPDATE videos SET filepath=? WHERE id=?",
                      (str(dest_path), row["id"]))
         conn.commit()
@@ -608,7 +616,7 @@ for row in rows:
         failed += 1
 
 conn.close()
-print(f"\n  Blank archived: {archived}   Already done: {already_archived}   Skipped: {skipped}   Failed: {failed}")
+print(f"\n  Blank archived: {archived}   Already done: {already_archived}   Skipped: {skipped}   Failed: {failed}   Duplicates reconciled: {duplicate_recognized}")
 if failed:
     sys.exit(1)
 PYEOF
