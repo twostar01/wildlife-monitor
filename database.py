@@ -805,7 +805,7 @@ def get_kept_video_paths() -> list:
 
 
 def _row_older_than(row, max_days) -> bool:
-    if not max_days:
+    if not max_days or max_days < 0:
         return False
     # A row with recorded_at NULL/malformed previously fell through to
     # the `except` below and was silently treated as "never old enough

@@ -3235,7 +3235,7 @@ function collectSettingsPayload() {
     blank_retention_gb:   parseFloat(document.getElementById('setBlankGb').value) || 0,
     kept_retention_days:  parseInt(document.getElementById('setKeptDays').value)  || 0,
     kept_retention_gb:    parseFloat(document.getElementById('setKeptGb').value)  || 0,
-    raw_recordings_retention_days: parseInt(document.getElementById('setRawRecordingsDays').value) || 0,
+    raw_recordings_retention_days: Math.max(0, parseInt(document.getElementById('setRawRecordingsDays').value) || 0),
     smtp_server:               document.getElementById('setSmtpServer').value.trim(),
     smtp_port:                 smtp_port,
     smtp_username:              document.getElementById('setSmtpUsername').value.trim(),
