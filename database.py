@@ -138,6 +138,11 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS idx_videos_recorded_at ON videos(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_videos_camera ON videos(camera_name);
+-- Non-unique: production carries 2-6 duplicate (filename, camera_name) rows per
+-- identity (04-DEFERRED.md), so a UNIQUE index is not viable. This index exists
+-- purely to keep the identity lookup in insert_video()/find_existing_video()
+-- fast against an 81k-row table (T-05-03).
+CREATE INDEX IF NOT EXISTS idx_videos_identity ON videos(filename, camera_name);
 CREATE INDEX IF NOT EXISTS idx_detections_video_id ON detections(video_id);
 CREATE INDEX IF NOT EXISTS idx_species_label ON species(label);
 CREATE INDEX IF NOT EXISTS idx_crops_quality ON crops(quality_score DESC);
@@ -269,6 +274,12 @@ def init_db(db_path: Optional[str] = None):
             """)
             conn.execute("PRAGMA foreign_keys=ON")   # restore after executescript resets pragma state
             log.info("DB migration: filepath NOT NULL constraint removed")
+            # The table rebuild above drops and recreates `videos` after
+            # executescript(SCHEMA) already ran, so the identity index would be
+            # missing for the remainder of this run. Re-execute it (idempotent).
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_videos_identity ON videos(filename, camera_name)"
+            )
 
         # Dual-lens pairing repair (SYNC-04, D-01/D-03/D-04): re-validates ALL
         # paired_video_id values on every init_db() call, inside this same
@@ -374,6 +385,61 @@ def insert_video(
             ),
         )
         return cur.fetchone()[0]
+
+
+def _find_existing_video_row(conn, filename: str, camera_name: Optional[str]):
+    """
+    Module-private identity lookup. Takes an already-open connection so
+    insert_video() can call this inside its own transaction without opening a
+    second one.
+
+    `camera_name IS ?` is SQLite's NULL-safe equality — a plain `=` never
+    matches a NULL camera_name and would silently fail the
+    identity/null-camera-matches-null case. `filename = ?` is exact equality,
+    never LIKE — this is what makes a percent sign or underscore in a filename
+    inert (identity/like-metacharacter-filename, threat T-05-01).
+
+    The ORDER BY clause below is the deterministic tie-break: rows with a live
+    filepath sort first (the expression is 0 for non-NULL), then lowest id;
+    because id is unique the total order is total, so repeated calls always
+    return the same row. The tie-break exists because production carries 2-6
+    rows per identity and repair is out of scope for v1.1.
+    """
+    return conn.execute(
+        "SELECT id, filename, filepath, camera_name, file_purged_at FROM videos "
+        "WHERE filename = ? AND camera_name IS ? "
+        "ORDER BY (filepath IS NULL), id LIMIT 1",
+        (filename, camera_name),
+    ).fetchone()
+
+
+def find_existing_video(filename: str, camera_name: Optional[str]):
+    """Public wrapper around _find_existing_video_row(). Returns the
+    deterministic matching row for (filename, camera_name), or None."""
+    with get_conn() as conn:
+        return _find_existing_video_row(conn, filename, camera_name)
+
+
+def find_archived_duplicate(filename: str, camera_name: Optional[str], candidate_filepath: str):
+    """
+    Guard predicate: a return value means "this physical file already has a
+    row recorded at a different location (archived or purged), so re-doing
+    work for it is wasted". None means "either unknown, or the same still-
+    staged file".
+
+    Does not compare against the NAS archive root or any configured path
+    prefix — path-differs is the signal, because nas_sync.sh writes both a
+    main-archive path and a blanks/ path and process_videos() has no
+    archive-root argument. A NULL stored filepath compares unequal to any
+    candidate string and therefore returns the row — that is the
+    purged/archived case and is intended.
+    """
+    existing = find_existing_video(filename, camera_name)
+    if existing is None:
+        return None
+    if existing["filepath"] == candidate_filepath:
+        return None
+    return existing
 
 
 def parse_dual_lens_filename(filename: str) -> Optional[tuple]:
