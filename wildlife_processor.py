@@ -18,7 +18,7 @@ import cv2
 
 from database import (
     init_db, insert_video, insert_detection, insert_species, insert_crop,
-    link_lens_pair, parse_dual_lens_filename,
+    link_lens_pair, parse_dual_lens_filename, find_archived_duplicate,
     record_run_start, record_run_end, get_camera_offline_flags, get_run_by_id,
 )
 from notifications import decide_run_alert, format_run_alert, send_notification_email
@@ -453,6 +453,7 @@ def process_videos(args):
     # whichever run touched it last.
     video_errors = 0
     videos_done = 0
+    duplicates_skipped = 0
     run_detections = 0
     cameras_seen = {}
     run_closed = False
@@ -495,6 +496,7 @@ def process_videos(args):
         for i, video_path in enumerate(videos, 1):
             video_detections = 0
             video_failed = False
+            video_skipped = False
             camera_name = None
             try:
                 log.info(f"[{i}/{total}] → {video_path.name}")
@@ -506,6 +508,14 @@ def process_videos(args):
                 camera_name = extract_camera_name(video_path, args.video_dir)
                 if camera_name:
                     log.info(f"  Camera: {camera_name}")
+
+                duplicate = find_archived_duplicate(video_path.name, camera_name, str(video_path))
+                if duplicate is not None:
+                    log.info(f"  Already archived as row id={duplicate['id']} — recognized duplicate, skipping")
+                    duplicates_skipped += 1
+                    video_skipped = True
+                    continue
+
                 thumb       = extract_thumbnail(video_path, thumb_dir, camera_name)
                 has_animal = has_person = False
 
@@ -639,7 +649,7 @@ def process_videos(args):
                 video_errors += 1
                 video_failed = True
             finally:
-                if not video_failed:
+                if not video_failed and not video_skipped:
                     videos_done += 1
                     run_detections += video_detections
                     cam_key = camera_name or "(unknown)"
