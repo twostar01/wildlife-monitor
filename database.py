@@ -63,7 +63,8 @@ CREATE TABLE IF NOT EXISTS videos (
     file_purged_at  TEXT,           -- ISO datetime when video file was deleted (record kept)
     lens_index      INTEGER,        -- 0 = wide/fixed, 1 = telephoto/adjustable, NULL = unknown
     paired_video_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,  -- id of the other lens for dual-lens cameras
-    needs_reprocess INTEGER DEFAULT 0
+    needs_reprocess INTEGER DEFAULT 0,
+    raw_purged_at   TEXT            -- ISO datetime when the NAS raw_recordings source file was deleted (cumulative)
 );
 
 CREATE TABLE IF NOT EXISTS detections (
@@ -133,7 +134,10 @@ CREATE TABLE IF NOT EXISTS runs (
     detections_found      INTEGER DEFAULT 0,
     error_summary         TEXT,
     cameras_json          TEXT,                                -- {"CameraName": {"videos": n, "detections": n}, ...}
-    offline_cameras_json  TEXT                                 -- ["CameraName", ...] flagged as possibly offline this run
+    offline_cameras_json  TEXT,                                -- ["CameraName", ...] flagged as possibly offline this run
+    raw_cleanup_removed   INTEGER,                             -- raw_recordings files removed this run (NULL = no cleanup run yet)
+    raw_cleanup_gb        REAL,                                -- GB reclaimed by raw_recordings cleanup this run
+    raw_cleanup_skipped   INTEGER                              -- raw_recordings files skipped (failed verification) this run
 );
 
 CREATE INDEX IF NOT EXISTS idx_videos_recorded_at ON videos(recorded_at);
@@ -178,6 +182,16 @@ ALTER TABLE videos ADD COLUMN needs_reprocess INTEGER DEFAULT 0;
 
 MIGRATION_ADD_CANDIDATES = """
 ALTER TABLE species ADD COLUMN top_candidates_json TEXT;
+"""
+
+MIGRATION_ADD_RAW_PURGED = """
+ALTER TABLE videos ADD COLUMN raw_purged_at TEXT;
+"""
+
+MIGRATION_ADD_RAW_CLEANUP_STATS = """
+ALTER TABLE runs ADD COLUMN raw_cleanup_removed INTEGER;
+ALTER TABLE runs ADD COLUMN raw_cleanup_gb REAL;
+ALTER TABLE runs ADD COLUMN raw_cleanup_skipped INTEGER;
 """
 
 # Labels to exclude from all dashboard queries.
@@ -231,6 +245,11 @@ def init_db(db_path: Optional[str] = None):
             conn.executescript(MIGRATION_ADD_CANDIDATES)
         if "needs_reprocess" not in cols:
             conn.executescript(MIGRATION_ADD_REPROCESS)
+        if "raw_purged_at" not in cols:
+            conn.executescript(MIGRATION_ADD_RAW_PURGED)
+        run_cols = [r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()]
+        if "raw_cleanup_removed" not in run_cols:
+            conn.executescript(MIGRATION_ADD_RAW_CLEANUP_STATS)
         # Migration: drop NOT NULL constraint on filepath so purged/blank records can have NULL
         filepath_notnull = next(
             (r[3] for r in conn.execute("PRAGMA table_info(videos)").fetchall() if r[1] == "filepath"), 0
@@ -256,18 +275,21 @@ def init_db(db_path: Optional[str] = None):
                     file_purged_at  TEXT,
                     lens_index      INTEGER,
                     paired_video_id INTEGER REFERENCES videos_new(id) ON DELETE SET NULL,
-                    needs_reprocess INTEGER DEFAULT 0
+                    needs_reprocess INTEGER DEFAULT 0,
+                    raw_purged_at   TEXT
                 );
                 INSERT INTO videos_new (
                     id, filename, filepath, camera_name, file_size_mb, duration_secs,
                     recorded_at, processed_at, has_animal, has_person, kept, thumbnail_path,
-                    frame_count, file_purged_at, lens_index, paired_video_id, needs_reprocess
+                    frame_count, file_purged_at, lens_index, paired_video_id, needs_reprocess,
+                    raw_purged_at
                 )
                 SELECT
                     id, filename, filepath, camera_name, file_size_mb, duration_secs,
                     recorded_at, processed_at, has_animal, has_person, kept, thumbnail_path,
                     frame_count, file_purged_at, lens_index, paired_video_id,
-                    COALESCE(needs_reprocess, 0)
+                    COALESCE(needs_reprocess, 0),
+                    raw_purged_at
                 FROM videos;
                 DROP TABLE videos;
                 ALTER TABLE videos_new RENAME TO videos;
