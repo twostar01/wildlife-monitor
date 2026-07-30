@@ -654,13 +654,27 @@ def suite_source():
     if ok:
         passed += 1
 
-    # SRC5 (no hard failure): no sys.exit inside the block's extent, and no
-    # RAW_CLEANUP_EXIT shell guard exists anywhere in the file.
+    # SRC5 (no hard failure): no sys.exit inside the block's extent, and if a
+    # RAW_CLEANUP_EXIT shell guard exists it must never call `exit` on
+    # failure — it should warn and fall through to the retention-purge
+    # block, unlike ARCHIVE_EXIT/BLANK_ARCHIVE_EXIT which do `exit 1`
+    # (WR-01 fix: the guard now inspects the heredoc's exit code so a crash
+    # inside the block is surfaced with a warning instead of silently
+    # aborting under set -e, but it still can never fail the nightly
+    # systemd unit).
     case_id = "source/SRC5-no-hard-failure"
     no_sys_exit = not any("sys.exit" in l for l in block_lines)
-    no_exit_guard = not any("RAW_CLEANUP_EXIT" in l for l in lines)
-    ok = bool(block_lines) and no_sys_exit and no_exit_guard
-    _check(case_id, ok, f"no_sys_exit={no_sys_exit}, no_exit_guard={no_exit_guard}")
+    exit_guard_idxs = [i for i, l in enumerate(lines) if "RAW_CLEANUP_EXIT=" in l]
+    if exit_guard_idxs:
+        guard_start = exit_guard_idxs[0]
+        guard_end = _find_index(lines, lambda l: l.strip() == "", start=guard_start)
+        guard_end = guard_end if guard_end != -1 else len(lines)
+        guard_block = lines[guard_start:guard_end]
+        guard_never_exits = not any("exit" in l for l in guard_block)
+    else:
+        guard_never_exits = True
+    ok = bool(block_lines) and no_sys_exit and guard_never_exits
+    _check(case_id, ok, f"no_sys_exit={no_sys_exit}, guard_never_exits={guard_never_exits}")
     if ok:
         passed += 1
 

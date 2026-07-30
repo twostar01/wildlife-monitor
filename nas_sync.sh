@@ -724,7 +724,9 @@ else:
                 return (None, "size_mismatch")
 
             return (raw_path, "ok")
-        except OSError:
+        except (OSError, RuntimeError):
+            # RuntimeError covers Path.resolve() raising "Symlink loop from ..."
+            # on a circular symlink on the NAS mount — must not crash the run.
             return (None, "io_error")
     # <<< raw-cleanup-verify-fns
 
@@ -764,10 +766,17 @@ else:
                 reason_counts["io_error"] = reason_counts.get("io_error", 0) + 1
                 continue
 
-            mark_raw_purged(row["id"])
+            try:
+                mark_raw_purged(row["id"])
+            except Exception as e:
+                # DB errors (e.g. "database is locked") must not abort the loop
+                # or the script — the file is already gone, so crashing here
+                # would only lose the run without undoing the deletion. Count
+                # it as removed and flag for a follow-up reconciliation pass.
+                print(f"  ✗  Deleted {raw_path} but failed to record purge: {e}", file=sys.stderr)
             removed += 1
             freed_bytes += size
-        except OSError as e:
+        except (OSError, RuntimeError) as e:
             print(f"  ✗  Unexpected filesystem error for {row.get('filepath')}: {e}", file=sys.stderr)
             skipped += 1
             reason_counts["io_error"] = reason_counts.get("io_error", 0) + 1
@@ -775,9 +784,15 @@ else:
     gb_reclaimed = freed_bytes / (1024 ** 3)
 
     if not dry_run:
-        last_run = get_last_run()
-        if last_run is not None:
-            record_raw_cleanup_stats(last_run["id"], removed, gb_reclaimed, skipped)
+        try:
+            last_run = get_last_run()
+            if last_run is not None:
+                record_raw_cleanup_stats(last_run["id"], removed, gb_reclaimed, skipped)
+        except Exception as e:
+            # A DB error here (e.g. contention from the concurrently-running
+            # dashboard) must not abort the block — deletions already
+            # happened; only the run-summary bookkeeping would be incomplete.
+            print(f"  ✗  Raw cleanup succeeded but failed to record run stats: {e}", file=sys.stderr)
 
     dry_run_label = "  [DRY RUN — nothing deleted]" if dry_run else ""
     print(f"\n  Raw cleanup: {removed} removed   {skipped} skipped (verification failed)   {gb_reclaimed:.2f} GB reclaimed{dry_run_label}")
@@ -785,6 +800,11 @@ else:
         breakdown = "   ".join(f"{k}: {v}" for k, v in sorted(reason_counts.items()))
         print(f"  Skip reasons: {breakdown}")
 PYEOF
+
+        RAW_CLEANUP_EXIT=$?
+        if [[ "$RAW_CLEANUP_EXIT" -ne 0 ]]; then
+            warn "Raw recordings cleanup encountered an unexpected error (see above). Continuing to retention purge."
+        fi
 
         echo ""
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
