@@ -365,6 +365,24 @@ def record_run_end(
         )
 
 
+def record_raw_cleanup_stats(run_id: Optional[int], removed: int, gb_reclaimed: float, skipped: int) -> None:
+    """
+    Record this run's raw_recordings cleanup outcome on its `runs` row.
+    Touches only the three raw_cleanup_* columns — no other runs column.
+
+    A no-op when run_id is None, so a caller running against a database with
+    no recorded runs (e.g. an early/edge-case invocation) does not raise.
+    """
+    if run_id is None:
+        return
+    with get_conn() as conn:
+        conn.execute(
+            """UPDATE runs SET raw_cleanup_removed=?, raw_cleanup_gb=?, raw_cleanup_skipped=?
+               WHERE id=?""",
+            (removed, gb_reclaimed, skipped, run_id),
+        )
+
+
 def insert_video(
     filename: str,
     filepath: str,
@@ -786,6 +804,26 @@ def get_kept_video_paths() -> list:
         return [dict(r) for r in rows]
 
 
+def _row_older_than(row, max_days) -> bool:
+    if not max_days:
+        return False
+    # A row with recorded_at NULL/malformed previously fell through to
+    # the `except` below and was silently treated as "never old enough
+    # to purge" — such rows could only ever be purged via the storage-
+    # size limit, and would accumulate forever if an operator configures
+    # only a day-based limit (IN-05). Fall back to processed_at (always
+    # NOT NULL) so the row is still subject to age-based purging.
+    try:
+        dt = datetime.fromisoformat(row["recorded_at"])
+    except (ValueError, TypeError):
+        try:
+            dt = datetime.fromisoformat(row["processed_at"])
+        except (ValueError, TypeError):
+            return False
+    age_days = (datetime.now() - dt).days
+    return age_days > max_days
+
+
 def get_purgeable_videos(
     blank_days: Optional[int],
     blank_gb: Optional[float],
@@ -828,23 +866,10 @@ def get_purgeable_videos(
         """, (grace_cutoff,)).fetchall()
 
     def should_purge_by_age(row, max_days):
-        if not max_days:
-            return False
-        # A row with recorded_at NULL/malformed previously fell through to
-        # the `except` below and was silently treated as "never old enough
-        # to purge" — such rows could only ever be purged via the storage-
-        # size limit, and would accumulate forever if an operator configures
-        # only a day-based limit (IN-05). Fall back to processed_at (always
-        # NOT NULL) so the row is still subject to age-based purging.
-        try:
-            dt = datetime.fromisoformat(row["recorded_at"])
-        except (ValueError, TypeError):
-            try:
-                dt = datetime.fromisoformat(row["processed_at"])
-            except (ValueError, TypeError):
-                return False
-        age_days = (datetime.now() - dt).days
-        return age_days > max_days
+        # Delegates to the module-level _row_older_than() so there is exactly
+        # one implementation of the recorded_at -> processed_at fallback
+        # (also reused by get_raw_cleanup_candidates()).
+        return _row_older_than(row, max_days)
 
     def apply_limits(rows, max_days, max_gb):
         """Return rows that should be purged based on age and/or storage limits."""
@@ -882,6 +907,40 @@ def get_purgeable_videos(
     }
 
 
+def get_raw_cleanup_candidates(retention_days: int) -> list[dict]:
+    """
+    Return videos rows whose archived copy is old enough that the NAS
+    raw_recordings source file should be verified-and-deleted.
+
+    These are candidates only — the caller (nas_sync.sh) performs archive-
+    existence and byte-size verification (CLEANUP-02, D-03/D-04) before
+    deleting anything. This function never touches the filesystem.
+
+    A single unified query (no kept/blank split) is used deliberately:
+    CLEANUP-01 is one retention setting, not two — every row with a live
+    archive copy is a candidate under the same raw_recordings_retention_days
+    setting, unlike get_purgeable_videos()'s blank/kept split which has two
+    different retention knobs.
+
+    Mirrors _row_older_than()'s recorded_at -> processed_at fallback so the
+    IN-05 bug class (rows silently never purged when recorded_at is NULL/
+    malformed) is not reintroduced here.
+    """
+    if not retention_days:
+        return []
+    with get_conn() as conn:
+        rows = conn.execute("""
+            SELECT id, filepath, filename, camera_name, recorded_at,
+                   processed_at, file_size_mb
+            FROM videos
+            WHERE filepath IS NOT NULL
+              AND file_purged_at IS NULL
+              AND raw_purged_at IS NULL
+            ORDER BY recorded_at ASC
+        """).fetchall()
+    return [dict(r) for r in rows if _row_older_than(r, retention_days)]
+
+
 def purge_video_file(video_id: int) -> bool:
     """
     Delete the physical video file and null out filepath in the database.
@@ -915,6 +974,23 @@ def purge_video_file(video_id: int) -> bool:
             (datetime.now().isoformat(), video_id),
         )
         return deleted
+
+
+def mark_raw_purged(video_id: int) -> None:
+    """
+    Stamp videos.raw_purged_at for a row whose NAS raw_recordings source file
+    was just deleted by the caller.
+
+    Unlike purge_video_file(), this does NOT touch filepath or file_purged_at:
+    the file being deleted lives at a path reconstructed by the caller (never
+    stored in the DB), and filepath still legitimately points at the
+    surviving archive copy, which must remain addressable after this call.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE videos SET raw_purged_at=? WHERE id=?",
+            (datetime.now().isoformat(), video_id),
+        )
 
 
 def get_blank_videos(
@@ -1226,6 +1302,12 @@ def get_storage_stats() -> dict:
             FROM videos WHERE file_purged_at IS NOT NULL
         """).fetchone()
 
+        raw = conn.execute("""
+            SELECT COUNT(*) as count,
+                   COALESCE(SUM(file_size_mb), 0) as total_mb
+            FROM videos WHERE raw_purged_at IS NOT NULL
+        """).fetchone()
+
     return {
         "blank_videos":        blank["count"],
         "blank_gb":            round(blank["total_mb"] / 1024, 2),
@@ -1234,6 +1316,8 @@ def get_storage_stats() -> dict:
         "purged_videos":       purged["count"],
         "purged_gb_reclaimed": round(purged["total_mb"] / 1024, 2),
         "total_active_gb":     round((blank["total_mb"] + kept["total_mb"]) / 1024, 2),
+        "raw_purged_videos":   raw["count"],
+        "raw_gb_reclaimed":    round(raw["total_mb"] / 1024, 2),
     }
 
 
