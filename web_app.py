@@ -86,6 +86,8 @@ DEFAULT_PROCESSING_SETTINGS = {
     # Retention — kept videos (animal/person detected)
     "kept_retention_days":    730,
     "kept_retention_gb":      500.0,
+    # Retention — NAS raw_recordings source files (CLEANUP-01, D-08)
+    "raw_recordings_retention_days": 14,
     # Notifications — SMTP alerting (NOTIFY-03)
     "smtp_server":              "",
     "smtp_port":                None,
@@ -923,6 +925,7 @@ class ProcessingSettings(BaseModel):
     blank_retention_gb:     float = 20.0
     kept_retention_days:    int   = 730
     kept_retention_gb:      float = 500.0
+    raw_recordings_retention_days: int = 14
     smtp_server:              str           = ""
     smtp_port:                Optional[int] = None
     smtp_username:             str          = ""
