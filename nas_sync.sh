@@ -469,9 +469,10 @@ for row in rows:
     # If destination already exists, just update the DB path — don't re-move
     if dest_path.exists():
         # Clear any other record pointing here first to avoid UNIQUE conflict
-        conn.execute("UPDATE videos SET filepath=NULL WHERE filepath=? AND id!=?",
-                     (str(dest_path), row["id"]))
-        conn.commit()
+        conn.execute(
+            "UPDATE videos SET filepath=NULL, file_purged_at=? WHERE filepath=? AND id!=?",
+            (datetime.now().isoformat(), str(dest_path), row["id"]),
+        )
         conn.execute("UPDATE videos SET filepath=? WHERE id=?",
                      (str(dest_path), row["id"]))
         conn.commit()
@@ -485,9 +486,10 @@ for row in rows:
         src_atime = src_stat.st_atime
         shutil.move(str(local_path), str(dest_path))
         os.utime(str(dest_path), (src_atime, dt.timestamp()))
-        conn.execute("UPDATE videos SET filepath=NULL WHERE filepath=? AND id!=?",
-                     (str(dest_path), row["id"]))
-        conn.commit()
+        conn.execute(
+            "UPDATE videos SET filepath=NULL, file_purged_at=? WHERE filepath=? AND id!=?",
+            (datetime.now().isoformat(), str(dest_path), row["id"]),
+        )
         conn.execute("UPDATE videos SET filepath=? WHERE id=?",
                      (str(dest_path), row["id"]))
         conn.commit()
@@ -575,9 +577,10 @@ for row in rows:
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     if dest_path.exists():
-        conn.execute("UPDATE videos SET filepath=NULL WHERE filepath=? AND id!=?",
-                     (str(dest_path), row["id"]))
-        conn.commit()
+        conn.execute(
+            "UPDATE videos SET filepath=NULL, file_purged_at=? WHERE filepath=? AND id!=?",
+            (datetime.now().isoformat(), str(dest_path), row["id"]),
+        )
         conn.execute("UPDATE videos SET filepath=? WHERE id=?",
                      (str(dest_path), row["id"]))
         conn.commit()
@@ -590,9 +593,10 @@ for row in rows:
         src_atime = src_stat.st_atime
         shutil.move(str(local_path), str(dest_path))
         os.utime(str(dest_path), (src_atime, dt.timestamp()))
-        conn.execute("UPDATE videos SET filepath=NULL WHERE filepath=? AND id!=?",
-                     (str(dest_path), row["id"]))
-        conn.commit()
+        conn.execute(
+            "UPDATE videos SET filepath=NULL, file_purged_at=? WHERE filepath=? AND id!=?",
+            (datetime.now().isoformat(), str(dest_path), row["id"]),
+        )
         conn.execute("UPDATE videos SET filepath=? WHERE id=?",
                      (str(dest_path), row["id"]))
         conn.commit()
