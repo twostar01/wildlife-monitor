@@ -357,34 +357,92 @@ def insert_video(
     frame_count: int,
     lens_index: Optional[int] = None,
 ) -> int:
+    """
+    Insert or update a video row. The dedup key is (filename, camera_name) per
+    D-03, not filepath — a staging path is not stable file identity across
+    archive moves (DEDUP-01). The returned id may be a pre-existing row's id,
+    so callers must not assume a fresh row.
+    """
     with get_conn() as conn:
-        cur = conn.execute(
-            """INSERT INTO videos
-               (filename, filepath, camera_name, file_size_mb, duration_secs, recorded_at,
-                processed_at, has_animal, has_person, kept, thumbnail_path, frame_count, lens_index)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(filepath) DO UPDATE SET
-                 filename=excluded.filename,
-                 camera_name=excluded.camera_name,
-                 file_size_mb=excluded.file_size_mb,
-                 duration_secs=excluded.duration_secs,
-                 recorded_at=excluded.recorded_at,
-                 processed_at=excluded.processed_at,
-                 has_animal=excluded.has_animal,
-                 has_person=excluded.has_person,
-                 kept=excluded.kept,
-                 thumbnail_path=excluded.thumbnail_path,
-                 frame_count=excluded.frame_count,
-                 lens_index=excluded.lens_index
-               RETURNING id""",
+        # Take the write lock before the identity read so a second concurrent
+        # writer can't also miss the lookup and also insert (threat T-05-02).
+        # get_conn() yields a fresh connection on which only PRAGMAs have run,
+        # so no transaction is open yet and this explicit begin-immediate call
+        # is valid. get_conn()'s trailing conn.commit() closes this transaction.
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("BEGIN IMMEDIATE")
+
+        existing = _find_existing_video_row(conn, filename, camera_name)
+
+        if existing is None:
+            # No identity match — insert. The upsert clause below is retained
+            # as the hard backstop for the filepath UNIQUE constraint: if a
+            # concurrent writer inserted the same path between this
+            # transaction's start and this insert, this degrades to an
+            # in-place update instead of crashing with an IntegrityError.
+            cur = conn.execute(
+                """INSERT INTO videos
+                   (filename, filepath, camera_name, file_size_mb, duration_secs, recorded_at,
+                    processed_at, has_animal, has_person, kept, thumbnail_path, frame_count, lens_index)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(filepath) DO UPDATE SET
+                     filename=excluded.filename,
+                     camera_name=excluded.camera_name,
+                     file_size_mb=excluded.file_size_mb,
+                     duration_secs=excluded.duration_secs,
+                     recorded_at=excluded.recorded_at,
+                     processed_at=excluded.processed_at,
+                     has_animal=excluded.has_animal,
+                     has_person=excluded.has_person,
+                     kept=excluded.kept,
+                     thumbnail_path=excluded.thumbnail_path,
+                     frame_count=excluded.frame_count,
+                     lens_index=excluded.lens_index
+                   RETURNING id""",
+                (
+                    filename, filepath, camera_name, file_size_mb, duration_secs, recorded_at,
+                    datetime.now().isoformat(),
+                    int(has_animal), int(has_person), int(kept),
+                    thumbnail_path, frame_count, lens_index,
+                ),
+            )
+            return cur.fetchone()[0]
+
+        # Identity match — do not insert. Update metadata on the matched row.
+        conn.execute(
+            """UPDATE videos SET
+                 camera_name=?, file_size_mb=?, duration_secs=?, recorded_at=?,
+                 processed_at=?, has_animal=?, has_person=?, kept=?,
+                 thumbnail_path=?, frame_count=?, lens_index=?
+               WHERE id=?""",
             (
-                filename, filepath, camera_name, file_size_mb, duration_secs, recorded_at,
+                camera_name, file_size_mb, duration_secs, recorded_at,
                 datetime.now().isoformat(),
                 int(has_animal), int(has_person), int(kept),
                 thumbnail_path, frame_count, lens_index,
+                existing["id"],
             ),
         )
-        return cur.fetchone()[0]
+
+        # filepath and file_purged_at need their own rule — the most
+        # consequential decision in this function. Set filepath to the passed
+        # filepath only when the matched row has both filepath IS NULL and
+        # file_purged_at IS NULL — an un-located row that was never purged
+        # legitimately gains a location. In every other case leave both
+        # columns exactly as they are: a non-NULL path already on the row is
+        # the authoritative archived location and must win over a transient
+        # staging copy, and a purge marker must never be resurrected by
+        # re-pointing filepath. Never clear file_purged_at in this function.
+        # Leaving the staging path unreferenced here is safe because
+        # nas_sync.sh deletes local staging copies by directory sweep over its
+        # own file list (nas_sync.sh:618-636), not by DB reference.
+        if existing["filepath"] is None and existing["file_purged_at"] is None:
+            conn.execute(
+                "UPDATE videos SET filepath=? WHERE id=?",
+                (filepath, existing["id"]),
+            )
+
+        return existing["id"]
 
 
 def _find_existing_video_row(conn, filename: str, camera_name: Optional[str]):
