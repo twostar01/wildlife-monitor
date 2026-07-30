@@ -138,6 +138,11 @@ CREATE TABLE IF NOT EXISTS runs (
 
 CREATE INDEX IF NOT EXISTS idx_videos_recorded_at ON videos(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_videos_camera ON videos(camera_name);
+-- Non-unique: production carries 2-6 duplicate (filename, camera_name) rows per
+-- identity (04-DEFERRED.md), so a UNIQUE index is not viable. This index exists
+-- purely to keep the identity lookup in insert_video()/find_existing_video()
+-- fast against an 81k-row table (T-05-03).
+CREATE INDEX IF NOT EXISTS idx_videos_identity ON videos(filename, camera_name);
 CREATE INDEX IF NOT EXISTS idx_detections_video_id ON detections(video_id);
 CREATE INDEX IF NOT EXISTS idx_species_label ON species(label);
 CREATE INDEX IF NOT EXISTS idx_crops_quality ON crops(quality_score DESC);
@@ -269,6 +274,12 @@ def init_db(db_path: Optional[str] = None):
             """)
             conn.execute("PRAGMA foreign_keys=ON")   # restore after executescript resets pragma state
             log.info("DB migration: filepath NOT NULL constraint removed")
+            # The table rebuild above drops and recreates `videos` after
+            # executescript(SCHEMA) already ran, so the identity index would be
+            # missing for the remainder of this run. Re-execute it (idempotent).
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_videos_identity ON videos(filename, camera_name)"
+            )
 
         # Dual-lens pairing repair (SYNC-04, D-01/D-03/D-04): re-validates ALL
         # paired_video_id values on every init_db() call, inside this same
@@ -346,34 +357,147 @@ def insert_video(
     frame_count: int,
     lens_index: Optional[int] = None,
 ) -> int:
+    """
+    Insert or update a video row. The dedup key is (filename, camera_name) per
+    D-03, not filepath — a staging path is not stable file identity across
+    archive moves (DEDUP-01). The returned id may be a pre-existing row's id,
+    so callers must not assume a fresh row.
+    """
     with get_conn() as conn:
-        cur = conn.execute(
-            """INSERT INTO videos
-               (filename, filepath, camera_name, file_size_mb, duration_secs, recorded_at,
-                processed_at, has_animal, has_person, kept, thumbnail_path, frame_count, lens_index)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(filepath) DO UPDATE SET
-                 filename=excluded.filename,
-                 camera_name=excluded.camera_name,
-                 file_size_mb=excluded.file_size_mb,
-                 duration_secs=excluded.duration_secs,
-                 recorded_at=excluded.recorded_at,
-                 processed_at=excluded.processed_at,
-                 has_animal=excluded.has_animal,
-                 has_person=excluded.has_person,
-                 kept=excluded.kept,
-                 thumbnail_path=excluded.thumbnail_path,
-                 frame_count=excluded.frame_count,
-                 lens_index=excluded.lens_index
-               RETURNING id""",
+        # Take the write lock before the identity read so a second concurrent
+        # writer can't also miss the lookup and also insert (threat T-05-02).
+        # get_conn() yields a fresh connection on which only PRAGMAs have run,
+        # so no transaction is open yet and this explicit begin-immediate call
+        # is valid. get_conn()'s trailing conn.commit() closes this transaction.
+        conn.execute("PRAGMA busy_timeout=5000")
+        conn.execute("BEGIN IMMEDIATE")
+
+        existing = _find_existing_video_row(conn, filename, camera_name)
+
+        if existing is None:
+            # No identity match — insert. The upsert clause below is retained
+            # as the hard backstop for the filepath UNIQUE constraint: if a
+            # concurrent writer inserted the same path between this
+            # transaction's start and this insert, this degrades to an
+            # in-place update instead of crashing with an IntegrityError.
+            cur = conn.execute(
+                """INSERT INTO videos
+                   (filename, filepath, camera_name, file_size_mb, duration_secs, recorded_at,
+                    processed_at, has_animal, has_person, kept, thumbnail_path, frame_count, lens_index)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(filepath) DO UPDATE SET
+                     filename=excluded.filename,
+                     camera_name=excluded.camera_name,
+                     file_size_mb=excluded.file_size_mb,
+                     duration_secs=excluded.duration_secs,
+                     recorded_at=excluded.recorded_at,
+                     processed_at=excluded.processed_at,
+                     has_animal=excluded.has_animal,
+                     has_person=excluded.has_person,
+                     kept=excluded.kept,
+                     thumbnail_path=excluded.thumbnail_path,
+                     frame_count=excluded.frame_count,
+                     lens_index=excluded.lens_index
+                   RETURNING id""",
+                (
+                    filename, filepath, camera_name, file_size_mb, duration_secs, recorded_at,
+                    datetime.now().isoformat(),
+                    int(has_animal), int(has_person), int(kept),
+                    thumbnail_path, frame_count, lens_index,
+                ),
+            )
+            return cur.fetchone()[0]
+
+        # Identity match — do not insert. Update metadata on the matched row.
+        conn.execute(
+            """UPDATE videos SET
+                 camera_name=?, file_size_mb=?, duration_secs=?, recorded_at=?,
+                 processed_at=?, has_animal=?, has_person=?, kept=?,
+                 thumbnail_path=?, frame_count=?, lens_index=?
+               WHERE id=?""",
             (
-                filename, filepath, camera_name, file_size_mb, duration_secs, recorded_at,
+                camera_name, file_size_mb, duration_secs, recorded_at,
                 datetime.now().isoformat(),
                 int(has_animal), int(has_person), int(kept),
                 thumbnail_path, frame_count, lens_index,
+                existing["id"],
             ),
         )
-        return cur.fetchone()[0]
+
+        # filepath and file_purged_at need their own rule — the most
+        # consequential decision in this function. Set filepath to the passed
+        # filepath only when the matched row has both filepath IS NULL and
+        # file_purged_at IS NULL — an un-located row that was never purged
+        # legitimately gains a location. In every other case leave both
+        # columns exactly as they are: a non-NULL path already on the row is
+        # the authoritative archived location and must win over a transient
+        # staging copy, and a purge marker must never be resurrected by
+        # re-pointing filepath. Never clear file_purged_at in this function.
+        # Leaving the staging path unreferenced here is safe because
+        # nas_sync.sh deletes local staging copies by directory sweep over its
+        # own file list (nas_sync.sh:618-636), not by DB reference.
+        if existing["filepath"] is None and existing["file_purged_at"] is None:
+            conn.execute(
+                "UPDATE videos SET filepath=? WHERE id=?",
+                (filepath, existing["id"]),
+            )
+
+        return existing["id"]
+
+
+def _find_existing_video_row(conn, filename: str, camera_name: Optional[str]):
+    """
+    Module-private identity lookup. Takes an already-open connection so
+    insert_video() can call this inside its own transaction without opening a
+    second one.
+
+    `camera_name IS ?` is SQLite's NULL-safe equality — a plain `=` never
+    matches a NULL camera_name and would silently fail the
+    identity/null-camera-matches-null case. `filename = ?` is exact equality,
+    never LIKE — this is what makes a percent sign or underscore in a filename
+    inert (identity/like-metacharacter-filename, threat T-05-01).
+
+    The ORDER BY clause below is the deterministic tie-break: rows with a live
+    filepath sort first (the expression is 0 for non-NULL), then lowest id;
+    because id is unique the total order is total, so repeated calls always
+    return the same row. The tie-break exists because production carries 2-6
+    rows per identity and repair is out of scope for v1.1.
+    """
+    return conn.execute(
+        "SELECT id, filename, filepath, camera_name, file_purged_at FROM videos "
+        "WHERE filename = ? AND camera_name IS ? "
+        "ORDER BY (filepath IS NULL), id LIMIT 1",
+        (filename, camera_name),
+    ).fetchone()
+
+
+def find_existing_video(filename: str, camera_name: Optional[str]):
+    """Public wrapper around _find_existing_video_row(). Returns the
+    deterministic matching row for (filename, camera_name), or None."""
+    with get_conn() as conn:
+        return _find_existing_video_row(conn, filename, camera_name)
+
+
+def find_archived_duplicate(filename: str, camera_name: Optional[str], candidate_filepath: str):
+    """
+    Guard predicate: a return value means "this physical file already has a
+    row recorded at a different location (archived or purged), so re-doing
+    work for it is wasted". None means "either unknown, or the same still-
+    staged file".
+
+    Does not compare against the NAS archive root or any configured path
+    prefix — path-differs is the signal, because nas_sync.sh writes both a
+    main-archive path and a blanks/ path and process_videos() has no
+    archive-root argument. A NULL stored filepath compares unequal to any
+    candidate string and therefore returns the row — that is the
+    purged/archived case and is intended.
+    """
+    existing = find_existing_video(filename, camera_name)
+    if existing is None:
+        return None
+    if existing["filepath"] == candidate_filepath:
+        return None
+    return existing
 
 
 def parse_dual_lens_filename(filename: str) -> Optional[tuple]:
