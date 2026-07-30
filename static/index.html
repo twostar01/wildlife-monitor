@@ -788,14 +788,14 @@
           a purge. Set to 0 to disable a limit. Blank videos are archived to a blanks folder on the NAS
           and deleted when retention limits are reached.
         </p>
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:20px">
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px">
           <div>
             <div style="font-family:var(--font-mono);font-size:11px;color:var(--accent);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border)">
               Blank Videos <span style="color:var(--muted);font-size:10px">(no animal/person detected)</span>
             </div>
             <div class="setting-row">
               <label class="setting-label">Delete records after (days)</label>
-              <input class="setting-input" type="number" id="setBlankDays" min="0" style="width:100px">
+              <input class="setting-input" type="number" id="setBlankDays" min="0" style="width:100px" oninput="updateRawRetentionWarning()">
               <span class="setting-hint">Delete blank video files older than N days. Blank videos are archived to the NAS blanks folder and kept until this limit is reached. Default: 90.</span>
             </div>
             <div class="setting-row">
@@ -819,7 +819,18 @@
               <span class="setting-hint">Delete oldest kept videos when total exceeds this size. Default: 500 GB.</span>
             </div>
           </div>
+          <div>
+            <div style="font-family:var(--font-mono);font-size:11px;color:var(--accent);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid var(--border)">
+              Raw Recordings <span style="color:var(--muted);font-size:10px">(NAS source files, deleted after verified archiving)</span>
+            </div>
+            <div class="setting-row">
+              <label class="setting-label">Delete after (days)</label>
+              <input class="setting-input" type="number" id="setRawRecordingsDays" min="0" style="width:100px" oninput="updateRawRetentionWarning()">
+              <span class="setting-hint">Source files in the NAS raw_recordings folder are deleted N days after being archived and verified against the archive copy. Files that fail verification are retried on the next run. Default: 14. Set to 0 to disable.</span>
+            </div>
+          </div>
         </div>
+        <div id="rawRetentionWarning" style="display:none;font-size:11px;color:var(--gold);margin-top:10px"></div>
         <div style="margin-top:18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <button class="btn-save" onclick="saveSettings()">Save Retention Settings</button>
           <button class="btn-save" style="background:transparent;color:var(--gold);border-color:var(--gold)"
@@ -3111,6 +3122,8 @@ async function loadSettings() {
   document.getElementById('setBlankGb').value          = p.blank_retention_gb   ?? 20;
   document.getElementById('setKeptDays').value         = p.kept_retention_days  ?? 730;
   document.getElementById('setKeptGb').value           = p.kept_retention_gb    ?? 500;
+  document.getElementById('setRawRecordingsDays').value = p.raw_recordings_retention_days ?? 14;
+  updateRawRetentionWarning();
 
   document.getElementById('setRunTime').value          = p.run_time_hhmm ?? '06:00';
   state.loadedRunTimeHhmm = p.run_time_hhmm ?? '06:00';
@@ -3206,6 +3219,7 @@ function collectSettingsPayload() {
     blank_retention_gb:   parseFloat(document.getElementById('setBlankGb').value) || 0,
     kept_retention_days:  parseInt(document.getElementById('setKeptDays').value)  || 0,
     kept_retention_gb:    parseFloat(document.getElementById('setKeptGb').value)  || 0,
+    raw_recordings_retention_days: parseInt(document.getElementById('setRawRecordingsDays').value) || 0,
     smtp_server:               document.getElementById('setSmtpServer').value.trim(),
     smtp_port:                 smtp_port,
     smtp_username:              document.getElementById('setSmtpUsername').value.trim(),
@@ -3215,7 +3229,20 @@ function collectSettingsPayload() {
   };
 }
 
+function updateRawRetentionWarning() {
+  const warning = document.getElementById('rawRetentionWarning');
+  const rawDays   = parseInt(document.getElementById('setRawRecordingsDays').value) || 0;
+  const blankDays = parseInt(document.getElementById('setBlankDays').value)         || 0;
+  if (rawDays !== 0 && blankDays !== 0 && rawDays >= blankDays) {
+    warning.textContent = `⚠ Raw retention of ${rawDays} days should be shorter than blank retention of ${blankDays} days, otherwise the archive copy could be purged before a raw file is ever verified, permanently stranding it on the NAS — lower raw retention or raise blank retention.`;
+    warning.style.display = 'block';
+  } else {
+    warning.style.display = 'none';
+  }
+}
+
 async function saveSettings() {
+  updateRawRetentionWarning();
   const payload = collectSettingsPayload();
   const res = await fetch('/api/settings', {
     method: 'POST',

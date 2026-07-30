@@ -159,13 +159,15 @@ def suite_retention_ui():
 
     # R4: Retention Policy grid no longer fixed two-column, uses auto-fit minmax.
     case_id = "retention_ui/R4-grid-auto-fit"
-    # locate the grid declaration near the Retention Policy card — search for
-    # grid-template-columns using auto-fit / minmax in the vicinity of the
-    # Blank Videos header.
-    blank_idx = html.find("Blank Videos")
-    grid_region = html[max(0, blank_idx - 600):blank_idx] if blank_idx != -1 else ""
+    # Anchor on the Retention Policy card title (unique) rather than "Blank
+    # Videos" text, which also appears verbatim as an unrelated tab section
+    # title earlier in the file. Then locate the grid declaration between the
+    # card title and the sub-column header within that card.
+    card_idx = html.find("Retention Policy")
+    blank_idx = html.find("Blank Videos", card_idx) if card_idx != -1 else -1
+    grid_region = html[card_idx:blank_idx] if card_idx != -1 and blank_idx != -1 else ""
     ok = "auto-fit" in grid_region and "minmax" in grid_region
-    _check(case_id, ok, f"blank_idx={blank_idx}, grid_region_tail={grid_region[-200:]!r}")
+    _check(case_id, ok, f"card_idx={card_idx}, blank_idx={blank_idx}, grid_region_tail={grid_region[-200:]!r}")
     if ok:
         passed += 1
 
