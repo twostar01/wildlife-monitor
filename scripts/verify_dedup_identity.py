@@ -411,10 +411,149 @@ def suite_insert():
     return (passed, total)
 
 
+def _processor_lines():
+    """Read wildlife_processor.py from the repo root as a list of lines.
+
+    Source-text assertions are used for the `guard` suite (rather than importing
+    wildlife_processor) because that module imports cv2 and megadetector at module
+    scope and cannot be imported on a machine without the full ML stack.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    with open(repo_root / "wildlife_processor.py") as f:
+        return f.readlines()
+
+
+def _line_no(lines, needle, occurrence=1):
+    """Return the 1-based line number of the Nth line containing needle, or None."""
+    count = 0
+    for i, line in enumerate(lines, start=1):
+        if needle in line:
+            count += 1
+            if count == occurrence:
+                return i
+    return None
+
+
+def suite_guard():
+    """Seven cases, all source and positional assertions over wildlife_processor.py text."""
+    passed = 0
+    total = 7
+    lines = _processor_lines()
+
+    # 1. guard/call-present — exactly one find_archived_duplicate call site plus one import reference.
+    case_id = "guard/call-present"
+    occurrences = sum(1 for line in lines if "find_archived_duplicate" in line)
+    ok = occurrences == 2
+    _check(case_id, ok, f"occurrences={occurrences}, expected=2")
+    if ok:
+        passed += 1
+
+    camera_name_line = _line_no(lines, "camera_name = extract_camera_name(video_path, args.video_dir)")
+    guard_call_line = _line_no(lines, "find_archived_duplicate(video_path.name")
+    thumbnail_call_line = _line_no(lines, "extract_thumbnail(video_path", occurrence=2)
+    extract_frames_call_line = _line_no(lines, "extract_frames(video_path", occurrence=2)
+    run_megadetector_call_line = _line_no(lines, "run_megadetector(", occurrence=2)
+
+    # 2. guard/after-camera-name — the guard call line is greater than the camera_name assignment line.
+    case_id = "guard/after-camera-name"
+    ok = camera_name_line is not None and guard_call_line is not None and guard_call_line > camera_name_line
+    _check(case_id, ok, f"camera_name_line={camera_name_line}, guard_call_line={guard_call_line}")
+    if ok:
+        passed += 1
+
+    # 3. guard/before-thumbnail — the guard call line is less than the extract_thumbnail(video_path call line.
+    case_id = "guard/before-thumbnail"
+    ok = (
+        guard_call_line is not None and thumbnail_call_line is not None
+        and guard_call_line < thumbnail_call_line
+    )
+    _check(case_id, ok, f"guard_call_line={guard_call_line}, thumbnail_call_line={thumbnail_call_line}")
+    if ok:
+        passed += 1
+
+    # 4. guard/before-frame-extraction — the guard call line is less than extract_frames( and run_megadetector(.
+    case_id = "guard/before-frame-extraction"
+    ok = (
+        guard_call_line is not None
+        and extract_frames_call_line is not None and guard_call_line < extract_frames_call_line
+        and run_megadetector_call_line is not None and guard_call_line < run_megadetector_call_line
+    )
+    _check(
+        case_id, ok,
+        f"guard_call_line={guard_call_line}, extract_frames_call_line={extract_frames_call_line}, "
+        f"run_megadetector_call_line={run_megadetector_call_line}",
+    )
+    if ok:
+        passed += 1
+
+    # 5. guard/skip-excluded-from-tally — the finally tally condition requires both flags,
+    #    and that line number is greater than the guard call line.
+    case_id = "guard/skip-excluded-from-tally"
+    tally_line = _line_no(lines, "if not video_failed and not video_skipped:")
+    ok = tally_line is not None and guard_call_line is not None and tally_line > guard_call_line
+    _check(case_id, ok, f"tally_line={tally_line}, guard_call_line={guard_call_line}")
+    if ok:
+        passed += 1
+
+    # 6. guard/reprocess-path-isolated — args.reprocess_flagged appears exactly once, its line
+    #    number is greater than the last line of process_videos(), and neither
+    #    find_archived_duplicate nor the skip flag appears anywhere after it.
+    case_id = "guard/reprocess-path-isolated"
+    process_videos_def_line = _line_no(lines, "def process_videos(")
+    process_videos_end_line = None
+    if process_videos_def_line is not None:
+        for i in range(process_videos_def_line, len(lines)):
+            if lines[i].startswith("def "):
+                process_videos_end_line = i + 1  # 1-based line number of the next top-level def
+                break
+    reprocess_occurrences = sum(1 for line in lines if "args.reprocess_flagged" in line)
+    reprocess_line = _line_no(lines, "args.reprocess_flagged")
+    after_reprocess_leak = False
+    if reprocess_line is not None:
+        after_reprocess_leak = any(
+            ("find_archived_duplicate" in line) or ("video_skipped" in line)
+            for line in lines[reprocess_line:]
+        )
+    ok = (
+        reprocess_occurrences == 1
+        and process_videos_end_line is not None
+        and reprocess_line is not None and reprocess_line > process_videos_end_line
+        and not after_reprocess_leak
+    )
+    _check(
+        case_id, ok,
+        f"reprocess_occurrences={reprocess_occurrences}, process_videos_end_line={process_videos_end_line}, "
+        f"reprocess_line={reprocess_line}, after_reprocess_leak={after_reprocess_leak}",
+    )
+    if ok:
+        passed += 1
+
+    # 7. guard/summary-line-before-done — the duplicates_skipped summary log line number is less
+    #    than the Done. Launch dashboard line number, and there are exactly 3 duplicates_skipped
+    #    references in the file.
+    case_id = "guard/summary-line-before-done"
+    summary_line = _line_no(lines, "already-archived video(s) recognized, skipped.")
+    done_line = _line_no(lines, "Done. Launch dashboard")
+    duplicates_skipped_occurrences = sum(1 for line in lines if "duplicates_skipped" in line)
+    ok = (
+        summary_line is not None and done_line is not None and summary_line < done_line
+        and duplicates_skipped_occurrences == 3
+    )
+    _check(
+        case_id, ok,
+        f"summary_line={summary_line}, done_line={done_line}, "
+        f"duplicates_skipped_occurrences={duplicates_skipped_occurrences}",
+    )
+    if ok:
+        passed += 1
+
+    return (passed, total)
+
+
 def main():
     parser = argparse.ArgumentParser(description="File-identity dedup verification harness")
     parser.add_argument(
-        "--suite", choices=["identity", "archived-dup", "insert", "all"], default="all"
+        "--suite", choices=["identity", "archived-dup", "insert", "guard", "all"], default="all"
     )
     args = parser.parse_args()
 
@@ -422,6 +561,7 @@ def main():
         "identity": suite_identity,
         "archived-dup": suite_archived_dup,
         "insert": suite_insert,
+        "guard": suite_guard,
     }
     selected = suites.keys() if args.suite == "all" else [args.suite]
 
