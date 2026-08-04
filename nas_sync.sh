@@ -76,6 +76,23 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# ── Concurrency guard ────────────────────────────────────────────────────────
+# Prevents two invocations (e.g. a manual run and the scheduled timer) from
+# ever running at once, regardless of how each was launched. systemd's own
+# Type=oneshot singleton protection only covers systemd-initiated starts — a
+# manual `./nas_sync.sh` bypasses it entirely, which is exactly what let a
+# scheduled run collide with a manual backfill on 2026-08-01 (wasted ~4h of
+# compute, and corrupted run-stats attribution downstream). Non-blocking: a
+# second invocation fails fast with a clear message instead of silently
+# queuing behind the first for hours.
+LOCK_FILE="$SCRIPT_DIR/.nas_sync.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    err "Another nas_sync.sh instance is already running (lock: $LOCK_FILE)."
+    err "Refusing to start concurrently — wait for it to finish, or check 'ps aux | grep nas_sync' to find it."
+    exit 1
+fi
+
 # ── Load settings.json (fallback for values not passed on command line) ────────
 SETTINGS_FILE="$DATA_DIR/settings.json"
 if [[ -f "$SETTINGS_FILE" ]]; then
@@ -353,6 +370,14 @@ if [[ "$THEN_PROCESS" == true ]]; then
         "${EXTRA_PROCESSOR_ARGS[@]}"
 
     PROCESSOR_EXIT=$?
+
+    # Capture the exact run_id this invocation's wildlife_processor.py just
+    # created, so the raw-cleanup block below (if reached) can attribute its
+    # stats to THIS run explicitly instead of guessing via get_last_run().
+    PROCESSOR_RUN_ID=""
+    if [[ -f "$DATA_DIR/.last_run_id" ]]; then
+        PROCESSOR_RUN_ID=$(cat "$DATA_DIR/.last_run_id" 2>/dev/null || true)
+    fi
 
     if [[ "$PROCESSOR_EXIT" -ne 0 ]]; then
         warn "Processor exited with errors (code $PROCESSOR_EXIT)."
@@ -663,6 +688,15 @@ archive_root   = "$NAS_ARCHIVE_ROOT"
 blank_root     = "$NAS_BLANK_ROOT"
 dry_run        = os.environ.get("WM_RAW_CLEANUP_DRY_RUN", "").strip().lower() in ("1", "true", "yes")
 
+# The exact run_id this invocation's own wildlife_processor.py call created
+# (captured by nas_sync.sh from .last_run_id right after that call returned).
+# Authoritative — do NOT fall back to get_last_run()'s MAX(start_time) guess
+# unless this is genuinely unavailable (see 2026-08-01 misattribution incident:
+# a since-finished run picked up a *different*, later-started-but-earlier-dead
+# run's row because get_last_run() has no way to know which run is "mine").
+_shell_run_id = "$PROCESSOR_RUN_ID".strip()
+current_run_id = int(_shell_run_id) if _shell_run_id.isdigit() else None
+
 init_db(db_path)
 
 settings_path = "$DATA_DIR/settings.json"
@@ -785,9 +819,16 @@ else:
 
     if not dry_run:
         try:
-            last_run = get_last_run()
-            if last_run is not None:
-                record_raw_cleanup_stats(last_run["id"], removed, gb_reclaimed, skipped)
+            run_id = current_run_id
+            if run_id is None:
+                # Fallback only — .last_run_id was missing/unwritable. Not
+                # attribution-safe under concurrent runs, but better than
+                # silently dropping the stats entirely.
+                print("  !  .last_run_id unavailable — falling back to get_last_run() (attribution may be wrong if another run started more recently)", file=sys.stderr)
+                last_run = get_last_run()
+                run_id = last_run["id"] if last_run is not None else None
+            if run_id is not None:
+                record_raw_cleanup_stats(run_id, removed, gb_reclaimed, skipped)
         except Exception as e:
             # A DB error here (e.g. contention from the concurrently-running
             # dashboard) must not abort the block — deletions already

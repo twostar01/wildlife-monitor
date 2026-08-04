@@ -446,6 +446,16 @@ def process_videos(args):
     log.info(f"DB: {db_path}")
 
     run_id = record_run_start(getattr(args, "trigger", "scheduled") or "scheduled")
+    # Let nas_sync.sh's later raw-cleanup block attribute its stats to THIS run
+    # explicitly, rather than guessing via database.get_last_run() (which picks
+    # by MAX(start_time) and can return a different, unrelated run's row if
+    # another invocation started more recently but finished/died first — see
+    # the 2026-08-01 concurrent-run incident). Best-effort: nas_sync.sh falls
+    # back to get_last_run() if this file is missing or unwritable.
+    try:
+        Path(args.data_dir, ".last_run_id").write_text(str(run_id))
+    except OSError:
+        pass
     # Attribution invariant (02-RESEARCH.md Pitfall 3): the per-camera tally below
     # assumes nas_sync.sh deletes local staging copies after each run, so a video
     # is never re-scanned by a later run. A manual --no-cleanup run breaks that

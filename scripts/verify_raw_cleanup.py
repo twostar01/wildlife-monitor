@@ -559,9 +559,9 @@ def _raw_cleanup_block_extent(lines):
 
 
 def suite_source():
-    """Seven cases parsing nas_sync.sh as text — see PLAN.md task 2 for spec."""
+    """Nine cases parsing nas_sync.sh as text — see PLAN.md task 2 for spec."""
     passed = 0
-    total = 7
+    total = 9
     lines = _script_text()
 
     # SRC1 (D-05 ordering, load-bearing): the raw-cleanup block sits strictly
@@ -718,6 +718,41 @@ def suite_source():
         for l in block_lines
     )
     _check(case_id, ok, "fallback-to-zero line not found in the raw-cleanup block")
+    if ok:
+        passed += 1
+
+    # SRC8 (run-id attribution, regression for the 2026-08-01 misattribution
+    # incident): the block must use the shell-captured run_id from THIS
+    # invocation's own wildlife_processor.py call as authoritative, checked
+    # and used BEFORE any get_last_run() fallback — never the other way
+    # around, which is what silently attributed one run's raw-cleanup stats
+    # to a different, unrelated run's row.
+    case_id = "source/SRC8-run-id-attribution"
+    has_shell_capture = any('"$PROCESSOR_RUN_ID"' in l for l in block_lines)
+    run_id_assign_idx = _find_index(block_lines, lambda l: l.strip() == "run_id = current_run_id")
+    fallback_idx = _find_index(block_lines, lambda l: "last_run = get_last_run()" in l, start=max(run_id_assign_idx, 0))
+    ok = (
+        has_shell_capture
+        and run_id_assign_idx != -1
+        and fallback_idx != -1
+        and fallback_idx > run_id_assign_idx
+    )
+    _check(
+        case_id, ok,
+        f"has_shell_capture={has_shell_capture}, run_id_assign_idx={run_id_assign_idx}, fallback_idx={fallback_idx}",
+    )
+    if ok:
+        passed += 1
+
+    # SRC9 (concurrency guard, regression for the 2026-08-01 incident): a
+    # non-blocking flock acquisition must exist, and must occur before the
+    # settings.json load / any real work — never after — so a second
+    # invocation fails fast instead of racing the first.
+    case_id = "source/SRC9-concurrency-guard"
+    flock_idx = _find_index(lines, lambda l: "flock -n 200" in l)
+    settings_load_idx = _find_index(lines, lambda l: 'SETTINGS_FILE="$DATA_DIR/settings.json"' in l)
+    ok = flock_idx != -1 and settings_load_idx != -1 and flock_idx < settings_load_idx
+    _check(case_id, ok, f"flock_idx={flock_idx}, settings_load_idx={settings_load_idx}")
     if ok:
         passed += 1
 
