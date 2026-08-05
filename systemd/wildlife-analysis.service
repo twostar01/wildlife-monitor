@@ -14,7 +14,7 @@ ExecStart=/bin/bash -c '\
         --data-dir /home/twostar/wildlife_monitor/data'
 StandardOutput=append:/home/twostar/wildlife_monitor/data/cron.log
 StandardError=append:/home/twostar/wildlife_monitor/data/cron.log
-TimeoutStartSec=14400
+TimeoutStartSec=43200
 
 [Install]
 WantedBy=multi-user.target
