@@ -20,6 +20,7 @@ Config file format (INI-style, optional):
 import argparse
 import configparser
 import json
+import logging
 import os
 import re
 import subprocess
@@ -49,6 +50,28 @@ from notifications import (
     redact_smtp_password,
     merge_preserved_password,
 )
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+log = logging.getLogger("web_app")
+
+def setup_logging():
+    """
+    Configure the module logger for a long-running systemd service.
+
+    Attaches a single StreamHandler(sys.stdout) and nothing else. `web_app.py`
+    runs continuously under wildlife-monitor.service for weeks/months, and
+    journald (StandardOutput=journal) already persists and rotates stdout, so
+    an unrotated file-based sink here would grow unbounded. Idempotent: safe
+    to call more than once without duplicating output.
+    """
+    log.setLevel(logging.INFO)
+    log.handlers.clear()
+    fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(fmt)
+    log.addHandler(handler)
+    log.propagate = False
+    return log
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="Wildlife Monitor", docs_url=None, redoc_url=None)
@@ -1247,6 +1270,8 @@ def api_purge(dry_run: bool = Query(False)):
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
+    setup_logging()
+
     global DATA_DIR, SETTINGS_FILE
 
     parser = argparse.ArgumentParser(
