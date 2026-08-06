@@ -11,6 +11,8 @@ Suites:
                          (static/index.html JS, S1-S6).
     confidence_badge  — UI-04, gallery tile confidence badge
                          (database.py + static/index.html, C1-C8).
+    logging           — OBS-01, web_app.py journald logging
+                         (web_app.py source + runtime behaviour, L1-L8).
 
 Follows scripts/verify_raw_cleanup_ui.py's structure: a `_check(case_id,
 condition, detail)` helper, per-suite `(passed, total)` returns, a dict suite
@@ -22,7 +24,7 @@ running this harness before plans 07-02 through 07-04 land reports FAIL for
 every not-yet-implemented case. That is the intended and required outcome.
 
 Usage:
-    python scripts/verify_phase7.py --suite nav|nextrun|species_filter|confidence_badge|all
+    python scripts/verify_phase7.py --suite nav|nextrun|species_filter|confidence_badge|logging|all
     python scripts/verify_phase7.py --list
 """
 
@@ -422,11 +424,146 @@ def suite_confidence_badge():
     return (passed, total)
 
 
+def suite_logging():
+    """Eight cases proving web_app.py's journald logging (OBS-01) is wired up
+    correctly: handler shape, no file handler, idempotent setup, no
+    propagation, exactly-once emission with the expected format, no
+    remaining print() calls, correct setup ordering, and no secret leakage
+    (L1-L8)."""
+    passed = 0
+    total = 8
+
+    import web_app  # noqa: E402  (deferred import — only this suite needs it)
+
+    text = _web_app_text()
+    main_src = _slice(text, "def main():", None)
+
+    case_id = "logging/L1-module-logger"
+    log_attr = getattr(web_app, "log", None)
+    setup_fn = getattr(web_app, "setup_logging", None)
+    ok = (
+        log_attr is not None
+        and getattr(log_attr, "name", None) == "web_app"
+        and callable(setup_fn)
+    )
+    _check(case_id, ok, f"has_log={log_attr is not None}, has_setup_logging={callable(setup_fn)}")
+    if ok:
+        passed += 1
+
+    case_id = "logging/L2-handler-shape"
+    l2_ok = False
+    l2_detail = ""
+    if callable(setup_fn):
+        setup_fn()
+        handlers = list(web_app.log.handlers)
+        l2_ok = (
+            web_app.log.level == logging.INFO
+            and len(handlers) == 1
+            and isinstance(handlers[0], logging.StreamHandler)
+            and handlers[0].stream is sys.stdout
+        )
+        l2_detail = f"level={web_app.log.level}, handler_count={len(handlers)}"
+    _check(case_id, l2_ok, l2_detail)
+    if l2_ok:
+        passed += 1
+
+    case_id = "logging/L3-no-file-handler"
+    l3_ok = False
+    l3_detail = ""
+    if callable(setup_fn):
+        no_file_handler_instance = not any(
+            isinstance(h, logging.FileHandler) for h in web_app.log.handlers
+        )
+        no_file_handler_text = "FileHandler" not in text
+        l3_ok = no_file_handler_instance and no_file_handler_text
+        l3_detail = f"no_instance={no_file_handler_instance}, no_text={no_file_handler_text}"
+    _check(case_id, l3_ok, l3_detail)
+    if l3_ok:
+        passed += 1
+
+    case_id = "logging/L4-idempotent"
+    l4_ok = False
+    l4_detail = ""
+    if callable(setup_fn):
+        setup_fn()
+        setup_fn()
+        l4_ok = len(web_app.log.handlers) == 1
+        l4_detail = f"handler_count={len(web_app.log.handlers)}"
+    _check(case_id, l4_ok, l4_detail)
+    if l4_ok:
+        passed += 1
+
+    case_id = "logging/L5-no-propagate"
+    l5_ok = False
+    if callable(setup_fn):
+        l5_ok = web_app.log.propagate is False
+    _check(case_id, l5_ok, f"propagate={getattr(web_app.log, 'propagate', None) if log_attr else 'n/a'}")
+    if l5_ok:
+        passed += 1
+
+    case_id = "logging/L6-exactly-once"
+    l6_ok = False
+    l6_detail = ""
+    if callable(setup_fn):
+        marker = "phase7-probe"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            setup_fn()
+            web_app.log.info(marker)
+        setup_fn()  # rebind to the real sys.stdout (T-07-H2)
+        output = buf.getvalue()
+        occurrences = output.count(marker)
+        lines = [ln for ln in output.splitlines() if marker in ln]
+        pattern = re.compile(
+            r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\s+INFO\s+" + re.escape(marker) + r"$"
+        )
+        format_ok = len(lines) == 1 and bool(pattern.match(lines[0]))
+        l6_ok = occurrences == 1 and format_ok
+        l6_detail = f"occurrences={occurrences}, output={output!r}"
+    _check(case_id, l6_ok, l6_detail)
+    if l6_ok:
+        passed += 1
+
+    case_id = "logging/L7-no-print"
+    print_count = text.count("print(")
+    ok = print_count == 0
+    _check(case_id, ok, f"found {print_count} occurrence(s) of print(")
+    if ok:
+        passed += 1
+
+    case_id = "logging/L8-setup-before-serve-and-no-secrets"
+    setup_idx = main_src.find("setup_logging()")
+    uvicorn_idx = main_src.find("uvicorn.run(")
+    order_ok = setup_idx != -1 and uvicorn_idx != -1 and setup_idx < uvicorn_idx
+    log_call_count = main_src.count("log.info(") + main_src.count("log.warning(")
+    enough_calls = log_call_count >= 8
+    no_secrets = True
+    for line in text.splitlines():
+        if "log." in line and ("password" in line.lower() or "smtp" in line.lower()):
+            no_secrets = False
+            break
+    ok = order_ok and enough_calls and no_secrets
+    _check(
+        case_id, ok,
+        f"order_ok={order_ok}, log_call_count={log_call_count}, no_secrets={no_secrets}",
+    )
+    if ok:
+        passed += 1
+
+    # Leave the module in a known-good state (real stdout) regardless of
+    # which cases above ran.
+    if callable(setup_fn):
+        setup_fn()
+
+    return (passed, total)
+
+
 SUITES = {
     "nav": (suite_nav, 5),
     "nextrun": (suite_nextrun, 5),
     "species_filter": (suite_species_filter, 6),
     "confidence_badge": (suite_confidence_badge, 8),
+    "logging": (suite_logging, 8),
 }
 
 
