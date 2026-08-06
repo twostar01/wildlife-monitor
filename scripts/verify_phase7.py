@@ -7,6 +7,10 @@ Suites:
                          N1-N5).
     nextrun           — UI-02, "Next scheduled run" card overflow fix
                          (static/index.html inline styles, X1-X5).
+    species_filter    — UI-03, species/camera dropdown tab-coupling fix
+                         (static/index.html JS, S1-S6).
+    confidence_badge  — UI-04, gallery tile confidence badge
+                         (database.py + static/index.html, C1-C8).
 
 Follows scripts/verify_raw_cleanup_ui.py's structure: a `_check(case_id,
 condition, detail)` helper, per-suite `(passed, total)` returns, a dict suite
@@ -18,7 +22,7 @@ running this harness before plans 07-02 through 07-04 land reports FAIL for
 every not-yet-implemented case. That is the intended and required outcome.
 
 Usage:
-    python scripts/verify_phase7.py --suite nav|nextrun|all
+    python scripts/verify_phase7.py --suite nav|nextrun|species_filter|confidence_badge|all
     python scripts/verify_phase7.py --list
 """
 
@@ -105,6 +109,24 @@ def _tag_attrs(text, elem_id):
     if tag_start == -1 or tag_end == -1:
         return ""
     return text[tag_start:tag_end]
+
+
+def _meta_windows(text):
+    """Return, for every occurrence of `<div class="gallery-item-meta">`, the
+    substring from 400 characters before the match to 700 characters after
+    it, clamped to the text bounds."""
+    windows = []
+    needle = '<div class="gallery-item-meta">'
+    search_from = 0
+    while True:
+        idx = text.find(needle, search_from)
+        if idx == -1:
+            break
+        start = max(0, idx - 400)
+        end = min(len(text), idx + len(needle) + 700)
+        windows.append(text[start:end])
+        search_from = idx + 1
+    return windows
 
 
 def suite_nav():
@@ -206,9 +228,205 @@ def suite_nextrun():
     return (passed, total)
 
 
+def suite_species_filter():
+    """Six cases proving the species/camera dropdown tab-coupling fix (UI-03)
+    is present without regressing the existing tab-open fallback or the
+    camera dropdown (S1-S6)."""
+    passed = 0
+    total = 6
+    text = _index_html_text()
+
+    dash = _slice(text, "async function loadDashboard()", "\nasync function ")
+    species_fn = _slice(text, "async function loadSpecies()", "\nasync function ")
+    cameras_fn = _slice(text, "async function loadCameras()", "\nasync function ")
+    boot = _slice(text, "// ── Boot ─", None)
+
+    case_id = "species_filter/S1-boot-populate"
+    ok = "populateSpeciesFilters(" in dash
+    _check(case_id, ok, "loadDashboard() does not call populateSpeciesFilters(")
+    if ok:
+        passed += 1
+
+    case_id = "species_filter/S2-guarded"
+    ok = dash.count("state.speciesList.length") >= 2
+    _check(case_id, ok, f"count={dash.count('state.speciesList.length')}")
+    if ok:
+        passed += 1
+
+    case_id = "species_filter/S3-no-boot-loadSpecies"
+    ok = "loadDashboard();" in boot and "loadCameras();" in boot and "loadSpecies(" not in boot
+    _check(case_id, ok, f"has_loadDashboard={'loadDashboard();' in boot}, has_loadCameras={'loadCameras();' in boot}, has_loadSpecies={'loadSpecies(' in boot}")
+    if ok:
+        passed += 1
+
+    case_id = "species_filter/S4-fallback-intact"
+    fallback_marker = "if (tab === 'species') loadSpecies();"
+    species_fn_ok = "populateSpeciesFilters(data)" in species_fn
+    fallback_wired = fallback_marker in text
+    ok = species_fn_ok and fallback_wired
+    _check(case_id, ok, f"species_fn_ok={species_fn_ok}, fallback_wired={fallback_wired}")
+    if ok:
+        passed += 1
+
+    case_id = "species_filter/S5-selection-preserved"
+    ok = "state.gallerySpecies" in dash and "gallerySpeciesFilter" in dash
+    _check(case_id, ok, f"has_gallerySpecies={'state.gallerySpecies' in dash}, has_filter_id={'gallerySpeciesFilter' in dash}")
+    if ok:
+        passed += 1
+
+    case_id = "species_filter/S6-camera-unchanged"
+    ok = "gallerySel.value = state.galleryCamera" in cameras_fn and "loadCameras();" in boot
+    _check(case_id, ok, f"cameras_fn_ok={'gallerySel.value = state.galleryCamera' in cameras_fn}, boot_ok={'loadCameras();' in boot}")
+    if ok:
+        passed += 1
+
+    return (passed, total)
+
+
+def suite_confidence_badge():
+    """Eight cases proving the gallery tile confidence badge (UI-04) is wired
+    at both render sites, backed by a SQL column addition, and that the
+    verification fixture itself never touches the production database
+    (C1-C8)."""
+    passed = 0
+    total = 8
+    index_text = _index_html_text()
+
+    case_id = "confidence_badge/C1-sql-column"
+    detail_fn = _nows(_slice(_database_text(), "def get_species_detail(", "def get_gallery("))
+    ok = "s.confidenceASspecies_confidence" in detail_fn
+    _check(case_id, ok, "get_species_detail() crops query is missing s.confidence AS species_confidence")
+    if ok:
+        passed += 1
+
+    # C2/C3: shared fixture — a temp SQLite database with one video, two
+    # detections, two species rows (confidence 0.0 and 0.87) on the same
+    # label, and one crop per detection.
+    import database  # noqa: E402  (deferred import — only this suite needs it)
+
+    c2_ok = False
+    c3_ok = False
+    c2_detail = ""
+    c3_detail = ""
+    original_db_path = database.DB_PATH
+    tmpdir = tempfile.mkdtemp()
+    try:
+        tmp_db_path = os.path.join(tmpdir, "t.db")
+        assert tmp_db_path != original_db_path, "temp db path collides with production DB_PATH"
+        database.init_db(tmp_db_path)
+        label = "phase7_probe_species"
+        with database.get_conn() as conn:
+            conn.execute(
+                "INSERT INTO videos (filename, processed_at) VALUES (?, ?)",
+                ("probe.mp4", "2026-08-06T00:00:00"),
+            )
+            video_id = conn.execute("SELECT id FROM videos WHERE filename = ?", ("probe.mp4",)).fetchone()[0]
+
+            det_ids = []
+            for _ in range(2):
+                conn.execute(
+                    "INSERT INTO detections (video_id, category, confidence) VALUES (?, 'animal', 0.9)",
+                    (video_id,),
+                )
+                det_ids.append(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+            confidences = (0.0, 0.87)
+            for det_id, conf in zip(det_ids, confidences):
+                conn.execute(
+                    "INSERT INTO species (detection_id, label, common_name, scientific_name, confidence) "
+                    "VALUES (?, ?, 'Probe Animal', 'Probus animalus', ?)",
+                    (det_id, label, conf),
+                )
+
+            for i, det_id in enumerate(det_ids):
+                conn.execute(
+                    "INSERT INTO crops (detection_id, crop_path, quality_score, created_at) VALUES (?, ?, ?, ?)",
+                    (det_id, f"probe_crop_{i}.jpg", 50.0 + i, "2026-08-06T00:00:00"),
+                )
+
+        detail = database.get_species_detail(label)
+        crops = detail.get("crops", [])
+        crop_confidences = [c.get("species_confidence") for c in crops if "species_confidence" in c]
+
+        c2_ok = len(crop_confidences) == len(crops) and len(crops) > 0 and 0.0 in crop_confidences
+        c2_detail = f"crops={crops}"
+        c3_ok = 0.87 in crop_confidences
+        c3_detail = f"crop_confidences={crop_confidences}"
+    finally:
+        database.set_db_path(original_db_path)
+        try:
+            import shutil
+
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
+    case_id = "confidence_badge/C2-roundtrip-zero"
+    _check(case_id, c2_ok, c2_detail)
+    if c2_ok:
+        passed += 1
+
+    case_id = "confidence_badge/C3-roundtrip-value"
+    _check(case_id, c3_ok, c3_detail)
+    if c3_ok:
+        passed += 1
+
+    case_id = "confidence_badge/C4-two-render-sites"
+    windows = _meta_windows(index_text)
+    ok = len(windows) == 2
+    _check(case_id, ok, f"found {len(windows)} gallery-item-meta occurrence(s)")
+    if ok:
+        passed += 1
+
+    case_id = "confidence_badge/C5-helper-contract"
+    helper = _slice(index_text, "function confidenceBadge(", "\nfunction ")
+    ok = all(
+        v in helper
+        for v in (
+            "!== null",
+            "!== undefined",
+            "Math.round(",
+            "100",
+            "< 70",
+            "var(--danger)",
+            "font-weight:700",
+            "quality-score",
+            "%",
+        )
+    )
+    _check(case_id, ok, f"helper_found={bool(helper)}")
+    if ok:
+        passed += 1
+
+    case_id = "confidence_badge/C6-main-grid-wired"
+    main_grid_window = next((w for w in windows if "item.quality_score" in w), "")
+    ok = "confidenceBadge(item.species_confidence)" in main_grid_window and 'class="badge-pair"' in main_grid_window
+    _check(case_id, ok, f"main_grid_window_found={bool(main_grid_window)}")
+    if ok:
+        passed += 1
+
+    case_id = "confidence_badge/C7-modal-grid-wired"
+    modal_grid_window = next((w for w in windows if "c.quality_score" in w), "")
+    ok = "confidenceBadge(c.species_confidence)" in modal_grid_window and 'class="badge-pair"' in modal_grid_window
+    _check(case_id, ok, f"modal_grid_window_found={bool(modal_grid_window)}")
+    if ok:
+        passed += 1
+
+    case_id = "confidence_badge/C8-badge-pair-css"
+    badge_pair_rule = _rule(_nows(index_text), ".badge-pair")
+    ok = all(v in badge_pair_rule for v in ("display:flex", "align-items:center", "gap:4px"))
+    _check(case_id, ok, f"badge_pair_rule={badge_pair_rule!r}")
+    if ok:
+        passed += 1
+
+    return (passed, total)
+
+
 SUITES = {
     "nav": (suite_nav, 5),
     "nextrun": (suite_nextrun, 5),
+    "species_filter": (suite_species_filter, 6),
+    "confidence_badge": (suite_confidence_badge, 8),
 }
 
 
