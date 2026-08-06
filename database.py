@@ -1469,14 +1469,15 @@ def get_species_detail(label: str) -> dict:
         """, (label,)).fetchall()
 
         # Selects the same detection-identifying columns as get_gallery() (label,
-        # detection_id, top_candidates_json, corrected common/scientific name) so
-        # the frontend can route this grid through the same openDetectionCorrection
-        # entry point the main Gallery tab uses, instead of a plain video-open
-        # click — see WR-07.
+        # detection_id, top_candidates_json, corrected common/scientific name,
+        # confidence) so the frontend can route this grid through the same
+        # openDetectionCorrection entry point the main Gallery tab uses, instead
+        # of a plain video-open click — see WR-07.
         crops = conn.execute(f"""
             SELECT c.crop_path, c.quality_score, v.id as video_id,
                    v.filename, v.recorded_at,
                    s.label, s.detection_id, s.top_candidates_json,
+                   s.confidence          AS species_confidence,
                    {DISPLAY_COMMON}     AS common_name,
                    {DISPLAY_SCIENTIFIC} AS scientific_name
             FROM crops c
