@@ -1179,6 +1179,20 @@ async function loadDashboard() {
       : api('/species').then(s => { state.speciesList = s; }).catch(() => {}),
   ]);
 
+  // Populate the species filter dropdowns from this boot-time fetch so they
+  // are ready no matter which tab the operator opens first (previously they
+  // only populated after visiting the Species tab). Guarded on a non-empty
+  // list so a failed fetch leaves the dropdown at its "All Species" default
+  // and falls back silently to the existing tab-open retry (loadSpecies()).
+  if (state.speciesList.length) {
+    populateSpeciesFilters(state.speciesList);
+    // Rebuilding the options clears the selection, so re-apply the species
+    // filter carried in state (e.g. restored from the URL hash) — mirrors
+    // loadCameras()'s gallerySel.value = state.galleryCamera re-apply.
+    const gallerySpeciesSel = document.getElementById('gallerySpeciesFilter');
+    if (gallerySpeciesSel) gallerySpeciesSel.value = state.gallerySpecies;
+  }
+
   // Stat cards — clicking navigates to the relevant tab/filter
   const statCards = [
     { value: data.total_videos,   label: 'Total Videos Scanned', action: null },
