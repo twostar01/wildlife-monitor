@@ -97,6 +97,13 @@
 
   @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
+  /* ── UI-01: MOBILE NAV WRAP ─────────────────────────── */
+  @media (max-width: 700px) {
+    header { flex-wrap: wrap; row-gap: 8px; }
+    nav { flex-wrap: wrap; width: 100%; justify-content: flex-start; row-gap: 4px; }
+    .search-bar { order: 3; width: 100%; }
+  }
+
   /* ── CARDS ──────────────────────────────────────────── */
   .card {
     background: var(--card); border: 1px solid var(--border);
@@ -500,9 +507,9 @@
         <div id="lastRunBody">
           <div class="loading"><span class="spinner"></span>Loading…</div>
         </div>
-        <div id="nextRunRow" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;align-items:center;justify-content:space-between">
+        <div id="nextRunRow" style="margin-top:10px;padding-top:10px;border-top:1px solid var(--border);display:flex;flex-direction:column;align-items:flex-start;gap:4px">
           <span class="nas-key">Next scheduled run</span>
-          <span class="nas-val" id="nextRunValue" style="text-align:left;white-space:nowrap">—</span>
+          <span class="nas-val" id="nextRunValue" style="text-align:left;white-space:normal">—</span>
         </div>
       </div>
       <div class="stat-grid" id="statGrid">
@@ -1171,6 +1178,20 @@ async function loadDashboard() {
       ? Promise.resolve()
       : api('/species').then(s => { state.speciesList = s; }).catch(() => {}),
   ]);
+
+  // Populate the species filter dropdowns from this boot-time fetch so they
+  // are ready no matter which tab the operator opens first (previously they
+  // only populated after visiting the Species tab). Guarded on a non-empty
+  // list so a failed fetch leaves the dropdown at its "All Species" default
+  // and falls back silently to the existing tab-open retry (loadSpecies()).
+  if (state.speciesList.length) {
+    populateSpeciesFilters(state.speciesList);
+    // Rebuilding the options clears the selection, so re-apply the species
+    // filter carried in state (e.g. restored from the URL hash) — mirrors
+    // loadCameras()'s gallerySel.value = state.galleryCamera re-apply.
+    const gallerySpeciesSel = document.getElementById('gallerySpeciesFilter');
+    if (gallerySpeciesSel) gallerySpeciesSel.value = state.gallerySpecies;
+  }
 
   // Stat cards — clicking navigates to the relevant tab/filter
   const statCards = [
