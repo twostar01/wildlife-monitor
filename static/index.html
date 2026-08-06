@@ -286,6 +286,7 @@
   }
   .quality-bar-fill { height: 100%; border-radius: 2px; background: linear-gradient(90deg, var(--accent), var(--gold)); }
   .quality-score { font-family: var(--font-mono); font-size: 10px; color: var(--gold); }
+  .badge-pair { display: flex; align-items: center; gap: 4px; }
 
   /* ── VIDEOS ─────────────────────────────────────────── */
   .video-list { display: flex; flex-direction: column; gap: 10px; }
@@ -1628,7 +1629,10 @@ async function openSpecies(label) {
             <div>
               <div class="quality-bar"><div class="quality-bar-fill" style="width:${c.quality_score||0}%"></div></div>
             </div>
-            <div class="quality-score">${Math.round(c.quality_score||0)}</div>
+            <div class="badge-pair">
+              ${confidenceBadge(c.species_confidence)}
+              <div class="quality-score">${Math.round(c.quality_score||0)}</div>
+            </div>
           </div>
         </div>
       `).join('')
@@ -1830,7 +1834,10 @@ async function loadGallery(page) {
           ${aiName}
           <div class="quality-bar"><div class="quality-bar-fill" style="width:${item.quality_score||0}%"></div></div>
         </div>
-        <div class="quality-score">${Math.round(item.quality_score||0)}</div>
+        <div class="badge-pair">
+          ${confidenceBadge(item.species_confidence)}
+          <div class="quality-score">${Math.round(item.quality_score||0)}</div>
+        </div>
       </div>
     </div>
   `}).join('');
@@ -2470,6 +2477,17 @@ function populateSpeciesFilters(speciesList) {
 }
 
 // ── Util ──────────────────────────────────────────────────────────────────────
+function confidenceBadge(value) {
+  // Explicit !== null / !== undefined check, not a truthiness test — 0.0 is a
+  // real, meaningful confidence score and is falsy in JS, so `if (value)`
+  // would suppress the badge on exactly the tiles the operator most needs to
+  // see. Mirrors database.py's get_gallery() `min_confidence is not None` guard.
+  if (value === null || value === undefined) return '';
+  const pct = Math.round(value * 100);
+  const style = pct < 70 ? ' style="color:var(--danger);font-weight:700"' : '';
+  return `<span class="quality-score"${style}>${pct}%</span>`;
+}
+
 function escHtml(s) {
   return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
                 .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
