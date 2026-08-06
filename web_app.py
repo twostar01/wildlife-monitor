@@ -261,14 +261,14 @@ def resolve_port(requested_port: int, host: str) -> int:
     """
     if requested_port == 0:
         port = find_free_port(host)
-        print(f"  Auto-selected port: {port}")
+        log.info("Auto-selected port: %s", port)
         return port
 
     if is_port_free(host, requested_port):
         return requested_port
 
     proc = get_process_on_port(requested_port)
-    print(f"\n  ✗  Port {requested_port} is already in use by: {proc}")
+    log.error("Port %s is already in use by: %s", requested_port, proc)
 
     # Suggest alternatives
     alternatives = []
@@ -279,9 +279,9 @@ def resolve_port(requested_port: int, host: str) -> int:
             break
 
     if alternatives:
-        print(f"     Free alternatives nearby: {', '.join(str(p) for p in alternatives)}")
-        print(f"     Example: python web_app.py --port {alternatives[0]}")
-    print(f"     Or use --port 0 to auto-select a free port.\n")
+        log.error("Free alternatives nearby: %s", ', '.join(str(p) for p in alternatives))
+        log.error("Example: python web_app.py --port %s", alternatives[0])
+    log.error("Or use --port 0 to auto-select a free port.")
     sys.exit(1)
 
 
@@ -332,7 +332,7 @@ data_dir = ./data
 """
     with open(path, "w") as f:
         f.write(content)
-    print(f"  Example config written to: {path}")
+    log.info("Example config written to: %s", path)
 
 
 # ── Static / media routes ──────────────────────────────────────────────────────
@@ -1312,7 +1312,7 @@ def main():
     # Load config file (silently ignored if missing)
     file_cfg = load_config(args.config)
     if file_cfg and args.config == DEFAULT_CONFIG_PATH:
-        print(f"  Loaded config: {args.config}")
+        log.info("Loaded config: %s", args.config)
 
     # Merge: CLI args > config file > defaults
     host     = args.host     or file_cfg.get("host",     "0.0.0.0")
@@ -1323,38 +1323,37 @@ def main():
     # Port conflict check
     if args.check_port:
         if is_port_free(host, port_req):
-            print(f"  Port {port_req} is free.")
+            log.info("Port %s is free.", port_req)
             sys.exit(0)
         else:
             proc = get_process_on_port(port_req)
-            print(f"  Port {port_req} is in use by: {proc}")
+            log.warning("Port %s is in use by: %s", port_req, proc)
             sys.exit(1)
 
     port = resolve_port(port_req, host)
 
     # Validate data directory
     if not os.path.isdir(DATA_DIR):
-        print(f"\n  Warning: data directory '{DATA_DIR}' does not exist yet.")
-        print(f"  It will be created when you first run wildlife_processor.py.")
-        print(f"  The dashboard will start but will show empty data until then.\n")
+        log.warning("Warning: data directory '%s' does not exist yet.", DATA_DIR)
+        log.warning("It will be created when you first run wildlife_processor.py.")
+        log.warning("The dashboard will start but will show empty data until then.")
 
     # Initialise database
     db_path = os.path.join(DATA_DIR, "wildlife.db")
     db.init_db(db_path)
 
     bind_display = "localhost" if host == "127.0.0.1" else host
-    print(f"\n  🦌  Wildlife Monitor")
-    print(f"      Data dir  : {DATA_DIR}")
-    print(f"      Database  : {db_path}")
-    print(f"      Listening : http://{bind_display}:{port}")
+    log.info("🦌  Wildlife Monitor")
+    log.info("      Data dir  : %s", DATA_DIR)
+    log.info("      Database  : %s", db_path)
+    log.info("      Listening : http://%s:%s", bind_display, port)
     if host == "0.0.0.0":
         # Also show LAN IP if binding to all interfaces
         try:
             lan_ip = socket.gethostbyname(socket.gethostname())
-            print(f"      LAN URL   : http://{lan_ip}:{port}")
+            log.info("      LAN URL   : http://%s:%s", lan_ip, port)
         except Exception:
             pass
-    print()
 
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
