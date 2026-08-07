@@ -403,7 +403,11 @@ def suite_frontend():
     case_id = "frontend/F3-gray-css"
     rule = _rule(_nows(text), ".status-dot.gray")
     achromatic = False
-    hex_match = re.search(r"#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})", rule)
+    # 6-digit alternative must be tried first: regex alternation matches the
+    # first alternative that succeeds, and a fixed {3} quantifier always
+    # succeeds against the leading 3 chars of a 6-digit hex, truncating
+    # "8a8a8a" to "8a8" (which mis-expands to a non-achromatic "88aa88").
+    hex_match = re.search(r"#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})", rule)
     if hex_match:
         h = hex_match.group(1)
         if len(h) == 3:
