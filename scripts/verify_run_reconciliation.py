@@ -341,9 +341,14 @@ def suite_source():
 
     case_id = "source/S5-call-site-position"
     import_tuple = _slice(processor_text, "from database import (", ")")
-    idx_call = processor_text.find("reconcile_interrupted_runs(")
     idx_init = processor_text.find("init_db(db_path)")
-    idx_start = processor_text.find("record_run_start(")
+    # Search for the call-site occurrences strictly after init_db(db_path) —
+    # both "reconcile_interrupted_runs(" and "record_run_start(" can
+    # legitimately appear earlier in the file in prose/docstrings (e.g.
+    # _finish_run()'s docstring: "Close the run row opened by
+    # record_run_start()"), which must not satisfy this positional check.
+    idx_call = processor_text.find("reconcile_interrupted_runs(", idx_init) if idx_init != -1 else -1
+    idx_start = processor_text.find("record_run_start(", idx_init) if idx_init != -1 else -1
     ok = (
         "reconcile_interrupted_runs" in import_tuple
         and -1 not in (idx_call, idx_init, idx_start)
