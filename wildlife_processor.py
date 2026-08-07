@@ -20,6 +20,7 @@ from database import (
     init_db, insert_video, insert_detection, insert_species, insert_crop,
     link_lens_pair, parse_dual_lens_filename, find_archived_duplicate,
     record_run_start, record_run_end, get_camera_offline_flags, get_run_by_id,
+    reconcile_interrupted_runs,
 )
 from notifications import decide_run_alert, format_run_alert, send_notification_email
 from image_quality import score_image
@@ -444,6 +445,10 @@ def process_videos(args):
     db_path = os.path.join(args.data_dir, "wildlife.db")
     init_db(db_path)
     log.info(f"DB: {db_path}")
+
+    reconciled = reconcile_interrupted_runs()
+    if reconciled:
+        log.warning(f"Reconciled {reconciled} interrupted run(s) from a prior invocation")
 
     run_id = record_run_start(getattr(args, "trigger", "scheduled") or "scheduled")
     # Let nas_sync.sh's later raw-cleanup block attribute its stats to THIS run

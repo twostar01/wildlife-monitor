@@ -365,6 +365,40 @@ def record_run_end(
         )
 
 
+def reconcile_interrupted_runs() -> int:
+    """Close any runs row abandoned by a process that exited without calling
+    record_run_end() (e.g. a service restart mid-run).
+
+    Safety: nas_sync.sh's flock guard (line 90) ensures only one
+    nas_sync.sh-spawned wildlife_processor.py can be alive at a time, so any
+    row still status IS NULL when this runs (called before this run's own
+    record_run_start()) belongs to an already-exited process — no age
+    threshold needed. This assumption does NOT hold for a wildlife_processor.py
+    invoked directly, bypassing nas_sync.sh (see wildlife_processor.py:330-337
+    and 459-464 for the same accepted invariant-risk precedent).
+
+    Set-based (no LIMIT) — reconciles ALL stale rows in one statement in case
+    more than one interruption happened before a run completed successfully.
+
+    end_time is set to the sweep timestamp (not left NULL or estimated) so
+    duration_secs is derivable for the reconciled row. This means the shown
+    duration reflects when the interruption was *detected*, not when the
+    process actually died — a reconciled row will usually show an inflated
+    multi-hour duration. That is expected behaviour, not a bug.
+    """
+    with get_conn() as conn:
+        cur = conn.execute(
+            """UPDATE runs SET status=?, end_time=?, error_summary=?
+               WHERE status IS NULL""",
+            (
+                "interrupted",
+                datetime.now().isoformat(),
+                "Process did not complete — likely interrupted by a service restart or crash",
+            ),
+        )
+        return cur.rowcount
+
+
 def record_raw_cleanup_stats(run_id: Optional[int], removed: int, gb_reclaimed: float, skipped: int) -> None:
     """
     Record this run's raw_recordings cleanup outcome on its `runs` row.
