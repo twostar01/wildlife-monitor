@@ -644,6 +644,254 @@ def suite_fk_integrity():
     return (passed, total)
 
 
+def suite_correction_precedence():
+    """Nine cases exercising D-01/D-02 correction precedence:
+    correction_signal() detecting either write path, select_winner()'s
+    override for a single correction holder, the conflicting-holders skip,
+    and the tie-break fallback when siblings disagree with no correction
+    present."""
+    passed = 0
+    total = 9
+    try:
+        # 1. correction/species-corrected-at-detected
+        case_id = "correction/species-corrected-at-detected"
+        with _fixture_db():
+            vid = _seed_video("corr1.mp4", camera_name="CamA")
+            det = _seed_detection(vid)
+            _seed_species(det, "felis catus;;;cat", corrected_at="2026-08-01T00:00:00")
+            with database.get_conn() as conn:
+                signal = backfill_dedup_videos.correction_signal(conn, vid)
+            ok = signal is True
+            _check(case_id, ok, f"signal={signal}")
+            if ok:
+                passed += 1
+
+        # 2. correction/video-correction-row-detected
+        case_id = "correction/video-correction-row-detected"
+        with _fixture_db():
+            vid = _seed_video("corr2.mp4", camera_name="CamA")
+            det = _seed_detection(vid)
+            _seed_species(det, "felis catus;;;cat")
+            _seed_video_correction(vid, "felis catus;;;cat", corrected_label="lynx rufus;;;bobcat")
+            with database.get_conn() as conn:
+                signal = backfill_dedup_videos.correction_signal(conn, vid)
+            ok = signal is True
+            _check(case_id, ok, f"signal={signal}")
+            if ok:
+                passed += 1
+
+        # 3. correction/no-signal-when-uncorrected
+        case_id = "correction/no-signal-when-uncorrected"
+        with _fixture_db():
+            vid = _seed_video("corr3.mp4", camera_name="CamA")
+            det = _seed_detection(vid)
+            _seed_species(det, "felis catus;;;cat")
+            with database.get_conn() as conn:
+                signal = backfill_dedup_videos.correction_signal(conn, vid)
+            ok = signal is False
+            _check(case_id, ok, f"signal={signal}")
+            if ok:
+                passed += 1
+
+        # 4. correction/single-holder-wins-over-tiebreak
+        case_id = "correction/single-holder-wins-over-tiebreak"
+        with _fixture_db():
+            _id_a = _seed_video("corr4.mp4", filepath=None, camera_name="CamA")
+            _id_b = _seed_video("corr4.mp4", filepath=None, camera_name="CamA")
+            id_c = _seed_video("corr4.mp4", filepath=None, camera_name="CamA")
+            det_c = _seed_detection(id_c)
+            _seed_species(det_c, "felis catus;;;cat", corrected_at="2026-08-01T00:00:00")
+            with database.get_conn() as conn:
+                member_ids = backfill_dedup_videos.group_member_ids(conn, "corr4.mp4", "CamA")
+                winner_id, rule, skipped_reason = backfill_dedup_videos.select_winner(
+                    conn, member_ids
+                )
+            ok = (
+                winner_id == id_c
+                and winner_id != member_ids[0]
+                and rule == "correction-precedence"
+                and skipped_reason == ""
+            )
+            _check(
+                case_id, ok,
+                f"winner_id={winner_id}, first_member={member_ids[0]}, rule={rule}, "
+                f"skipped_reason={skipped_reason!r}",
+            )
+            if ok:
+                passed += 1
+
+        # 5. correction/single-holder-survives-apply
+        case_id = "correction/single-holder-survives-apply"
+        with _fixture_db() as db_path:
+            _id_a = _seed_video("corr5.mp4", filepath=None, camera_name="CamA")
+            _id_b = _seed_video("corr5.mp4", filepath=None, camera_name="CamA")
+            id_c = _seed_video("corr5.mp4", filepath=None, camera_name="CamA")
+            det_c = _seed_detection(id_c)
+            _seed_species(
+                det_c, "felis catus;;;cat", user_common_name="Bobcat",
+                corrected_at="2026-08-01T00:00:00",
+            )
+            snapshot_dir = os.path.join(os.path.dirname(db_path), "snap5")
+            audit_log_path = os.path.join(os.path.dirname(db_path), "audit5.jsonl")
+
+            exit_code = None
+            try:
+                with redirect_stdout(io.StringIO()):
+                    backfill_dedup_videos.main([
+                        "--db", db_path, "--consolidate", "--apply", "--confirm-irreversible",
+                        "--snapshot-dir", snapshot_dir, "--audit-log", audit_log_path,
+                    ])
+            except SystemExit as exc:
+                exit_code = exc.code
+
+            with database.get_conn() as conn:
+                remaining = [
+                    r["id"] for r in conn.execute(
+                        "SELECT id FROM videos WHERE filename=? AND camera_name IS ?",
+                        ("corr5.mp4", "CamA"),
+                    ).fetchall()
+                ]
+                species_row = conn.execute(
+                    "SELECT s.corrected_at, s.user_common_name FROM species s "
+                    "JOIN detections d ON s.detection_id = d.id WHERE d.video_id=?",
+                    (id_c,),
+                ).fetchone()
+
+            ok = (
+                exit_code == 0
+                and remaining == [id_c]
+                and species_row is not None
+                and species_row["corrected_at"] == "2026-08-01T00:00:00"
+                and species_row["user_common_name"] == "Bobcat"
+            )
+            _check(
+                case_id, ok,
+                f"exit_code={exit_code}, remaining={remaining}, "
+                f"species_row={dict(species_row) if species_row else None}",
+            )
+            if ok:
+                passed += 1
+
+        # 6. correction/conflicting-holders-skipped
+        case_id = "correction/conflicting-holders-skipped"
+        with _fixture_db() as db_path:
+            id_a = _seed_video("corr6.mp4", filepath=None, camera_name="CamA")
+            id_b = _seed_video("corr6.mp4", filepath=None, camera_name="CamA")
+            det_a = _seed_detection(id_a)
+            _seed_species(det_a, "felis catus;;;cat", corrected_at="2026-08-01T00:00:00")
+            det_b = _seed_detection(id_b)
+            _seed_species(det_b, "lynx rufus;;;bobcat", corrected_at="2026-08-02T00:00:00")
+
+            with database.get_conn() as conn:
+                plan = backfill_dedup_videos.plan_group(conn, "corr6.mp4", "CamA")
+            ok_plan = plan.skipped_reason == "conflicting-corrections"
+
+            snapshot_before = _table_snapshot()
+
+            snapshot_dir = os.path.join(os.path.dirname(db_path), "snap6")
+            audit_log_path = os.path.join(os.path.dirname(db_path), "audit6.jsonl")
+            exit_code = None
+            try:
+                with redirect_stdout(io.StringIO()):
+                    backfill_dedup_videos.main([
+                        "--db", db_path, "--consolidate", "--apply", "--confirm-irreversible",
+                        "--snapshot-dir", snapshot_dir, "--audit-log", audit_log_path,
+                    ])
+            except SystemExit as exc:
+                exit_code = exc.code
+
+            snapshot_after = _table_snapshot()
+
+            ok = ok_plan and exit_code == 0 and snapshot_before == snapshot_after
+            _check(
+                case_id, ok,
+                f"plan.skipped_reason={plan.skipped_reason!r}, exit_code={exit_code}, "
+                f"snapshot_equal={snapshot_before == snapshot_after}",
+            )
+            if ok:
+                passed += 1
+
+        # 7. correction/same-member-two-signals-not-conflicting
+        case_id = "correction/same-member-two-signals-not-conflicting"
+        with _fixture_db():
+            _id_a = _seed_video("corr7.mp4", filepath=None, camera_name="CamA")
+            id_b = _seed_video("corr7.mp4", filepath=None, camera_name="CamA")
+            det_b = _seed_detection(id_b)
+            _seed_species(det_b, "felis catus;;;cat", corrected_at="2026-08-01T00:00:00")
+            _seed_video_correction(id_b, "felis catus;;;cat", corrected_label="lynx rufus;;;bobcat")
+
+            with database.get_conn() as conn:
+                member_ids = backfill_dedup_videos.group_member_ids(conn, "corr7.mp4", "CamA")
+                winner_id, rule, skipped_reason = backfill_dedup_videos.select_winner(
+                    conn, member_ids
+                )
+
+            ok = winner_id == id_b and rule == "correction-precedence" and skipped_reason == ""
+            _check(
+                case_id, ok,
+                f"winner_id={winner_id}, rule={rule}, skipped_reason={skipped_reason!r}",
+            )
+            if ok:
+                passed += 1
+
+        # 8. correction/label-disagreement-without-correction-uses-tiebreak
+        case_id = "correction/label-disagreement-without-correction-uses-tiebreak"
+        with _fixture_db():
+            id_a = _seed_video("corr8.mp4", filepath=None, camera_name="CamA")
+            id_b = _seed_video("corr8.mp4", filepath=None, camera_name="CamA")
+            det_a = _seed_detection(id_a)
+            _seed_species(det_a, "felis catus;;;cat")
+            det_b = _seed_detection(id_b)
+            _seed_species(det_b, "lynx rufus;;;bobcat")
+
+            with database.get_conn() as conn:
+                member_ids = backfill_dedup_videos.group_member_ids(conn, "corr8.mp4", "CamA")
+                winner_id, rule, skipped_reason = backfill_dedup_videos.select_winner(
+                    conn, member_ids
+                )
+
+            ok = winner_id == member_ids[0] and rule == "default-tiebreak" and skipped_reason == ""
+            _check(
+                case_id, ok,
+                f"winner_id={winner_id}, rule={rule}, skipped_reason={skipped_reason!r}",
+            )
+            if ok:
+                passed += 1
+
+        # 9. correction/quality-disagreement-without-correction-uses-tiebreak
+        case_id = "correction/quality-disagreement-without-correction-uses-tiebreak"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            id_a = _seed_video("corr9.mp4", filepath=None, camera_name="CamA")
+            id_b = _seed_video("corr9.mp4", filepath=None, camera_name="CamA")
+            det_a = _seed_detection(id_a)
+            _seed_species(det_a, "felis catus;;;cat")
+            _seed_crop(det_a, _seed_crop_file(tmpdir, "corr9_a.jpg"), quality_score=20.0)
+            det_b = _seed_detection(id_b)
+            _seed_species(det_b, "felis catus;;;cat")
+            _seed_crop(det_b, _seed_crop_file(tmpdir, "corr9_b.jpg"), quality_score=90.0)
+
+            with database.get_conn() as conn:
+                member_ids = backfill_dedup_videos.group_member_ids(conn, "corr9.mp4", "CamA")
+                winner_id, rule, skipped_reason = backfill_dedup_videos.select_winner(
+                    conn, member_ids
+                )
+
+            ok = winner_id == member_ids[0] and rule == "default-tiebreak" and skipped_reason == ""
+            _check(
+                case_id, ok,
+                f"winner_id={winner_id}, rule={rule}, skipped_reason={skipped_reason!r}",
+            )
+            if ok:
+                passed += 1
+
+    except AttributeError as exc:
+        print(f"FAIL: correction-precedence/function-missing — {exc}")
+        return (passed, total)
+
+    return (passed, total)
+
+
 def suite_grouping():
     """Six cases exercising backfill_dedup_videos.find_duplicate_groups() /
     group_member_ids() against synthetic fixture data."""
@@ -800,7 +1048,7 @@ def main():
         "--suite",
         choices=[
             "grouping", "audit-readonly", "tiebreak", "consolidate-tracer",
-            "fk-integrity", "all",
+            "fk-integrity", "correction-precedence", "all",
         ],
         default="all",
     )
@@ -812,6 +1060,7 @@ def main():
         "tiebreak": suite_tiebreak,
         "consolidate-tracer": suite_consolidate_tracer,
         "fk-integrity": suite_fk_integrity,
+        "correction-precedence": suite_correction_precedence,
     }
     selected = suites.keys() if args.suite == "all" else [args.suite]
 
