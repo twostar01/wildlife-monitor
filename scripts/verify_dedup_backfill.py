@@ -1369,6 +1369,196 @@ def suite_pairing_preservation():
     return (passed, total)
 
 
+def _seed_batching_group(index):
+    """Seed one simple two-member duplicate group for suite_batching(): a
+    live-filepath winner and a filepath-None loser, no detections/crops/
+    corrections/pairing — batching only needs to exercise the transaction
+    boundary and --limit's group count, not the child-handling rules
+    already covered by suite_reparent_and_skip/suite_pairing_preservation."""
+    filename = f"batch_{index}.mp4"
+    winner_id = _seed_video(filename, filepath=f"/nas/archive/{filename}", camera_name="CamA")
+    loser_id = _seed_video(filename, filepath=None, camera_name="CamA")
+    return filename, winner_id, loser_id
+
+
+def suite_batching():
+    """Four cases exercising bounded-batch commits: a batch size smaller
+    than the fixture's total group count still consolidates everything, a
+    fault mid-batch leaves only the already-committed batches consolidated,
+    --limit caps how many groups a single run processes, and a second
+    unlimited run finishes the rest."""
+    passed = 0
+    total = 4
+    try:
+        # 1. batching/all-batches-consolidate
+        case_id = "batching/all-batches-consolidate"
+        with _fixture_db():
+            for i in range(12):
+                _seed_batching_group(i)
+
+            with database.get_conn() as conn:
+                all_groups = backfill_dedup_videos.find_duplicate_groups(conn)
+                plans = [
+                    backfill_dedup_videos.plan_group(conn, g["filename"], g["camera_name"])
+                    for g in all_groups
+                ]
+
+            for batch in backfill_dedup_videos.iter_batches(plans, 5):
+                with database.get_conn() as conn:
+                    for plan in batch:
+                        if plan.pairing_repoints:
+                            backfill_dedup_videos.apply_pairing_repoints(
+                                conn, plan.pairing_repoints
+                            )
+                        if plan.reparent_from is not None:
+                            backfill_dedup_videos.reparent_detections(
+                                conn, plan.reparent_from, plan.winner_id
+                            )
+                        backfill_dedup_videos.apply_group(conn, plan)
+
+            with database.get_conn() as conn:
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+                remaining = backfill_dedup_videos.find_duplicate_groups(conn)
+
+            ok = violations == [] and remaining == []
+            _check(case_id, ok, f"violations={violations}, remaining={remaining}")
+            if ok:
+                passed += 1
+
+        # 2. batching/interrupt-leaves-first-batch-whole
+        case_id = "batching/interrupt-leaves-first-batch-whole"
+        with _fixture_db():
+            for i in range(12):
+                _seed_batching_group(i)
+
+            with database.get_conn() as conn:
+                all_groups = backfill_dedup_videos.find_duplicate_groups(conn)
+                plans = [
+                    backfill_dedup_videos.plan_group(conn, g["filename"], g["camera_name"])
+                    for g in all_groups
+                ]
+
+            batches = list(backfill_dedup_videos.iter_batches(plans, 5))
+
+            with database.get_conn() as conn:
+                for plan in batches[0]:
+                    if plan.reparent_from is not None:
+                        backfill_dedup_videos.reparent_detections(
+                            conn, plan.reparent_from, plan.winner_id
+                        )
+                    backfill_dedup_videos.apply_group(conn, plan)
+
+            raised = False
+            try:
+                with database.get_conn() as conn:
+                    proxy = _FlakyConnProxy(conn, fail_on_call=1)
+                    for plan in batches[1]:
+                        if plan.reparent_from is not None:
+                            backfill_dedup_videos.reparent_detections(
+                                proxy, plan.reparent_from, plan.winner_id
+                            )
+                        backfill_dedup_videos.apply_group(proxy, plan)
+            except sqlite3.OperationalError:
+                raised = True
+
+            with database.get_conn() as conn:
+                remaining_groups = backfill_dedup_videos.find_duplicate_groups(conn)
+            remaining_filenames = {g["filename"] for g in remaining_groups}
+            batch0_filenames = {p.filename for p in batches[0]}
+            rest_filenames = {p.filename for b in batches[1:] for p in b}
+
+            ok = (
+                raised
+                and remaining_filenames == rest_filenames
+                and batch0_filenames.isdisjoint(remaining_filenames)
+            )
+            _check(
+                case_id, ok,
+                f"raised={raised}, remaining_filenames={remaining_filenames}, "
+                f"rest_filenames={rest_filenames}, batch0_filenames={batch0_filenames}",
+            )
+            if ok:
+                passed += 1
+
+        # 3. batching/limit-partial-rehearsal
+        case_id = "batching/limit-partial-rehearsal"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            for i in range(12):
+                _seed_batching_group(i)
+
+            snapshot_dir = os.path.join(tmpdir, "snap-limit")
+            audit_log_path = os.path.join(tmpdir, "audit-limit.jsonl")
+            exit_code = None
+            try:
+                with redirect_stdout(io.StringIO()):
+                    backfill_dedup_videos.main([
+                        "--db", db_path, "--consolidate", "--apply", "--confirm-irreversible",
+                        "--limit", "3",
+                        "--snapshot-dir", snapshot_dir, "--audit-log", audit_log_path,
+                    ])
+            except SystemExit as exc:
+                exit_code = exc.code
+
+            with database.get_conn() as conn:
+                remaining = backfill_dedup_videos.find_duplicate_groups(conn)
+
+            ok = exit_code == 0 and len(remaining) == 9
+            _check(case_id, ok, f"exit_code={exit_code}, remaining_count={len(remaining)}")
+            if ok:
+                passed += 1
+
+        # 4. batching/limit-then-full-run-completes
+        case_id = "batching/limit-then-full-run-completes"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            for i in range(12):
+                _seed_batching_group(i)
+
+            snapshot_dir = os.path.join(tmpdir, "snap-limit2")
+            audit_log_path = os.path.join(tmpdir, "audit-limit2.jsonl")
+            run_args_limited = [
+                "--db", db_path, "--consolidate", "--apply", "--confirm-irreversible",
+                "--limit", "3",
+                "--snapshot-dir", snapshot_dir, "--audit-log", audit_log_path,
+            ]
+            run_args_full = [
+                "--db", db_path, "--consolidate", "--apply", "--confirm-irreversible",
+                "--snapshot-dir", snapshot_dir, "--audit-log", audit_log_path,
+            ]
+
+            exit1 = None
+            try:
+                with redirect_stdout(io.StringIO()):
+                    backfill_dedup_videos.main(list(run_args_limited))
+            except SystemExit as exc:
+                exit1 = exc.code
+
+            exit2 = None
+            try:
+                with redirect_stdout(io.StringIO()):
+                    backfill_dedup_videos.main(list(run_args_full))
+            except SystemExit as exc:
+                exit2 = exc.code
+
+            with database.get_conn() as conn:
+                remaining = backfill_dedup_videos.find_duplicate_groups(conn)
+
+            ok = exit1 == 0 and exit2 == 0 and remaining == []
+            _check(
+                case_id, ok,
+                f"exit1={exit1}, exit2={exit2}, remaining={remaining}",
+            )
+            if ok:
+                passed += 1
+
+    except AttributeError as exc:
+        print(f"FAIL: batching/function-missing — {exc}")
+        return (passed, total)
+
+    return (passed, total)
+
+
 def suite_grouping():
     """Six cases exercising backfill_dedup_videos.find_duplicate_groups() /
     group_member_ids() against synthetic fixture data."""
@@ -1526,7 +1716,7 @@ def main():
         choices=[
             "grouping", "audit-readonly", "tiebreak", "consolidate-tracer",
             "fk-integrity", "correction-precedence", "reparent-and-skip",
-            "pairing-preservation", "all",
+            "pairing-preservation", "batching", "all",
         ],
         default="all",
     )
@@ -1541,6 +1731,7 @@ def main():
         "correction-precedence": suite_correction_precedence,
         "reparent-and-skip": suite_reparent_and_skip,
         "pairing-preservation": suite_pairing_preservation,
+        "batching": suite_batching,
     }
     selected = suites.keys() if args.suite == "all" else [args.suite]
 
