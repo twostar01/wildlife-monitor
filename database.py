@@ -154,6 +154,22 @@ CREATE INDEX IF NOT EXISTS idx_blacklist_label ON blacklist(label);
 CREATE INDEX IF NOT EXISTS idx_corrections_video ON video_corrections(video_id);
 CREATE INDEX IF NOT EXISTS idx_corrections_label ON video_corrections(original_label);
 CREATE INDEX IF NOT EXISTS idx_runs_start_time ON runs(start_time DESC);
+-- The three indexes below were added during Phase 9's dedup backfill
+-- (09-04 full-scale rehearsal, 2026-08-09): none of crops.detection_id,
+-- species.detection_id, or videos.paired_video_id previously carried an
+-- index, even though all three are FOREIGN KEY columns. SQLite enforces
+-- foreign keys per-connection (get_conn() turns PRAGMA foreign_keys=ON),
+-- and an unindexed FK column makes every DELETE of the referenced parent
+-- row (videos or detections) do a full table scan to find/cascade any
+-- child that references it — regardless of how the application phrases
+-- its own DELETE statement. Measured directly during the rehearsal: a
+-- 50-group consolidation sample went from 24.655s to 0.011s (~2,241x)
+-- once these three indexes existed. CREATE INDEX IF NOT EXISTS is
+-- idempotent and applies retroactively to an already-deployed database
+-- on its next init_db() call, the same as the six indexes above.
+CREATE INDEX IF NOT EXISTS idx_crops_detection_id ON crops(detection_id);
+CREATE INDEX IF NOT EXISTS idx_species_detection_id ON species(detection_id);
+CREATE INDEX IF NOT EXISTS idx_videos_paired_video_id ON videos(paired_video_id);
 """
 
 # Migration: add camera_name to existing databases that predate this column
