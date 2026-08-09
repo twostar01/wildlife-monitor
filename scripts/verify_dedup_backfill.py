@@ -1559,6 +1559,216 @@ def suite_batching():
     return (passed, total)
 
 
+def suite_summary_report():
+    """Five cases covering two correctness/performance fixes discovered
+    during the 09-04 full-scale rehearsal, both found only at real
+    production scale (Pitfall 7's exact purpose):
+
+    Cases 1-3: build_summary_report()'s file-disposition preview
+    (files_would_remove/files_would_retain), which was found to always
+    report 0 removable files against real production data — it was
+    checking the live, not-yet-mutated database for "is this path still
+    referenced", which always finds the candidate's own about-to-be-deleted
+    row since nothing has been deleted yet in a dry-run. Case 3 also
+    confirms the cached (`cache=` a _bulk_prefetch() dict) and uncached
+    code paths agree byte-for-byte, since production-scale runs use the
+    cached path exclusively and small-fixture tests exercise the uncached
+    path by default.
+
+    Cases 4-5: cleanup_files()'s still-referenced guard, which issued one
+    query per unique candidate path — a full table scan against
+    videos.thumbnail_path (no index) at real row counts, measured at
+    roughly 3 minutes per --batch-size 500 batch during the rehearsal.
+    _still_referenced_paths() batches this into two chunked IN-clause
+    queries instead."""
+    passed = 0
+    total = 5
+    try:
+        # 1. summary/unique-loser-crop-would-remove
+        case_id = "summary/unique-loser-crop-would-remove"
+        with _fixture_db():
+            winner_id = _seed_video(
+                "a.mp4", filepath="/nas/archive/a.mp4", camera_name="CamA"
+            )
+            wdet = _seed_detection(winner_id)
+            _seed_crop(wdet, crop_path="/data/crops/winner_crop.jpg")
+            loser_id = _seed_video("a.mp4", filepath=None, camera_name="CamA")
+            ldet = _seed_detection(loser_id)
+            _seed_crop(ldet, crop_path="/data/crops/loser_crop.jpg")
+
+            with database.get_conn() as conn:
+                groups = backfill_dedup_videos.find_duplicate_groups(conn)
+                plans = [
+                    backfill_dedup_videos.plan_group(conn, g["filename"], g["camera_name"])
+                    for g in groups
+                ]
+                report = backfill_dedup_videos.build_summary_report(conn, plans, len(groups))
+
+            ok = report["files_would_remove"] == 1 and report["files_would_retain"] == 0
+            _check(case_id, ok, f"report={report}")
+            if ok:
+                passed += 1
+
+        # 2. summary/shared-thumbnail-would-retain
+        case_id = "summary/shared-thumbnail-would-retain"
+        with _fixture_db():
+            shared_thumb = "/data/thumbnails/shared.jpg"
+            winner_id = _seed_video(
+                "b.mp4", filepath="/nas/archive/b.mp4", camera_name="CamA",
+                thumbnail_path=shared_thumb,
+            )
+            wdet = _seed_detection(winner_id)
+            _seed_crop(wdet, crop_path="/data/crops/winner_crop2.jpg")
+            loser_id = _seed_video(
+                "b.mp4", filepath=None, camera_name="CamA", thumbnail_path=shared_thumb
+            )
+            ldet = _seed_detection(loser_id)
+            _seed_crop(ldet, crop_path="/data/crops/loser_crop2.jpg")
+
+            with database.get_conn() as conn:
+                groups = backfill_dedup_videos.find_duplicate_groups(conn)
+                cache = backfill_dedup_videos._bulk_prefetch(conn)
+                plans = [
+                    backfill_dedup_videos.plan_group(
+                        conn, g["filename"], g["camera_name"], cache=cache
+                    )
+                    for g in groups
+                ]
+                report = backfill_dedup_videos.build_summary_report(
+                    conn, plans, len(groups), cache=cache
+                )
+
+            # loser_crop2.jpg is unique to the loser -> would_remove;
+            # shared.jpg is still referenced by the surviving winner's
+            # identical thumbnail_path (hazard H-1) -> would_retain.
+            ok = report["files_would_remove"] == 1 and report["files_would_retain"] == 1
+            _check(case_id, ok, f"report={report}")
+            if ok:
+                passed += 1
+
+        # 3. summary/cached-and-uncached-agree
+        case_id = "summary/cached-and-uncached-agree"
+        with _fixture_db():
+            shared_thumb = "/data/thumbnails/shared3.jpg"
+            winner_id = _seed_video(
+                "c.mp4", filepath="/nas/archive/c.mp4", camera_name="CamA",
+                thumbnail_path=shared_thumb,
+            )
+            wdet = _seed_detection(winner_id)
+            _seed_crop(wdet, crop_path="/data/crops/winner_crop3.jpg")
+            loser_id = _seed_video(
+                "c.mp4", filepath=None, camera_name="CamA", thumbnail_path=shared_thumb
+            )
+            ldet = _seed_detection(loser_id)
+            _seed_crop(ldet, crop_path="/data/crops/loser_crop3.jpg")
+
+            with database.get_conn() as conn:
+                groups = backfill_dedup_videos.find_duplicate_groups(conn)
+                plans_uncached = [
+                    backfill_dedup_videos.plan_group(conn, g["filename"], g["camera_name"])
+                    for g in groups
+                ]
+                report_uncached = backfill_dedup_videos.build_summary_report(
+                    conn, plans_uncached, len(groups)
+                )
+
+                cache = backfill_dedup_videos._bulk_prefetch(conn)
+                plans_cached = [
+                    backfill_dedup_videos.plan_group(
+                        conn, g["filename"], g["camera_name"], cache=cache
+                    )
+                    for g in groups
+                ]
+                report_cached = backfill_dedup_videos.build_summary_report(
+                    conn, plans_cached, len(groups), cache=cache
+                )
+
+            ok = report_uncached == report_cached
+            _check(
+                case_id, ok,
+                f"uncached={report_uncached}, cached={report_cached}",
+            )
+            if ok:
+                passed += 1
+
+        # 4. summary/cleanup-files-batched-check-still-correct
+        # Also added during the 09-04 rehearsal: cleanup_files()'s
+        # per-candidate-path "is this still referenced" query was a full
+        # table scan on videos.thumbnail_path (no index) called once per
+        # unique path — roughly 3 minutes per --batch-size 500 batch
+        # against production's real row count. _still_referenced_paths()
+        # replaces it with two batched IN-clause queries; this case checks
+        # the batched result still distinguishes retained-vs-removed
+        # correctly across a real still-referenced path, a real
+        # not-referenced path, and a real crop_path match.
+        case_id = "summary/cleanup-files-batched-check-still-correct"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            surviving_id = _seed_video(
+                "keep.mp4", filepath="/nas/archive/keep.mp4", camera_name="CamA",
+                thumbnail_path="/data/thumbnails/keep_thumb.jpg",
+            )
+            kdet = _seed_detection(surviving_id)
+            kept_crop_path = _seed_crop_file(tmpdir, "kept_crop.jpg")
+            _seed_crop(kdet, crop_path=kept_crop_path)
+
+            orphan_thumb = _seed_crop_file(tmpdir, "orphan_thumb.jpg")
+            orphan_crop = _seed_crop_file(tmpdir, "orphan_crop.jpg")
+
+            still_referenced_thumb = "/data/thumbnails/keep_thumb.jpg"
+            candidate_paths = [orphan_thumb, orphan_crop, still_referenced_thumb, kept_crop_path]
+
+            with database.get_conn() as conn:
+                result = backfill_dedup_videos.cleanup_files(conn, candidate_paths)
+
+            outcome_by_path = {d["path"]: d["outcome"] for d in result["details"]}
+            ok = (
+                outcome_by_path.get(orphan_thumb) == "removed"
+                and outcome_by_path.get(orphan_crop) == "removed"
+                and outcome_by_path.get(still_referenced_thumb) == "retained"
+                and outcome_by_path.get(kept_crop_path) == "retained"
+                and not os.path.exists(orphan_thumb)
+                and not os.path.exists(orphan_crop)
+                and os.path.exists(kept_crop_path)
+            )
+            _check(case_id, ok, f"result={result}")
+            if ok:
+                passed += 1
+
+        # 5. summary/cleanup-files-chunks-past-500-paths
+        # _still_referenced_paths() chunks its IN clause at 500
+        # placeholders; this case confirms a candidate list larger than
+        # one chunk still resolves every path correctly, not just the
+        # first 500.
+        case_id = "summary/cleanup-files-chunks-past-500-paths"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            candidate_paths = [_seed_crop_file(tmpdir, f"chunk_{i}.jpg") for i in range(620)]
+
+            with database.get_conn() as conn:
+                result = backfill_dedup_videos.cleanup_files(conn, candidate_paths)
+
+            ok = (
+                result["removed"] == 620
+                and result["retained"] == 0
+                and result["failed"] == 0
+                and all(not os.path.exists(p) for p in candidate_paths)
+            )
+            _check(
+                case_id, ok,
+                f"removed={result['removed']}, retained={result['retained']}, "
+                f"failed={result['failed']}",
+            )
+            if ok:
+                passed += 1
+
+    except AttributeError as exc:
+        print(f"FAIL: summary-report/function-missing — {exc}")
+        return (passed, total)
+
+    return (passed, total)
+
+
 def suite_grouping():
     """Six cases exercising backfill_dedup_videos.find_duplicate_groups() /
     group_member_ids() against synthetic fixture data."""
@@ -1716,7 +1926,7 @@ def main():
         choices=[
             "grouping", "audit-readonly", "tiebreak", "consolidate-tracer",
             "fk-integrity", "correction-precedence", "reparent-and-skip",
-            "pairing-preservation", "batching", "all",
+            "pairing-preservation", "batching", "summary-report", "all",
         ],
         default="all",
     )
@@ -1732,6 +1942,7 @@ def main():
         "reparent-and-skip": suite_reparent_and_skip,
         "pairing-preservation": suite_pairing_preservation,
         "batching": suite_batching,
+        "summary-report": suite_summary_report,
     }
     selected = suites.keys() if args.suite == "all" else [args.suite]
 
