@@ -221,11 +221,105 @@ def collect_candidate_files(conn, loser_ids):
     return sorted(paths)
 
 
+def choose_reparent_source(conn, winner_id, loser_ids):
+    """Return the loser id to adopt detections from (rule 4), or None.
+
+    Returns None unless the winner's detection count is zero and at least
+    one loser's is greater than zero — a winner that already holds any
+    detections is never re-parented onto, even if a loser holds more.
+    Among qualifying losers, returns the one with the highest detection
+    count, breaking ties by lowest id so repeated planning is
+    deterministic."""
+    winner_detections = conn.execute(
+        "SELECT COUNT(*) FROM detections WHERE video_id=?", (winner_id,)
+    ).fetchone()[0]
+    if winner_detections != 0:
+        return None
+
+    candidates = []
+    for loser_id in loser_ids:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM detections WHERE video_id=?", (loser_id,)
+        ).fetchone()[0]
+        if count > 0:
+            candidates.append((count, loser_id))
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda c: (-c[0], c[1]))
+    return candidates[0][1]
+
+
+def reparent_detections(conn, from_video_id, to_video_id):
+    """Move every detection from one video onto another via a single
+    UPDATE. Does not touch species or crops: both reference detection_id,
+    not video_id, so they follow the moved detections automatically without
+    being touched. Does not move video_corrections either — that table
+    references video_id directly and records the operator's judgment about
+    a specific row; a loser carrying a video_corrections row would already
+    have been caught by correction_signal() and either won the group
+    outright or caused a conflicting-corrections skip, so a re-parent
+    source is guaranteed not to carry one."""
+    conn.execute(
+        "UPDATE detections SET video_id=? WHERE video_id=?",
+        (to_video_id, from_video_id),
+    )
+
+
+def collect_pairing_repoints(conn, winner_id, loser_ids):
+    """Return (row_id, new_target) pairs needed to preserve every
+    paired_video_id relationship a group's losers participate in (rule 7),
+    checked in both directions per Pitfall 5:
+
+    - any row elsewhere in the table whose paired_video_id references a
+      loser is re-pointed at the winner
+    - the winner's own paired_video_id, if it references a loser in this
+      same group, is cleared to NULL rather than re-pointed at itself — a
+      self-reference is meaningless
+
+    Never relies on the paired_video_id column's ON DELETE SET NULL
+    default, which would silently break a live pairing with no error."""
+    if not loser_ids:
+        return []
+
+    placeholders = ",".join("?" for _ in loser_ids)
+    exclude_ids = list(loser_ids) + [winner_id]
+    exclude_placeholders = ",".join("?" for _ in exclude_ids)
+
+    repoints = []
+    for row in conn.execute(
+        f"SELECT id FROM videos WHERE paired_video_id IN ({placeholders}) "
+        f"AND id NOT IN ({exclude_placeholders})",
+        tuple(loser_ids) + tuple(exclude_ids),
+    ):
+        repoints.append((row["id"], winner_id))
+
+    winner_row = conn.execute(
+        "SELECT paired_video_id FROM videos WHERE id=?", (winner_id,)
+    ).fetchone()
+    if winner_row is not None and winner_row["paired_video_id"] in loser_ids:
+        repoints.append((winner_id, None))
+
+    return repoints
+
+
+def apply_pairing_repoints(conn, repoints):
+    """Apply the (row_id, new_target) pairs collect_pairing_repoints()
+    computed, one UPDATE per pair. Must run inside the group's transaction
+    before any loser row is deleted."""
+    for row_id, new_target in repoints:
+        conn.execute(
+            "UPDATE videos SET paired_video_id=? WHERE id=?", (new_target, row_id)
+        )
+
+
 def plan_group(conn, filename, camera_name):
     """Build and return a GroupPlan with no side effects at all — safe to
     call in dry-run mode against production. Gathers member ids, selects the
-    winner, sums each loser's child_stats() into the count fields, and
-    collects candidate_files via collect_candidate_files().
+    winner, applies the child-handling rules (4/5/6) and the pairing-repoint
+    rule (7) when no skip is already set, sums each loser's child_stats()
+    into the count fields, and collects candidate_files via
+    collect_candidate_files().
 
     loser_ids is every member id that is not the winner — computed by
     exclusion rather than member_ids[1:], because correction-precedence
@@ -235,6 +329,47 @@ def plan_group(conn, filename, camera_name):
     member_ids = group_member_ids(conn, filename, camera_name)
     winner_id, rule, skipped_reason = select_winner(conn, member_ids)
     loser_ids = [vid for vid in member_ids if vid != winner_id]
+
+    reparent_from = None
+    if not skipped_reason:
+        reparent_from = choose_reparent_source(conn, winner_id, loser_ids)
+        if reparent_from is not None:
+            # Rule 4: the winner holds zero detections but the richest
+            # loser holds some — adopt that loser's detections onto the
+            # winner rather than discarding the only detection data the
+            # physical file has.
+            rule = f"{rule}+reparent"
+        else:
+            winner_stats = child_stats(conn, winner_id)
+            loser_children_stats = [child_stats(conn, lid) for lid in loser_ids]
+            if (
+                winner_stats["detections"] > 0
+                and winner_stats["crops"] == 0
+                and any(
+                    s["detections"] > 0 and s["crops"] > 0 for s in loser_children_stats
+                )
+            ):
+                # Rule 5 (hazard H-2, see 09-03-PLAN.md <why_rule_5_skips>):
+                # the winner holds detections but zero crops while a loser's
+                # detections hold crops — a downstream INSERT OR REPLACE
+                # migrated the shared crop_path onto a later duplicate's
+                # detection_id, leaving the winner crop-less and a loser
+                # holding every crop the file has. Neither automatic
+                # resolution is safe: deleting the loser destroys the only
+                # crops for that physical file (its gallery tiles vanish);
+                # re-parenting the loser's detections onto the winner
+                # duplicates the same animal in the gallery; and choosing
+                # the loser as winner instead would mean re-litigating the
+                # D-01 tie-break, which is outside this phase's authority.
+                # Skipping leaves the group exactly as production has it
+                # today — no better, no worse, no data destroyed — and
+                # reports it so the operator sees the size of the
+                # unconsolidated remainder at the D-05 go/no-go gate.
+                skipped_reason = "winner-crops-migrated"
+
+    pairing_repoints = []
+    if not skipped_reason:
+        pairing_repoints = collect_pairing_repoints(conn, winner_id, loser_ids)
 
     detections = species = crops = corrections = 0
     for loser_id in loser_ids:
@@ -246,8 +381,14 @@ def plan_group(conn, filename, camera_name):
 
     # A skipped group is never touched, so it has nothing to clean up —
     # collecting candidate files for it would be meaningless work and could
-    # confuse the report into implying files are slated for removal.
-    candidate_files = [] if skipped_reason else collect_candidate_files(conn, loser_ids)
+    # confuse the report into implying files are slated for removal. A
+    # re-parent source's crop paths stay live under the winner, so they are
+    # excluded from the candidate set even though the group itself proceeds.
+    if skipped_reason:
+        candidate_files = []
+    else:
+        cleanup_loser_ids = [lid for lid in loser_ids if lid != reparent_from]
+        candidate_files = collect_candidate_files(conn, cleanup_loser_ids)
 
     return GroupPlan(
         filename=filename,
@@ -256,13 +397,13 @@ def plan_group(conn, filename, camera_name):
         loser_ids=loser_ids,
         rule=rule,
         skipped_reason=skipped_reason,
-        reparent_from=None,
+        reparent_from=reparent_from,
         detections=detections,
         species=species,
         crops=crops,
         corrections=corrections,
         candidate_files=candidate_files,
-        pairing_repoints=[],
+        pairing_repoints=pairing_repoints,
     )
 
 
@@ -280,25 +421,35 @@ def apply_group(conn, plan):
 
     A skipped group (plan.skipped_reason set) returns immediately with no
     statement issued at all — not even a no-op one. A skipped group must
-    leave production exactly as found."""
+    leave production exactly as found.
+
+    When plan.reparent_from is set, that loser's crops/species/detections
+    rows are excluded from the deletion set — its detections were moved
+    onto the winner (by reparent_detections(), which the caller must run
+    before this function, in the same transaction), not removed, so
+    deleting them here would delete data that now belongs to the winner.
+    Its video_corrections row (should be none — a re-parent source can't
+    hold one, see reparent_detections()'s docstring) and its now-empty
+    videos row are still removed, same as any other loser."""
     counts = {"crops": 0, "species": 0, "detections": 0, "video_corrections": 0, "videos": 0}
     if plan.skipped_reason:
         return counts
     for loser_id in plan.loser_ids:
-        cur = conn.execute(
-            "DELETE FROM crops WHERE detection_id IN "
-            "(SELECT id FROM detections WHERE video_id=?)",
-            (loser_id,),
-        )
-        counts["crops"] += cur.rowcount
-        cur = conn.execute(
-            "DELETE FROM species WHERE detection_id IN "
-            "(SELECT id FROM detections WHERE video_id=?)",
-            (loser_id,),
-        )
-        counts["species"] += cur.rowcount
-        cur = conn.execute("DELETE FROM detections WHERE video_id=?", (loser_id,))
-        counts["detections"] += cur.rowcount
+        if loser_id != plan.reparent_from:
+            cur = conn.execute(
+                "DELETE FROM crops WHERE detection_id IN "
+                "(SELECT id FROM detections WHERE video_id=?)",
+                (loser_id,),
+            )
+            counts["crops"] += cur.rowcount
+            cur = conn.execute(
+                "DELETE FROM species WHERE detection_id IN "
+                "(SELECT id FROM detections WHERE video_id=?)",
+                (loser_id,),
+            )
+            counts["species"] += cur.rowcount
+            cur = conn.execute("DELETE FROM detections WHERE video_id=?", (loser_id,))
+            counts["detections"] += cur.rowcount
         cur = conn.execute("DELETE FROM video_corrections WHERE video_id=?", (loser_id,))
         counts["video_corrections"] += cur.rowcount
         cur = conn.execute("DELETE FROM videos WHERE id=?", (loser_id,))
@@ -395,8 +546,10 @@ def verify_post_conditions(conn):
     """Return fk_violations (row count from PRAGMA foreign_key_check),
     broken_pairings (database.check_pairing_consistency(), not
     re-implemented here), and remaining_groups (find_duplicate_groups()
-    count). Callers must treat a non-zero fk_violations as a hard abort,
-    not a warning."""
+    count). Callers must treat a non-zero fk_violations as a hard abort, not
+    a warning — and a non-zero broken_pairings just as prominently: it means
+    a dual-lens pairing broke during the run, exactly the silent-data-loss
+    mode Pitfall 5 exists to catch."""
     fk_violations = len(conn.execute("PRAGMA foreign_key_check").fetchall())
     broken_pairings = database.check_pairing_consistency()
     remaining_groups = len(find_duplicate_groups(conn))
@@ -829,6 +982,14 @@ def main(argv=None):
     try:
         for plan in plans:
             with database.get_conn() as conn:
+                # Order matters: pairing repoints and the re-parent move
+                # must both land before apply_group()'s deletes touch the
+                # same video ids, all inside one transaction so a mid-group
+                # failure rolls every part of the group back together.
+                if plan.pairing_repoints:
+                    apply_pairing_repoints(conn, plan.pairing_repoints)
+                if plan.reparent_from is not None:
+                    reparent_detections(conn, plan.reparent_from, plan.winner_id)
                 deleted_counts = apply_group(conn, plan)
 
             if args.skip_file_cleanup:
@@ -857,7 +1018,7 @@ def main(argv=None):
     print("Post-run verification:")
     print(json.dumps(verification, indent=2))
 
-    if verification["fk_violations"] != 0:
+    if verification["fk_violations"] != 0 or verification["broken_pairings"] != 0:
         sys.exit(1)
     sys.exit(0)
 
