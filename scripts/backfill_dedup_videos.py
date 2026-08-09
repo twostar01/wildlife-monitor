@@ -118,13 +118,20 @@ def child_stats(conn, video_id):
     }
 
 
-def correction_signal(conn, video_id):
+def correction_signal(conn, video_id, cache=None):
     """Return True when this video carries an operator correction signal
     from either write path: a species row (joined via detections) with
     non-NULL corrected_at, or any video_corrections row for this video_id.
     Both sources must be consulted — database.correct_species() writes the
     first, the video-correction endpoint writes the second, and checking
-    only one silently misses half of the operator's manual labeling."""
+    only one silently misses half of the operator's manual labeling.
+
+    When `cache` (a _bulk_prefetch() dict) is supplied, this is an O(1)
+    dict lookup instead of two fresh queries — required at production scale
+    (~19,291 groups), where the per-call query version issues on the order
+    of tens of thousands of statements just for this one check."""
+    if cache is not None:
+        return _cached_correction_signal(cache, video_id)
     species_row = conn.execute(
         "SELECT 1 FROM species s JOIN detections d ON s.detection_id = d.id "
         "WHERE d.video_id = ? AND s.corrected_at IS NOT NULL LIMIT 1",
@@ -139,10 +146,10 @@ def correction_signal(conn, video_id):
     return correction_row is not None
 
 
-def group_correction_holders(conn, member_ids):
+def group_correction_holders(conn, member_ids, cache=None):
     """Return the subset of member_ids for which correction_signal() is
     True, preserving member_ids' original order."""
-    return [vid for vid in member_ids if correction_signal(conn, vid)]
+    return [vid for vid in member_ids if correction_signal(conn, vid, cache=cache)]
 
 
 @dataclasses.dataclass
@@ -168,7 +175,7 @@ class GroupPlan:
     pairing_repoints: list
 
 
-def select_winner(conn, member_ids):
+def select_winner(conn, member_ids, cache=None):
     """Return (winner_id, rule, skipped_reason) for a duplicate group's
     already tie-break-ordered member ids, applying D-01/D-02's correction
     precedence ahead of the default tie-break:
@@ -193,7 +200,7 @@ def select_winner(conn, member_ids):
       correction present fall straight into this branch as normal ML
       scoring variance, not a signal requiring special handling.
     """
-    holders = group_correction_holders(conn, member_ids)
+    holders = group_correction_holders(conn, member_ids, cache=cache)
     if len(holders) == 1:
         return holders[0], "correction-precedence", ""
     if len(holders) >= 2:
@@ -201,14 +208,27 @@ def select_winner(conn, member_ids):
     return member_ids[0], "default-tiebreak", ""
 
 
-def collect_candidate_files(conn, loser_ids):
+def collect_candidate_files(conn, loser_ids, cache=None):
     """Return the distinct, sorted set of file paths the given losers
     reference: every crop_path from crops joined through those videos'
     detections, plus every non-NULL thumbnail_path on the loser videos rows
     themselves. Collected before deletion, because once the rows are gone
-    the paths are unrecoverable."""
+    the paths are unrecoverable.
+
+    When `cache` (a _bulk_prefetch() dict) is supplied, this reads
+    crop_paths_by_video/thumbnail_by_video instead of issuing two fresh
+    queries per group — required at production scale, where the per-group
+    query version issues on the order of tens of thousands of statements."""
     if not loser_ids:
         return []
+    if cache is not None:
+        paths = set()
+        for lid in loser_ids:
+            paths.update(cache["crop_paths_by_video"].get(lid, []))
+            thumb = cache["thumbnail_by_video"].get(lid)
+            if thumb is not None:
+                paths.add(thumb)
+        return sorted(paths)
     placeholders = ",".join("?" for _ in loser_ids)
     paths = set()
     for row in conn.execute(
@@ -227,7 +247,7 @@ def collect_candidate_files(conn, loser_ids):
     return sorted(paths)
 
 
-def choose_reparent_source(conn, winner_id, loser_ids):
+def choose_reparent_source(conn, winner_id, loser_ids, cache=None):
     """Return the loser id to adopt detections from (rule 4), or None.
 
     Returns None unless the winner's detection count is zero and at least
@@ -235,18 +255,29 @@ def choose_reparent_source(conn, winner_id, loser_ids):
     detections is never re-parented onto, even if a loser holds more.
     Among qualifying losers, returns the one with the highest detection
     count, breaking ties by lowest id so repeated planning is
-    deterministic."""
-    winner_detections = conn.execute(
-        "SELECT COUNT(*) FROM detections WHERE video_id=?", (winner_id,)
-    ).fetchone()[0]
+    deterministic.
+
+    When `cache` (a _bulk_prefetch() dict) is supplied, detection counts
+    come from its detections_count dict instead of one query per member —
+    required at production scale, where the per-member query version
+    issues on the order of tens of thousands of statements."""
+    if cache is not None:
+        winner_detections = cache["detections_count"].get(winner_id, 0)
+    else:
+        winner_detections = conn.execute(
+            "SELECT COUNT(*) FROM detections WHERE video_id=?", (winner_id,)
+        ).fetchone()[0]
     if winner_detections != 0:
         return None
 
     candidates = []
     for loser_id in loser_ids:
-        count = conn.execute(
-            "SELECT COUNT(*) FROM detections WHERE video_id=?", (loser_id,)
-        ).fetchone()[0]
+        if cache is not None:
+            count = cache["detections_count"].get(loser_id, 0)
+        else:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM detections WHERE video_id=?", (loser_id,)
+            ).fetchone()[0]
         if count > 0:
             candidates.append((count, loser_id))
     if not candidates:
@@ -272,7 +303,7 @@ def reparent_detections(conn, from_video_id, to_video_id):
     )
 
 
-def collect_pairing_repoints(conn, winner_id, loser_ids):
+def collect_pairing_repoints(conn, winner_id, loser_ids, cache=None):
     """Return (row_id, new_target) pairs needed to preserve every
     paired_video_id relationship a group's losers participate in (rule 7),
     checked in both directions per Pitfall 5:
@@ -284,12 +315,31 @@ def collect_pairing_repoints(conn, winner_id, loser_ids):
       self-reference is meaningless
 
     Never relies on the paired_video_id column's ON DELETE SET NULL
-    default, which would silently break a live pairing with no error."""
+    default, which would silently break a live pairing with no error.
+
+    When `cache` (a _bulk_prefetch() dict) is supplied, both directions
+    are resolved from its paired_referrers/paired_by_video dicts instead
+    of two fresh queries per group — required at production scale, where
+    the per-group query version issues on the order of tens of thousands
+    of statements, and production audit measured groups_with_pairing at 0
+    but that reflects today's data shape, not a guarantee for every run."""
     if not loser_ids:
         return []
 
+    exclude_ids = set(loser_ids) | {winner_id}
+
+    if cache is not None:
+        repoints = []
+        for loser_id in loser_ids:
+            for referrer_id in cache["paired_referrers"].get(loser_id, []):
+                if referrer_id not in exclude_ids:
+                    repoints.append((referrer_id, winner_id))
+        winner_target = cache["paired_by_video"].get(winner_id)
+        if winner_target in loser_ids:
+            repoints.append((winner_id, None))
+        return repoints
+
     placeholders = ",".join("?" for _ in loser_ids)
-    exclude_ids = list(loser_ids) + [winner_id]
     exclude_placeholders = ",".join("?" for _ in exclude_ids)
 
     repoints = []
@@ -319,7 +369,7 @@ def apply_pairing_repoints(conn, repoints):
         )
 
 
-def plan_group(conn, filename, camera_name):
+def plan_group(conn, filename, camera_name, cache=None):
     """Build and return a GroupPlan with no side effects at all — safe to
     call in dry-run mode against production. Gathers member ids, selects the
     winner, applies the child-handling rules (4/5/6) and the pairing-repoint
@@ -331,14 +381,30 @@ def plan_group(conn, filename, camera_name):
     exclusion rather than member_ids[1:], because correction-precedence
     (D-02) can select a winner that does not sort first in tie-break order,
     and member_ids[1:] would then wrongly still count the true default-first
-    member as a loser to delete while leaving the real loser undeleted."""
+    member as a loser to delete while leaving the real loser undeleted.
+
+    When `cache` (a _bulk_prefetch() dict, built once by the caller) is
+    supplied, every per-video lookup below reads from it instead of issuing
+    a fresh query, and the rule-5 check's stats are reused for the final
+    per-loser summary loop rather than recomputed. This is required at
+    production scale: called once per duplicate group (~19,291 in
+    production), the uncached version issues on the order of hundreds of
+    thousands of individual SQL statements across select_winner(),
+    choose_reparent_source(), the two child_stats() call sites, and
+    collect_pairing_repoints() — the same N+1 shape 09-01 found and fixed
+    in run_audit(), but in this function, only ever exercised against small
+    fixtures before the 09-04 rehearsal ran it at real production scale."""
     member_ids = group_member_ids(conn, filename, camera_name)
-    winner_id, rule, skipped_reason = select_winner(conn, member_ids)
+    winner_id, rule, skipped_reason = select_winner(conn, member_ids, cache=cache)
     loser_ids = [vid for vid in member_ids if vid != winner_id]
 
+    def _stats(vid):
+        return _cached_child_stats(cache, vid) if cache is not None else child_stats(conn, vid)
+
     reparent_from = None
+    loser_stats_by_id = {}
     if not skipped_reason:
-        reparent_from = choose_reparent_source(conn, winner_id, loser_ids)
+        reparent_from = choose_reparent_source(conn, winner_id, loser_ids, cache=cache)
         if reparent_from is not None:
             # Rule 4: the winner holds zero detections but the richest
             # loser holds some — adopt that loser's detections onto the
@@ -346,13 +412,14 @@ def plan_group(conn, filename, camera_name):
             # physical file has.
             rule = f"{rule}+reparent"
         else:
-            winner_stats = child_stats(conn, winner_id)
-            loser_children_stats = [child_stats(conn, lid) for lid in loser_ids]
+            winner_stats = _stats(winner_id)
+            loser_stats_by_id = {lid: _stats(lid) for lid in loser_ids}
             if (
                 winner_stats["detections"] > 0
                 and winner_stats["crops"] == 0
                 and any(
-                    s["detections"] > 0 and s["crops"] > 0 for s in loser_children_stats
+                    s["detections"] > 0 and s["crops"] > 0
+                    for s in loser_stats_by_id.values()
                 )
             ):
                 # Rule 5 (hazard H-2, see 09-03-PLAN.md <why_rule_5_skips>):
@@ -375,11 +442,18 @@ def plan_group(conn, filename, camera_name):
 
     pairing_repoints = []
     if not skipped_reason:
-        pairing_repoints = collect_pairing_repoints(conn, winner_id, loser_ids)
+        pairing_repoints = collect_pairing_repoints(conn, winner_id, loser_ids, cache=cache)
 
     detections = species = crops = corrections = 0
     for loser_id in loser_ids:
-        stats = child_stats(conn, loser_id)
+        # Reuse the rule-5 check's stats when they were already computed
+        # for this loser (avoids calling child_stats()/_cached_child_stats()
+        # a second time for the same video); otherwise compute fresh —
+        # covers both the reparent-triggered branch (never populated
+        # loser_stats_by_id) and any group already skipped before that
+        # branch ran (conflicting-corrections), where the totals are still
+        # needed for the report even though nothing will be deleted.
+        stats = loser_stats_by_id[loser_id] if loser_id in loser_stats_by_id else _stats(loser_id)
         detections += stats["detections"]
         species += stats["species"]
         crops += stats["crops"]
@@ -394,7 +468,7 @@ def plan_group(conn, filename, camera_name):
         candidate_files = []
     else:
         cleanup_loser_ids = [lid for lid in loser_ids if lid != reparent_from]
-        candidate_files = collect_candidate_files(conn, cleanup_loser_ids)
+        candidate_files = collect_candidate_files(conn, cleanup_loser_ids, cache=cache)
 
     return GroupPlan(
         filename=filename,
@@ -413,7 +487,7 @@ def plan_group(conn, filename, camera_name):
     )
 
 
-def apply_group(conn, plan):
+def apply_group(conn, plan, cache=None):
     """Delete a group's loser rows and their full child graph on the
     caller's open connection, so the caller controls the transaction
     boundary. Deletes in foreign-key dependency order — crops, species,
@@ -436,24 +510,58 @@ def apply_group(conn, plan):
     deleting them here would delete data that now belongs to the winner.
     Its video_corrections row (should be none — a re-parent source can't
     hold one, see reparent_detections()'s docstring) and its now-empty
-    videos row are still removed, same as any other loser."""
+    videos row are still removed, same as any other loser.
+
+    When `cache` (a _bulk_prefetch() dict, built once before any write in
+    this run) is supplied, crops/species are deleted by their own
+    primary-key `id` (from cache's crop_ids_by_video/species_ids_by_video)
+    instead of `detection_id IN (SELECT id FROM detections WHERE
+    video_id=?)`. Required at production scale: crops.detection_id and
+    species.detection_id carry no index (only detections.video_id does —
+    see database.py's SCHEMA), so the subquery form is a full table scan
+    of crops/species for every single loser processed. Measured during the
+    09-04 rehearsal at roughly 0.75s per group (~1200 unindexed DELETE
+    subqueries per --batch-size 500 batch), which would have projected to
+    hours for the full population and directly determines how long
+    production services must stay stopped in Task 3. Deleting by primary
+    key sidesteps the missing secondary index entirely without adding one
+    to the shared production schema. Safe to use a cache snapshotted
+    before this run's writes started: each video belongs to exactly one
+    duplicate group, so no other code path in this run touches the same
+    loser's children between the snapshot and this delete."""
     counts = {"crops": 0, "species": 0, "detections": 0, "video_corrections": 0, "videos": 0}
     if plan.skipped_reason:
         return counts
     for loser_id in plan.loser_ids:
         if loser_id != plan.reparent_from:
-            cur = conn.execute(
-                "DELETE FROM crops WHERE detection_id IN "
-                "(SELECT id FROM detections WHERE video_id=?)",
-                (loser_id,),
-            )
-            counts["crops"] += cur.rowcount
-            cur = conn.execute(
-                "DELETE FROM species WHERE detection_id IN "
-                "(SELECT id FROM detections WHERE video_id=?)",
-                (loser_id,),
-            )
-            counts["species"] += cur.rowcount
+            if cache is not None:
+                crop_ids = cache["crop_ids_by_video"].get(loser_id, [])
+                if crop_ids:
+                    placeholders = ",".join("?" for _ in crop_ids)
+                    cur = conn.execute(
+                        f"DELETE FROM crops WHERE id IN ({placeholders})", tuple(crop_ids)
+                    )
+                    counts["crops"] += cur.rowcount
+                species_ids = cache["species_ids_by_video"].get(loser_id, [])
+                if species_ids:
+                    placeholders = ",".join("?" for _ in species_ids)
+                    cur = conn.execute(
+                        f"DELETE FROM species WHERE id IN ({placeholders})", tuple(species_ids)
+                    )
+                    counts["species"] += cur.rowcount
+            else:
+                cur = conn.execute(
+                    "DELETE FROM crops WHERE detection_id IN "
+                    "(SELECT id FROM detections WHERE video_id=?)",
+                    (loser_id,),
+                )
+                counts["crops"] += cur.rowcount
+                cur = conn.execute(
+                    "DELETE FROM species WHERE detection_id IN "
+                    "(SELECT id FROM detections WHERE video_id=?)",
+                    (loser_id,),
+                )
+                counts["species"] += cur.rowcount
             cur = conn.execute("DELETE FROM detections WHERE video_id=?", (loser_id,))
             counts["detections"] += cur.rowcount
         cur = conn.execute("DELETE FROM video_corrections WHERE video_id=?", (loser_id,))
@@ -463,14 +571,59 @@ def apply_group(conn, plan):
     return counts
 
 
+def _still_referenced_paths(conn, paths):
+    """Return the subset of `paths` that at least one live row currently
+    references (a crops.crop_path match or a videos.thumbnail_path match),
+    via two batched IN-clause queries instead of one query per path.
+
+    Found necessary during the 09-04 full-scale rehearsal: neither
+    videos.thumbnail_path nor (implicitly, through the JOIN) the per-path
+    lookup pattern is backed by an index that makes a single-path query
+    cheap at production scale (crops.crop_path is UNIQUE and so has an
+    implicit index, but videos.thumbnail_path has none — see database.py's
+    SCHEMA), so a per-candidate-path query against the live videos table
+    (93k+ rows) is a full table scan every time. Across a --batch-size 500
+    run this meant ~500 full scans per batch; the first two real batches of
+    the rehearsal took roughly 3 minutes each before this fix, projecting
+    to over an hour for the full population — directly determines how long
+    production services must stay stopped in Task 3, so it is fixed here
+    rather than left as a rehearsal-only inconvenience.
+
+    Chunks the IN clause at 500 placeholders per query, well under
+    SQLite's default SQLITE_MAX_VARIABLE_NUMBER, so this stays correct
+    regardless of how large a single cleanup_files() call's candidate list
+    is (batch-size is caller-configurable, not fixed at 500)."""
+    unique_paths = list(dict.fromkeys(paths))  # de-dupe, preserve order
+    if not unique_paths:
+        return set()
+
+    still_referenced = set()
+    chunk_size = 500
+    for start in range(0, len(unique_paths), chunk_size):
+        chunk = unique_paths[start:start + chunk_size]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT crop_path FROM crops WHERE crop_path IN ({placeholders})",
+            tuple(chunk),
+        ):
+            still_referenced.add(row["crop_path"])
+        for row in conn.execute(
+            f"SELECT thumbnail_path FROM videos WHERE thumbnail_path IN ({placeholders})",
+            tuple(chunk),
+        ):
+            still_referenced.add(row["thumbnail_path"])
+    return still_referenced
+
+
 def cleanup_files(conn, candidate_paths, quarantine_dir=None):
     """Call only after the group's transaction has committed, never inside
     it — this guard re-queries live database state, so running it
     pre-commit would read stale (pre-delete) rows and reach the wrong
     answer. For each candidate path, first check whether any surviving row
-    still references it (a crops.crop_path match or a videos.thumbnail_path
-    match); if so, skip removal entirely. This is the mitigation for hazard
-    H-1: extract_thumbnail() derives its output path from camera name and
+    still references it (via _still_referenced_paths(), batched rather
+    than one query per path — see that function's docstring); if so, skip
+    removal entirely. This is the mitigation for hazard H-1:
+    extract_thumbnail() derives its output path from camera name and
     filename alone with no uniquifier, so every duplicate sibling of one
     physical file stores the identical thumbnail_path string, and removing
     a loser's copy would delete the file the surviving winner still points
@@ -486,19 +639,13 @@ def cleanup_files(conn, candidate_paths, quarantine_dir=None):
     removed = retained = failed = 0
     details = []
     seen = set()
+    still_referenced_paths = _still_referenced_paths(conn, candidate_paths)
     for path in candidate_paths:
         if path in seen:
             continue
         seen.add(path)
 
-        still_referenced = conn.execute(
-            "SELECT 1 FROM crops WHERE crop_path = ? "
-            "UNION ALL "
-            "SELECT 1 FROM videos WHERE thumbnail_path = ? "
-            "LIMIT 1",
-            (path, path),
-        ).fetchone()
-        if still_referenced is not None:
+        if path in still_referenced_paths:
             retained += 1
             details.append({"path": path, "outcome": "retained"})
             continue
@@ -661,17 +808,21 @@ def iter_batches(items, size):
         yield items[start:start + size]
 
 
-def _preview_deletion_counts(conn, plan):
+def _preview_deletion_counts(conn, plan, cache=None):
     """Read-only projection, for the dry-run report only, of what
     apply_group() would delete for this plan — honoring the same
     reparent-source exclusion apply_group() itself applies. apply_group()
     measures the real counts once it actually runs; this never writes
-    anything."""
+    anything.
+
+    When `cache` (a _bulk_prefetch() dict) is supplied, per-loser stats
+    come from it instead of a fresh child_stats() query — required at
+    production scale, called once per consolidated group."""
     counts = {"crops": 0, "species": 0, "detections": 0, "video_corrections": 0, "videos": 0}
     if plan.skipped_reason:
         return counts
     for loser_id in plan.loser_ids:
-        stats = child_stats(conn, loser_id)
+        stats = _cached_child_stats(cache, loser_id) if cache is not None else child_stats(conn, loser_id)
         if loser_id != plan.reparent_from:
             counts["crops"] += stats["crops"]
             counts["species"] += stats["species"]
@@ -681,35 +832,76 @@ def _preview_deletion_counts(conn, plan):
     return counts
 
 
-def _preview_file_disposition(conn, candidate_paths):
+def _preview_file_disposition(conn, candidate_paths, deleted_video_ids, cache=None):
     """Read-only preview, for the dry-run report only, of cleanup_files()'s
     disposition: how many distinct candidate paths would be removed versus
     retained because a surviving row still references them. Issues no
-    filesystem operation and no database write — mirrors cleanup_files()'s
-    still-referenced guard query without its I/O side effects."""
+    filesystem operation and no database write.
+
+    Unlike cleanup_files() — which only ever runs after a batch's DB
+    transaction has committed, so its "still referenced" query already
+    reads post-deletion state — this preview runs entirely before any
+    write. Naively re-querying the live, not-yet-mutated database for
+    "does any row reference this path" would find the candidate's own
+    about-to-be-deleted row every time, since it hasn't been deleted yet,
+    which would misreport nearly every removable file as "would retain".
+    `deleted_video_ids` is this run's full set of video ids that will be
+    removed (every consolidated plan's loser_ids, including reparent
+    sources); a referrer is only counted as "still referenced" if it
+    belongs to a video id NOT in that set — simulating the post-deletion
+    state cleanup_files() will actually see, without requiring the writes
+    to have happened first.
+
+    When `cache` (a _bulk_prefetch() dict) is supplied, referrers come
+    from its crop_referrers/thumbnail_referrers reverse indexes instead of
+    one query per distinct candidate path — required at production scale."""
     would_remove = would_retain = 0
     seen = set()
     for path in candidate_paths:
         if path in seen:
             continue
         seen.add(path)
-        still_referenced = conn.execute(
-            "SELECT 1 FROM crops WHERE crop_path = ? "
-            "UNION ALL SELECT 1 FROM videos WHERE thumbnail_path = ? LIMIT 1",
-            (path, path),
-        ).fetchone()
-        if still_referenced is not None:
+        if cache is not None:
+            referrers = cache["crop_referrers"].get(path, []) + cache["thumbnail_referrers"].get(path, [])
+            still_referenced = any(vid not in deleted_video_ids for vid in referrers)
+        elif deleted_video_ids:
+            placeholders = ",".join("?" for _ in deleted_video_ids)
+            row = conn.execute(
+                f"SELECT 1 FROM crops c JOIN detections d ON c.detection_id = d.id "
+                f"WHERE c.crop_path = ? AND d.video_id NOT IN ({placeholders}) "
+                f"UNION ALL "
+                f"SELECT 1 FROM videos WHERE thumbnail_path = ? AND id NOT IN ({placeholders}) "
+                f"LIMIT 1",
+                (path, *deleted_video_ids, path, *deleted_video_ids),
+            ).fetchone()
+            still_referenced = row is not None
+        else:
+            row = conn.execute(
+                "SELECT 1 FROM crops WHERE crop_path = ? "
+                "UNION ALL SELECT 1 FROM videos WHERE thumbnail_path = ? LIMIT 1",
+                (path, path),
+            ).fetchone()
+            still_referenced = row is not None
+        if still_referenced:
             would_retain += 1
         else:
             would_remove += 1
     return {"would_remove": would_remove, "would_retain": would_retain}
 
 
-def build_summary_report(conn, plans, groups_discovered):
+def build_summary_report(conn, plans, groups_discovered, cache=None):
     """Compute the full go/no-go summary (D-05) from a set of GroupPlans and
     the total discovered-group count (before --limit). A single dict shared
     by both the human-readable and --json renderings in main(), so the two
-    can never drift apart."""
+    can never drift apart.
+
+    Builds its own `cache` (a _bulk_prefetch() dict) when the caller
+    doesn't supply one, so this function is always fast on its own; main()
+    passes through the same cache it already built for plan_group(), so
+    the whole run shares one set of bulk scans rather than repeating them."""
+    if cache is None:
+        cache = _bulk_prefetch(conn)
+
     skipped_plans = [p for p in plans if p.skipped_reason]
     consolidated_plans = [p for p in plans if not p.skipped_reason]
     conflicting = [p for p in skipped_plans if p.skipped_reason == "conflicting-corrections"]
@@ -719,18 +911,27 @@ def build_summary_report(conn, plans, groups_discovered):
 
     rows_deleted = {"crops": 0, "species": 0, "detections": 0, "video_corrections": 0, "videos": 0}
     for p in consolidated_plans:
-        projected = _preview_deletion_counts(conn, p)
+        projected = _preview_deletion_counts(conn, p, cache=cache)
         for key in rows_deleted:
             rows_deleted[key] += projected[key]
 
     detections_moved = sum(
-        child_stats(conn, p.reparent_from)["detections"] for p in reparented
+        _cached_child_stats(cache, p.reparent_from)["detections"] for p in reparented
     )
+
+    # This run's full video-id deletion set (every consolidated plan's
+    # losers, including reparent sources — apply_group() deletes a
+    # reparent source's own videos row even though its children moved
+    # rather than being deleted). Used so the file-disposition preview
+    # below simulates the post-deletion state, not the current one.
+    deleted_video_ids = {lid for p in consolidated_plans for lid in p.loser_ids}
 
     all_candidate_files = sorted({
         path for p in consolidated_plans for path in p.candidate_files
     })
-    file_disposition = _preview_file_disposition(conn, all_candidate_files)
+    file_disposition = _preview_file_disposition(
+        conn, all_candidate_files, deleted_video_ids, cache=cache
+    )
 
     return {
         "groups_discovered": groups_discovered,
@@ -770,26 +971,50 @@ def _bulk_prefetch(conn):
     the order of 500,000+ individual SQL statements — correct, but far too
     slow for an audit meant to inform a go/no-go decision. This function
     computes the identical values via ~8 bulk scans instead."""
+    # detection_ids_by_video/crop_ids_by_video/species_ids_by_video (added
+    # alongside the pre-existing *_count dicts, same scans, no extra
+    # queries) exist so apply_group() can delete crops/species by their own
+    # primary-key `id` instead of `detection_id IN (subquery)` — see
+    # apply_group()'s docstring for why: crops.detection_id and
+    # species.detection_id carry no index (only detections.video_id does),
+    # so the subquery form is a full table scan of crops/species for every
+    # single loser processed. At production scale this measured at roughly
+    # 0.75s per group during the 09-04 rehearsal (~1200 unindexed DELETE
+    # subqueries per --batch-size 500 batch), projecting to hours for the
+    # full population. Deleting by primary-key id avoids the missing
+    # secondary index entirely, without adding one to the shared production
+    # schema.
     detections_count = {}
-    for row in conn.execute("SELECT video_id, COUNT(*) AS n FROM detections GROUP BY video_id"):
-        detections_count[row["video_id"]] = row["n"]
+    detection_ids_by_video = {}
+    for row in conn.execute("SELECT id, video_id FROM detections"):
+        vid = row["video_id"]
+        detections_count[vid] = detections_count.get(vid, 0) + 1
+        detection_ids_by_video.setdefault(vid, []).append(row["id"])
 
     species_count = {}
+    corrected_species_count = {}
+    species_ids_by_video = {}
     for row in conn.execute(
-        "SELECT d.video_id AS video_id, COUNT(*) AS n FROM species s "
-        "JOIN detections d ON s.detection_id = d.id GROUP BY d.video_id"
+        "SELECT s.id AS id, s.corrected_at AS corrected_at, d.video_id AS video_id "
+        "FROM species s JOIN detections d ON s.detection_id = d.id"
     ):
-        species_count[row["video_id"]] = row["n"]
+        vid = row["video_id"]
+        species_count[vid] = species_count.get(vid, 0) + 1
+        species_ids_by_video.setdefault(vid, []).append(row["id"])
+        if row["corrected_at"] is not None:
+            corrected_species_count[vid] = corrected_species_count.get(vid, 0) + 1
 
     crops_count = {}
     crop_paths_by_video = {}
+    crop_ids_by_video = {}
     for row in conn.execute(
-        "SELECT d.video_id AS video_id, c.crop_path AS crop_path FROM crops c "
+        "SELECT d.video_id AS video_id, c.id AS id, c.crop_path AS crop_path FROM crops c "
         "JOIN detections d ON c.detection_id = d.id"
     ):
         vid = row["video_id"]
         crops_count[vid] = crops_count.get(vid, 0) + 1
         crop_paths_by_video.setdefault(vid, []).append(row["crop_path"])
+        crop_ids_by_video.setdefault(vid, []).append(row["id"])
 
     video_corrections_count = {}
     for row in conn.execute(
@@ -797,25 +1022,18 @@ def _bulk_prefetch(conn):
     ):
         video_corrections_count[row["video_id"]] = row["n"]
 
-    corrected_species_count = {}
-    for row in conn.execute(
-        "SELECT d.video_id AS video_id, COUNT(*) AS n FROM species s "
-        "JOIN detections d ON s.detection_id = d.id "
-        "WHERE s.corrected_at IS NOT NULL GROUP BY d.video_id"
-    ):
-        corrected_species_count[row["video_id"]] = row["n"]
-
     thumbnail_by_video = {}
     paired_by_video = {}
     paired_ref_counts = {}
+    paired_referrers = {}
     for row in conn.execute("SELECT id, thumbnail_path, paired_video_id FROM videos"):
         vid = row["id"]
         thumbnail_by_video[vid] = row["thumbnail_path"]
         paired_by_video[vid] = row["paired_video_id"]
         if row["paired_video_id"] is not None:
-            paired_ref_counts[row["paired_video_id"]] = (
-                paired_ref_counts.get(row["paired_video_id"], 0) + 1
-            )
+            target = row["paired_video_id"]
+            paired_ref_counts[target] = paired_ref_counts.get(target, 0) + 1
+            paired_referrers.setdefault(target, []).append(vid)
 
     top_label_by_video = {}
     for row in conn.execute(
@@ -827,6 +1045,23 @@ def _bulk_prefetch(conn):
         if vid not in top_label_by_video:
             top_label_by_video[vid] = row["label"]
 
+    # Reverse indexes for crop_path/thumbnail_path -> referring video ids,
+    # built by inverting crop_paths_by_video/thumbnail_by_video in Python
+    # (no extra SQL query) rather than issuing a lookup query per candidate
+    # path. Used by _preview_file_disposition() so a pre-apply dry-run can
+    # tell whether a path would still be referenced after this run's planned
+    # deletions, not just whether it's referenced by the current
+    # (pre-deletion) row set — see that function's docstring for why the
+    # distinction matters.
+    crop_referrers = {}
+    for vid, paths in crop_paths_by_video.items():
+        for path in paths:
+            crop_referrers.setdefault(path, []).append(vid)
+    thumbnail_referrers = {}
+    for vid, path in thumbnail_by_video.items():
+        if path is not None:
+            thumbnail_referrers.setdefault(path, []).append(vid)
+
     return {
         "detections_count": detections_count,
         "species_count": species_count,
@@ -837,8 +1072,36 @@ def _bulk_prefetch(conn):
         "thumbnail_by_video": thumbnail_by_video,
         "paired_by_video": paired_by_video,
         "paired_ref_counts": paired_ref_counts,
+        "paired_referrers": paired_referrers,
         "top_label_by_video": top_label_by_video,
+        "crop_referrers": crop_referrers,
+        "thumbnail_referrers": thumbnail_referrers,
+        "detection_ids_by_video": detection_ids_by_video,
+        "crop_ids_by_video": crop_ids_by_video,
+        "species_ids_by_video": species_ids_by_video,
     }
+
+
+def _cached_child_stats(cache, video_id):
+    """Cache-backed equivalent of child_stats() for a single video, using
+    _bulk_prefetch()'s dicts instead of five fresh queries. Same return
+    shape as child_stats() so callers can switch between the two
+    interchangeably based on whether a cache is available."""
+    return {
+        "detections": cache["detections_count"].get(video_id, 0),
+        "species": cache["species_count"].get(video_id, 0),
+        "crops": cache["crops_count"].get(video_id, 0),
+        "video_corrections": cache["video_corrections_count"].get(video_id, 0),
+        "corrected_species": cache["corrected_species_count"].get(video_id, 0),
+    }
+
+
+def _cached_correction_signal(cache, video_id):
+    """Cache-backed equivalent of correction_signal() for a single video."""
+    return (
+        cache["corrected_species_count"].get(video_id, 0) > 0
+        or cache["video_corrections_count"].get(video_id, 0) > 0
+    )
 
 
 def run_audit(conn):
@@ -1066,8 +1329,27 @@ def main(argv=None):
         # unlimited total, so a limited rehearsal run doesn't understate
         # the population size it's rehearsing against.
         groups = all_groups[: args.limit] if args.limit else all_groups
-        plans = [plan_group(conn, g["filename"], g["camera_name"]) for g in groups]
-        summary = build_summary_report(conn, plans, len(all_groups))
+        # Built once per invocation and threaded through every plan_group()
+        # call, build_summary_report(), and (below, for --apply) every
+        # apply_group() call: at production scale (~19,291 groups) planning
+        # without this cache issues on the order of hundreds of thousands
+        # of individual SQL statements (the same N+1 shape 09-01 found and
+        # fixed in run_audit(), rediscovered here during the 09-04
+        # full-scale rehearsal — see that plan's SUMMARY), and apply_group()
+        # without it re-hits an unindexed crops.detection_id/
+        # species.detection_id scan per loser (also found during that
+        # rehearsal). Safe to reuse the same one-time snapshot for the
+        # later --apply writes too, even though it's taken before any
+        # delete: each video belongs to exactly one duplicate group, so no
+        # other step in this run touches a given loser's children between
+        # this snapshot and that loser's own (single, one-time) delete —
+        # the cached id list for a not-yet-processed loser is exactly what
+        # a fresh query would still find at the moment it's actually used.
+        cache = _bulk_prefetch(conn)
+        plans = [
+            plan_group(conn, g["filename"], g["camera_name"], cache=cache) for g in groups
+        ]
+        summary = build_summary_report(conn, plans, len(all_groups), cache=cache)
 
     if args.json:
         full_report = {
@@ -1163,7 +1445,7 @@ def main(argv=None):
                         apply_pairing_repoints(conn, plan.pairing_repoints)
                     if plan.reparent_from is not None:
                         reparent_detections(conn, plan.reparent_from, plan.winner_id)
-                    deleted_counts = apply_group(conn, plan)
+                    deleted_counts = apply_group(conn, plan, cache=cache)
                     batch_deleted_counts.append(deleted_counts)
 
             # The batch has committed. Record its candidate file paths to
