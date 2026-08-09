@@ -104,11 +104,99 @@ def _top_species_label(conn, video_id):
     return row["label"] if row else None
 
 
+def _bulk_prefetch(conn):
+    """Precompute every per-video lookup run_audit() needs in a handful of
+    full-table/GROUP BY queries, so the per-group loop below does O(1) dict
+    lookups instead of issuing several fresh queries for every member of
+    every group. At production scale (~64k duplicate member rows across
+    ~19,291 groups) the naive per-row query pattern this replaces issues on
+    the order of 500,000+ individual SQL statements — correct, but far too
+    slow for an audit meant to inform a go/no-go decision. This function
+    computes the identical values via ~8 bulk scans instead."""
+    detections_count = {}
+    for row in conn.execute("SELECT video_id, COUNT(*) AS n FROM detections GROUP BY video_id"):
+        detections_count[row["video_id"]] = row["n"]
+
+    species_count = {}
+    for row in conn.execute(
+        "SELECT d.video_id AS video_id, COUNT(*) AS n FROM species s "
+        "JOIN detections d ON s.detection_id = d.id GROUP BY d.video_id"
+    ):
+        species_count[row["video_id"]] = row["n"]
+
+    crops_count = {}
+    crop_paths_by_video = {}
+    for row in conn.execute(
+        "SELECT d.video_id AS video_id, c.crop_path AS crop_path FROM crops c "
+        "JOIN detections d ON c.detection_id = d.id"
+    ):
+        vid = row["video_id"]
+        crops_count[vid] = crops_count.get(vid, 0) + 1
+        crop_paths_by_video.setdefault(vid, []).append(row["crop_path"])
+
+    video_corrections_count = {}
+    for row in conn.execute(
+        "SELECT video_id, COUNT(*) AS n FROM video_corrections GROUP BY video_id"
+    ):
+        video_corrections_count[row["video_id"]] = row["n"]
+
+    corrected_species_count = {}
+    for row in conn.execute(
+        "SELECT d.video_id AS video_id, COUNT(*) AS n FROM species s "
+        "JOIN detections d ON s.detection_id = d.id "
+        "WHERE s.corrected_at IS NOT NULL GROUP BY d.video_id"
+    ):
+        corrected_species_count[row["video_id"]] = row["n"]
+
+    thumbnail_by_video = {}
+    paired_by_video = {}
+    paired_ref_counts = {}
+    for row in conn.execute("SELECT id, thumbnail_path, paired_video_id FROM videos"):
+        vid = row["id"]
+        thumbnail_by_video[vid] = row["thumbnail_path"]
+        paired_by_video[vid] = row["paired_video_id"]
+        if row["paired_video_id"] is not None:
+            paired_ref_counts[row["paired_video_id"]] = (
+                paired_ref_counts.get(row["paired_video_id"], 0) + 1
+            )
+
+    top_label_by_video = {}
+    for row in conn.execute(
+        "SELECT d.video_id AS video_id, s.label AS label FROM species s "
+        "JOIN detections d ON s.detection_id = d.id "
+        "ORDER BY d.video_id, s.confidence DESC, s.id ASC"
+    ):
+        vid = row["video_id"]
+        if vid not in top_label_by_video:
+            top_label_by_video[vid] = row["label"]
+
+    return {
+        "detections_count": detections_count,
+        "species_count": species_count,
+        "crops_count": crops_count,
+        "crop_paths_by_video": crop_paths_by_video,
+        "video_corrections_count": video_corrections_count,
+        "corrected_species_count": corrected_species_count,
+        "thumbnail_by_video": thumbnail_by_video,
+        "paired_by_video": paired_by_video,
+        "paired_ref_counts": paired_ref_counts,
+        "top_label_by_video": top_label_by_video,
+    }
+
+
 def run_audit(conn):
     """Walk every duplicate group and accumulate the read-only shape metrics
     that drive the operator's go/no-go decision (D-05) and the 09-03
-    consolidation rules. Performs no writes."""
+    consolidation rules. Performs no writes.
+
+    Uses _bulk_prefetch() rather than child_stats() in the per-group loop —
+    child_stats() remains available as a correct single-video lookup for
+    future callers (e.g. 09-02/09-03 processing one group's winner at a
+    time), but run_audit() itself needs O(1) lookups across every duplicate
+    member row to stay fast at production scale.
+    """
     groups = find_duplicate_groups(conn)
+    cache = _bulk_prefetch(conn)
 
     metrics = {
         "groups": len(groups),
@@ -134,6 +222,15 @@ def run_audit(conn):
     all_loser_crop_paths = set()
     all_survivor_crop_paths = set()
 
+    def _stats(vid):
+        return {
+            "detections": cache["detections_count"].get(vid, 0),
+            "species": cache["species_count"].get(vid, 0),
+            "crops": cache["crops_count"].get(vid, 0),
+            "video_corrections": cache["video_corrections_count"].get(vid, 0),
+            "corrected_species": cache["corrected_species_count"].get(vid, 0),
+        }
+
     for group in groups:
         member_ids = group_member_ids(conn, group["filename"], group["camera_name"])
         n = len(member_ids)
@@ -143,7 +240,7 @@ def run_audit(conn):
         winner_id = member_ids[0]
         loser_ids = member_ids[1:]
 
-        stats_by_id = {vid: child_stats(conn, vid) for vid in member_ids}
+        stats_by_id = {vid: _stats(vid) for vid in member_ids}
 
         correction_members = [
             vid for vid, s in stats_by_id.items()
@@ -169,10 +266,7 @@ def run_audit(conn):
 
         thumbnail_counts = {}
         for vid in member_ids:
-            row = conn.execute(
-                "SELECT thumbnail_path FROM videos WHERE id = ?", (vid,)
-            ).fetchone()
-            path = row["thumbnail_path"]
+            path = cache["thumbnail_by_video"].get(vid)
             if path is not None:
                 thumbnail_counts[path] = thumbnail_counts.get(path, 0) + 1
         if any(count >= 2 for count in thumbnail_counts.values()):
@@ -180,37 +274,24 @@ def run_audit(conn):
 
         has_pairing = False
         for vid in member_ids:
-            row = conn.execute(
-                "SELECT paired_video_id FROM videos WHERE id = ?", (vid,)
-            ).fetchone()
-            if row["paired_video_id"] is not None:
+            if cache["paired_by_video"].get(vid) is not None:
                 has_pairing = True
-            ref_count = conn.execute(
-                "SELECT COUNT(*) FROM videos WHERE paired_video_id = ?", (vid,)
-            ).fetchone()[0]
-            if ref_count > 0:
+            if cache["paired_ref_counts"].get(vid, 0) > 0:
                 has_pairing = True
         if has_pairing:
             metrics["groups_with_pairing"] += 1
 
         for vid in loser_ids:
-            rows = conn.execute(
-                "SELECT crop_path FROM crops c JOIN detections d ON c.detection_id = d.id "
-                "WHERE d.video_id = ?", (vid,),
-            ).fetchall()
-            for row in rows:
-                all_loser_crop_paths.add(row["crop_path"])
+            for path in cache["crop_paths_by_video"].get(vid, []):
+                all_loser_crop_paths.add(path)
 
-        winner_rows = conn.execute(
-            "SELECT crop_path FROM crops c JOIN detections d ON c.detection_id = d.id "
-            "WHERE d.video_id = ?", (winner_id,),
-        ).fetchall()
-        for row in winner_rows:
-            all_survivor_crop_paths.add(row["crop_path"])
+        for path in cache["crop_paths_by_video"].get(winner_id, []):
+            all_survivor_crop_paths.add(path)
 
         top_labels = {
-            label for label in (_top_species_label(conn, vid) for vid in member_ids)
-            if label is not None
+            cache["top_label_by_video"][vid]
+            for vid in member_ids
+            if vid in cache["top_label_by_video"]
         }
         if len(top_labels) >= 2:
             metrics["disagreement_groups"] += 1
