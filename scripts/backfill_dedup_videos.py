@@ -1,21 +1,40 @@
 """
-backfill_dedup_videos.py — historical dedup backfill for the `videos` table
-(audit-only form; the --apply write path lands in 09-02/09-03).
+backfill_dedup_videos.py — historical dedup backfill for the `videos` table.
 
 Consolidates the ~19,291 duplicate (filename, camera_name) `videos` row
 identities left behind by the pre-v1.1 archive-collision bug (04-DEFERRED.md)
-down to one authoritative row per physical file. This script currently
-implements only the read-only shape audit (PITFALLS.md Pitfall 1) — it
-contains no row-mutating statement and no filesystem-removal call anywhere.
+down to one authoritative row per physical file. Supports two independent
+modes:
+
+  --audit       Read-only shape audit (PITFALLS.md Pitfall 1). No
+                row-mutating statement, no filesystem-removal call.
+  --consolidate The tracer's write path: plan every duplicate group, print
+                the plan, and — only with --apply --confirm-irreversible —
+                delete loser rows' full child graph and clean up orphaned
+                crop/thumbnail files, in one transaction per group. Dry-run
+                (plan-and-print, no writes) is the default whenever --apply
+                is absent. This slice's select_winner()/plan_group() apply
+                only the default tie-break with no correction precedence,
+                re-parenting, or pairing repoint — see 09-02-PLAN.md's
+                <scope_boundary>; 09-03 extends both functions.
 
 Usage:
     python scripts/backfill_dedup_videos.py --db data/wildlife.db --audit [--json]
+    python scripts/backfill_dedup_videos.py --db data/wildlife.db --consolidate
+    python scripts/backfill_dedup_videos.py --db data/wildlife.db --consolidate \
+        --apply --confirm-irreversible --snapshot-dir /tmp/snap --audit-log /tmp/audit.jsonl
 """
 
 import argparse
+import dataclasses
 import json
+import os
+import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
+from sqlite3 import connect as sqlite_connect
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -91,6 +110,284 @@ def child_stats(conn, video_id):
         "video_corrections": video_corrections,
         "corrected_species": corrected_species,
     }
+
+
+@dataclasses.dataclass
+class GroupPlan:
+    """One duplicate group's consolidation plan. skipped_reason is always
+    empty, reparent_from is always None, and pairing_repoints is always []
+    in this tracer slice — 09-03 populates all three (correction
+    precedence, the zero-detections re-parent rule, and dual-lens
+    paired_video_id repointing). Declaring the fields now lets 09-03 extend
+    behavior without reshaping this record."""
+    filename: str
+    camera_name: Optional[str]
+    winner_id: int
+    loser_ids: list
+    rule: str
+    skipped_reason: str
+    reparent_from: Optional[int]
+    detections: int
+    species: int
+    crops: int
+    corrections: int
+    candidate_files: list
+    pairing_repoints: list
+
+
+def select_winner(conn, member_ids):
+    """Return (winner_id, rule) for a duplicate group's already tie-break-
+    ordered member ids. member_ids arrives ordered by group_member_ids()'s
+    `ORDER BY (filepath IS NULL), id` expression, so the winner is simply
+    its first element — this function does not re-sort and does not
+    introduce a second ordering expression. PROJECT.md records this
+    tie-break as confirmed correct against production data in Phase 5; D-01
+    locks it as the rule for groups whose siblings disagree with no
+    correction present. `conn` is accepted (and currently unused) so 09-03
+    can extend this signature for correction-precedence lookups without an
+    incompatible change."""
+    return member_ids[0], "default-tiebreak"
+
+
+def collect_candidate_files(conn, loser_ids):
+    """Return the distinct, sorted set of file paths the given losers
+    reference: every crop_path from crops joined through those videos'
+    detections, plus every non-NULL thumbnail_path on the loser videos rows
+    themselves. Collected before deletion, because once the rows are gone
+    the paths are unrecoverable."""
+    if not loser_ids:
+        return []
+    placeholders = ",".join("?" for _ in loser_ids)
+    paths = set()
+    for row in conn.execute(
+        f"SELECT c.crop_path FROM crops c "
+        f"JOIN detections d ON c.detection_id = d.id "
+        f"WHERE d.video_id IN ({placeholders})",
+        tuple(loser_ids),
+    ):
+        paths.add(row["crop_path"])
+    for row in conn.execute(
+        f"SELECT thumbnail_path FROM videos "
+        f"WHERE id IN ({placeholders}) AND thumbnail_path IS NOT NULL",
+        tuple(loser_ids),
+    ):
+        paths.add(row["thumbnail_path"])
+    return sorted(paths)
+
+
+def plan_group(conn, filename, camera_name):
+    """Build and return a GroupPlan with no side effects at all — safe to
+    call in dry-run mode against production. Gathers member ids, selects the
+    winner, sums each loser's child_stats() into the count fields, and
+    collects candidate_files via collect_candidate_files()."""
+    member_ids = group_member_ids(conn, filename, camera_name)
+    winner_id, rule = select_winner(conn, member_ids)
+    loser_ids = list(member_ids[1:])
+
+    detections = species = crops = corrections = 0
+    for loser_id in loser_ids:
+        stats = child_stats(conn, loser_id)
+        detections += stats["detections"]
+        species += stats["species"]
+        crops += stats["crops"]
+        corrections += stats["video_corrections"]
+
+    return GroupPlan(
+        filename=filename,
+        camera_name=camera_name,
+        winner_id=winner_id,
+        loser_ids=loser_ids,
+        rule=rule,
+        skipped_reason="",
+        reparent_from=None,
+        detections=detections,
+        species=species,
+        crops=crops,
+        corrections=corrections,
+        candidate_files=collect_candidate_files(conn, loser_ids),
+        pairing_repoints=[],
+    )
+
+
+def apply_group(conn, plan):
+    """Delete a group's loser rows and their full child graph on the
+    caller's open connection, so the caller controls the transaction
+    boundary. Deletes in foreign-key dependency order — crops, species,
+    detections, video_corrections, then the videos row itself — because
+    get_conn() sets PRAGMA foreign_keys=ON and none of these child tables
+    declares ON DELETE CASCADE; removing a parent before its children raises
+    sqlite3.IntegrityError (Pitfall 2's safety backstop, never routed
+    around). Returns the actual row counts removed per table, measured via
+    cursor.rowcount, so the audit log records measured values rather than
+    the plan's projections."""
+    counts = {"crops": 0, "species": 0, "detections": 0, "video_corrections": 0, "videos": 0}
+    for loser_id in plan.loser_ids:
+        cur = conn.execute(
+            "DELETE FROM crops WHERE detection_id IN "
+            "(SELECT id FROM detections WHERE video_id=?)",
+            (loser_id,),
+        )
+        counts["crops"] += cur.rowcount
+        cur = conn.execute(
+            "DELETE FROM species WHERE detection_id IN "
+            "(SELECT id FROM detections WHERE video_id=?)",
+            (loser_id,),
+        )
+        counts["species"] += cur.rowcount
+        cur = conn.execute("DELETE FROM detections WHERE video_id=?", (loser_id,))
+        counts["detections"] += cur.rowcount
+        cur = conn.execute("DELETE FROM video_corrections WHERE video_id=?", (loser_id,))
+        counts["video_corrections"] += cur.rowcount
+        cur = conn.execute("DELETE FROM videos WHERE id=?", (loser_id,))
+        counts["videos"] += cur.rowcount
+    return counts
+
+
+def cleanup_files(conn, candidate_paths, quarantine_dir=None):
+    """Call only after the group's transaction has committed, never inside
+    it — this guard re-queries live database state, so running it
+    pre-commit would read stale (pre-delete) rows and reach the wrong
+    answer. For each candidate path, first check whether any surviving row
+    still references it (a crops.crop_path match or a videos.thumbnail_path
+    match); if so, skip removal entirely. This is the mitigation for hazard
+    H-1: extract_thumbnail() derives its output path from camera name and
+    filename alone with no uniquifier, so every duplicate sibling of one
+    physical file stores the identical thumbnail_path string, and removing
+    a loser's copy would delete the file the surviving winner still points
+    at (measured at ~98.7% of production groups per 09-01-SUMMARY.md).
+
+    For a path with no surviving reference: move it to quarantine_dir
+    (reversible) when set, otherwise os.remove() it. Mirrors
+    purge_video_file()'s error-handling style — Path.exists() before
+    removal, try/except OSError around the removal itself, log and continue
+    — so a missing or already-removed file never aborts the run. Returns
+    counts of removed/retained/failed plus a per-path outcome list for the
+    audit log."""
+    removed = retained = failed = 0
+    details = []
+    seen = set()
+    for path in candidate_paths:
+        if path in seen:
+            continue
+        seen.add(path)
+
+        still_referenced = conn.execute(
+            "SELECT 1 FROM crops WHERE crop_path = ? "
+            "UNION ALL "
+            "SELECT 1 FROM videos WHERE thumbnail_path = ? "
+            "LIMIT 1",
+            (path, path),
+        ).fetchone()
+        if still_referenced is not None:
+            retained += 1
+            details.append({"path": path, "outcome": "retained"})
+            continue
+
+        p = Path(path)
+        if not p.exists():
+            removed += 1
+            details.append({"path": path, "outcome": "already-missing"})
+            continue
+
+        try:
+            if quarantine_dir:
+                os.makedirs(quarantine_dir, exist_ok=True)
+                shutil.move(str(p), os.path.join(quarantine_dir, p.name))
+                outcome = "quarantined"
+            else:
+                p.unlink()
+                outcome = "removed"
+            removed += 1
+            details.append({"path": path, "outcome": outcome})
+        except OSError as exc:
+            failed += 1
+            details.append({"path": path, "outcome": "failed", "error": str(exc)})
+
+    return {"removed": removed, "retained": retained, "failed": failed, "details": details}
+
+
+def snapshot_db(src_path, dest_path):
+    """Take an online backup of the database at src_path into dest_path
+    using sqlite3.Connection.backup(). A plain file copy is wrong here:
+    get_conn() sets PRAGMA journal_mode=WAL, and copying the main database
+    file alone can miss data still sitting in the -wal file. Callers must
+    treat a raised exception here as a hard abort before any write pass —
+    the snapshot is the only rollback path for the database half of the
+    operation."""
+    dest_dir = os.path.dirname(dest_path)
+    if dest_dir:
+        os.makedirs(dest_dir, exist_ok=True)
+    src_conn = sqlite_connect(src_path)
+    try:
+        dest_conn = sqlite_connect(dest_path)
+        try:
+            src_conn.backup(dest_conn)
+        finally:
+            dest_conn.close()
+    finally:
+        src_conn.close()
+
+
+def verify_post_conditions(conn):
+    """Return fk_violations (row count from PRAGMA foreign_key_check),
+    broken_pairings (database.check_pairing_consistency(), not
+    re-implemented here), and remaining_groups (find_duplicate_groups()
+    count). Callers must treat a non-zero fk_violations as a hard abort,
+    not a warning."""
+    fk_violations = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+    broken_pairings = database.check_pairing_consistency()
+    remaining_groups = len(find_duplicate_groups(conn))
+    return {
+        "fk_violations": fk_violations,
+        "broken_pairings": broken_pairings,
+        "remaining_groups": remaining_groups,
+    }
+
+
+def open_audit_log(path):
+    """Open a JSON-lines file for append. Raises OSError (uncaught) if the
+    path can't be opened — callers in apply mode must treat that as a hard
+    abort before any write: an unlogged irreversible operation cannot be
+    reconstructed from the snapshot."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return open(path, "a", encoding="utf-8")
+
+
+def write_audit_line(handle, payload):
+    """Write one compact JSON object per line and flush immediately, so a
+    crash mid-run still leaves every completed group's line durable on
+    disk."""
+    handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    handle.flush()
+
+
+def render_plan_report(plans, as_json=False):
+    """Print the per-group plan and a totals block. In dry-run this is the
+    whole output."""
+    if as_json:
+        print(json.dumps([dataclasses.asdict(p) for p in plans], indent=2))
+        return
+
+    print("Dedup Backfill Consolidation Plan (dry-run unless --apply --confirm-irreversible)")
+    print("=" * 44)
+    if not plans:
+        print("No duplicate groups found.")
+        return
+    for p in plans:
+        print(
+            f"{p.filename} (camera={p.camera_name}): "
+            f"winner={p.winner_id} losers={p.loser_ids} rule={p.rule}"
+        )
+        print(
+            f"    detections={p.detections} species={p.species} "
+            f"crops={p.crops} corrections={p.corrections} "
+            f"candidate_files={len(p.candidate_files)}"
+        )
+    print("-" * 44)
+    print(f"Total groups: {len(plans)}")
+    print(f"Total loser rows: {sum(len(p.loser_ids) for p in plans)}")
 
 
 def _top_species_label(conn, video_id):
@@ -320,29 +617,147 @@ def render_audit_report(metrics, as_json=False):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Historical dedup backfill for the videos table (audit-only in this form)"
+        description="Historical dedup backfill for the videos table"
     )
     parser.add_argument("--db", default="data/wildlife.db", help="Path to the SQLite database")
     parser.add_argument("--audit", action="store_true", help="Run the read-only shape audit")
-    parser.add_argument("--json", action="store_true", help="Emit the audit report as JSON")
+    parser.add_argument("--json", action="store_true", help="Emit the report as JSON")
+    parser.add_argument(
+        "--consolidate", action="store_true",
+        help="Plan (and, with --apply --confirm-irreversible, apply) duplicate-group "
+             "consolidation. Prints a dry-run plan and writes nothing unless both "
+             "write flags are given.",
+    )
+    parser.add_argument(
+        "--apply", action="store_true",
+        help="Perform real writes/deletes — requires --confirm-irreversible too "
+             "(default: dry-run plan only, nothing written)",
+    )
+    parser.add_argument(
+        "--confirm-irreversible", action="store_true",
+        help="Required together with --apply to actually delete rows/files. Two "
+             "independent flags so no single mistyped or shell-history-recalled "
+             "argument can start an irreversible pass.",
+    )
+    parser.add_argument(
+        "--audit-log", default=None,
+        help="Path to the JSONL audit log written during --apply (required for --apply)",
+    )
+    parser.add_argument(
+        "--snapshot-dir", default=None,
+        help="Directory for the pre-apply online DB backup (required for --apply)",
+    )
+    parser.add_argument(
+        "--quarantine-dir", default=None,
+        help="Move removed crop/thumbnail files here instead of permanently deleting them",
+    )
+    parser.add_argument(
+        "--skip-file-cleanup", action="store_true",
+        help="Skip the file-cleanup pass entirely during --apply",
+    )
     return parser
 
 
-def main():
+def main(argv=None):
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    if not args.audit:
-        # No default action — the destructive --apply mode does not exist in
-        # this plan's code at all (lands in 09-02/09-03), so an accidental
-        # invocation with no flags must never write anything.
+    if args.audit:
+        database.set_db_path(args.db)
+        with database.get_conn() as conn:
+            metrics = run_audit(conn)
+        render_audit_report(metrics, as_json=args.json)
+        sys.exit(0)
+
+    if not args.consolidate and not args.apply:
+        # No recognized mode at all — unchanged help-plus-non-zero-exit
+        # fallback from 09-01 (whose only mode flag was --audit).
         parser.print_help()
         sys.exit(1)
 
+    if args.apply and not args.confirm_irreversible:
+        print(
+            "ERROR: --apply requires --confirm-irreversible. Consolidation deletes "
+            "database rows and files; both flags must be passed deliberately so no "
+            "single mistyped or shell-history-recalled argument can start an "
+            "irreversible pass over production.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     database.set_db_path(args.db)
+
     with database.get_conn() as conn:
-        metrics = run_audit(conn)
-    render_audit_report(metrics, as_json=args.json)
+        groups = find_duplicate_groups(conn)
+        plans = [plan_group(conn, g["filename"], g["camera_name"]) for g in groups]
+
+    render_plan_report(plans, as_json=args.json)
+
+    if not args.apply:
+        # Dry-run is what you get whenever --apply is absent: the plan was
+        # already printed above, and nothing has been written or removed.
+        sys.exit(0)
+
+    # From here: args.apply and args.confirm_irreversible are both true —
+    # the two independent flags required to reach an irreversible write.
+    if not args.snapshot_dir:
+        print("ERROR: --apply requires --snapshot-dir; aborting before any write.", file=sys.stderr)
+        sys.exit(1)
+    if not args.audit_log:
+        print("ERROR: --apply requires --audit-log; aborting before any write.", file=sys.stderr)
+        sys.exit(1)
+
+    snapshot_path = os.path.join(
+        args.snapshot_dir, f"backfill-snapshot-{datetime.now():%Y%m%dT%H%M%S%f}.db"
+    )
+    try:
+        snapshot_db(args.db, snapshot_path)
+    except Exception as exc:
+        print(f"ERROR: pre-apply snapshot failed, aborting before any write: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        audit_handle = open_audit_log(args.audit_log)
+    except OSError as exc:
+        print(
+            f"ERROR: could not open audit log for writing, aborting before any write: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        for plan in plans:
+            with database.get_conn() as conn:
+                deleted_counts = apply_group(conn, plan)
+
+            if args.skip_file_cleanup:
+                cleanup_result = {"removed": 0, "retained": 0, "failed": 0, "details": []}
+            else:
+                with database.get_conn() as conn:
+                    cleanup_result = cleanup_files(
+                        conn, plan.candidate_files, quarantine_dir=args.quarantine_dir
+                    )
+
+            write_audit_line(audit_handle, {
+                "filename": plan.filename,
+                "camera_name": plan.camera_name,
+                "winner_id": plan.winner_id,
+                "loser_ids": plan.loser_ids,
+                "rule": plan.rule,
+                "skipped_reason": plan.skipped_reason,
+                "deleted_counts": deleted_counts,
+                "file_cleanup": cleanup_result,
+            })
+    finally:
+        audit_handle.close()
+
+    with database.get_conn() as conn:
+        verification = verify_post_conditions(conn)
+    print("Post-run verification:")
+    print(json.dumps(verification, indent=2))
+
+    if verification["fk_violations"] != 0:
+        sys.exit(1)
     sys.exit(0)
 
 

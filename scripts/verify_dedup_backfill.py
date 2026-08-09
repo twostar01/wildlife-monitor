@@ -11,11 +11,13 @@ Usage:
 """
 
 import argparse
+import io
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -142,6 +144,504 @@ def _dir_snapshot(root):
             rel = os.path.relpath(full, root)
             entries.append((rel, os.path.getsize(full)))
     return sorted(entries)
+
+
+def _seed_crop_file(tmpdir, name):
+    """Write a small real placeholder file under a `crops` subdirectory of
+    the fixture temp directory and return its absolute path. File-cleanup
+    assertions must operate on genuine filesystem state, not on path strings
+    alone — a guard that only compares strings would pass while still
+    deleting the wrong file."""
+    crops_dir = os.path.join(tmpdir, "crops")
+    os.makedirs(crops_dir, exist_ok=True)
+    path = os.path.join(crops_dir, name)
+    with open(path, "w") as f:
+        f.write("fixture-crop")
+    return os.path.abspath(path)
+
+
+def _seed_tracer_group(tmpdir, filename="tracer.mp4", camera_name="CamA"):
+    """Seed the tracer's canonical two-member group: a winner holding two of
+    its own detections/species/crops, a loser holding two of its own,
+    distinct real crop files on disk, and one identical thumbnail_path
+    string shared by both rows (hazard H-1, measured at ~98.7% of production
+    groups per 09-01-SUMMARY.md). The winner is seeded with a live filepath
+    so the tie-break selects it regardless of insertion order. Returns a
+    dict of ids and paths used by the assertions in suite_consolidate_tracer
+    and suite_fk_integrity."""
+    shared_thumb = _seed_crop_file(tmpdir, f"{Path(filename).stem}_thumb_shared.jpg")
+
+    loser_id = _seed_video(
+        filename, filepath=None, camera_name=camera_name, thumbnail_path=shared_thumb
+    )
+    winner_id = _seed_video(
+        filename, filepath=f"/nas/archive/{filename}", camera_name=camera_name,
+        thumbnail_path=shared_thumb,
+    )
+
+    winner_crop_paths = []
+    for i in range(2):
+        det = _seed_detection(winner_id, frame_number=i)
+        _seed_species(det, "felis catus;;;cat")
+        crop_path = _seed_crop_file(tmpdir, f"{Path(filename).stem}_winner_crop_{i}.jpg")
+        _seed_crop(det, crop_path)
+        winner_crop_paths.append(crop_path)
+
+    loser_crop_paths = []
+    for i in range(2):
+        det = _seed_detection(loser_id, frame_number=i)
+        _seed_species(det, "felis catus;;;cat")
+        crop_path = _seed_crop_file(tmpdir, f"{Path(filename).stem}_loser_crop_{i}.jpg")
+        _seed_crop(det, crop_path)
+        loser_crop_paths.append(crop_path)
+
+    return {
+        "filename": filename,
+        "camera_name": camera_name,
+        "winner_id": winner_id,
+        "loser_id": loser_id,
+        "shared_thumbnail": shared_thumb,
+        "winner_crop_paths": winner_crop_paths,
+        "loser_crop_paths": loser_crop_paths,
+    }
+
+
+class _FlakyConnProxy:
+    """Wraps a real sqlite3.Connection and raises on the Nth call to
+    execute(), forwarding every other call and attribute access to the real
+    connection. sqlite3.Connection instances don't allow arbitrary attribute
+    assignment (`execute` is a read-only slot), so a proxy object — rather
+    than monkeypatching the connection in place — is the only way to inject
+    a mid-transaction fault. Used only by
+    consolidate/interrupt-leaves-group-whole; never touches the real
+    connection's attributes, so there is nothing to restore afterward."""
+
+    def __init__(self, real_conn, fail_on_call):
+        self._real = real_conn
+        self._fail_on_call = fail_on_call
+        self._n = 0
+
+    def execute(self, sql, params=()):
+        self._n += 1
+        if self._n == self._fail_on_call:
+            raise sqlite3.OperationalError("injected fault for interrupt test")
+        return self._real.execute(sql, params)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def suite_tiebreak():
+    """Five cases exercising backfill_dedup_videos.select_winner()'s
+    tie-break, mirroring verify_dedup_identity.suite_identity()'s cases 6-7
+    but retargeted at the backfill's own winner-selection call."""
+    passed = 0
+    total = 5
+    try:
+        # 1. tiebreak/live-filepath-wins
+        case_id = "tiebreak/live-filepath-wins"
+        with _fixture_db():
+            _seed_video("tie1.mp4", filepath=None, camera_name="CamA")
+            id_live = _seed_video("tie1.mp4", filepath="/nas/archive/tie1.mp4", camera_name="CamA")
+            with database.get_conn() as conn:
+                member_ids = backfill_dedup_videos.group_member_ids(conn, "tie1.mp4", "CamA")
+                winner_id, rule = backfill_dedup_videos.select_winner(conn, member_ids)
+            ok = winner_id == id_live and rule == "default-tiebreak"
+            _check(case_id, ok, f"winner_id={winner_id}, expected={id_live}, rule={rule}")
+            if ok:
+                passed += 1
+
+        # 2. tiebreak/lowest-id-wins-when-tied
+        case_id = "tiebreak/lowest-id-wins-when-tied"
+        with _fixture_db():
+            ids = [_seed_video("tie2.mp4", filepath=None, camera_name="CamA") for _ in range(3)]
+            with database.get_conn() as conn:
+                member_ids = backfill_dedup_videos.group_member_ids(conn, "tie2.mp4", "CamA")
+                winner_id, _rule = backfill_dedup_videos.select_winner(conn, member_ids)
+            ok = winner_id == min(ids)
+            _check(case_id, ok, f"winner_id={winner_id}, expected={min(ids)}")
+            if ok:
+                passed += 1
+
+        # 3. tiebreak/lowest-id-wins-when-all-live
+        case_id = "tiebreak/lowest-id-wins-when-all-live"
+        with _fixture_db():
+            ids = [
+                _seed_video("tie3.mp4", filepath=f"/nas/archive/tie3_{i}.mp4", camera_name="CamA")
+                for i in range(3)
+            ]
+            with database.get_conn() as conn:
+                member_ids = backfill_dedup_videos.group_member_ids(conn, "tie3.mp4", "CamA")
+                winner_id, _rule = backfill_dedup_videos.select_winner(conn, member_ids)
+            ok = winner_id == min(ids)
+            _check(case_id, ok, f"winner_id={winner_id}, expected={min(ids)}")
+            if ok:
+                passed += 1
+
+        # 4. tiebreak/deterministic-across-calls
+        case_id = "tiebreak/deterministic-across-calls"
+        with _fixture_db():
+            for i in range(6):
+                _seed_video(
+                    "tie4.mp4",
+                    filepath=(f"/nas/archive/tie4_{i}.mp4" if i % 2 == 0 else None),
+                    camera_name="CamA",
+                )
+            with database.get_conn() as conn:
+                plan1 = backfill_dedup_videos.plan_group(conn, "tie4.mp4", "CamA")
+                plan2 = backfill_dedup_videos.plan_group(conn, "tie4.mp4", "CamA")
+            ok = plan1.winner_id == plan2.winner_id and plan1.loser_ids == plan2.loser_ids
+            _check(
+                case_id, ok,
+                f"plan1=({plan1.winner_id},{plan1.loser_ids}), "
+                f"plan2=({plan2.winner_id},{plan2.loser_ids})",
+            )
+            if ok:
+                passed += 1
+
+        # 5. tiebreak/matches-database-helper
+        case_id = "tiebreak/matches-database-helper"
+        with _fixture_db():
+            _seed_video("tie5.mp4", filepath=None, camera_name="CamA")
+            _seed_video("tie5.mp4", filepath="/nas/archive/tie5.mp4", camera_name="CamA")
+            with database.get_conn() as conn:
+                member_ids = backfill_dedup_videos.group_member_ids(conn, "tie5.mp4", "CamA")
+                winner_id, _rule = backfill_dedup_videos.select_winner(conn, member_ids)
+            db_row = database.find_existing_video("tie5.mp4", "CamA")
+            ok = db_row is not None and winner_id == db_row["id"]
+            _check(
+                case_id, ok,
+                f"winner_id={winner_id}, db_row_id={db_row['id'] if db_row else None}",
+            )
+            if ok:
+                passed += 1
+
+    except AttributeError as exc:
+        print(f"FAIL: tiebreak/function-missing — {exc}")
+        return (passed, total)
+
+    return (passed, total)
+
+
+def suite_consolidate_tracer():
+    """Seven cases exercising the tracer's end-to-end consolidation path:
+    plan_group()/apply_group()/cleanup_files() and the backfill CLI's
+    dry-run-default, two-flag write gate."""
+    passed = 0
+    total = 7
+    try:
+        # 1. consolidate/tracer-happy-path
+        case_id = "consolidate/tracer-happy-path"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            g = _seed_tracer_group(tmpdir, filename="tracer1.mp4")
+
+            with database.get_conn() as conn:
+                plan = backfill_dedup_videos.plan_group(conn, g["filename"], g["camera_name"])
+                deleted_counts = backfill_dedup_videos.apply_group(conn, plan)
+
+            with database.get_conn() as conn:
+                remaining = [
+                    r["id"] for r in conn.execute(
+                        "SELECT id FROM videos WHERE filename=? AND camera_name IS ?",
+                        (g["filename"], g["camera_name"]),
+                    ).fetchall()
+                ]
+                winner_dets = conn.execute(
+                    "SELECT COUNT(*) FROM detections WHERE video_id=?", (g["winner_id"],)
+                ).fetchone()[0]
+                loser_dets = conn.execute(
+                    "SELECT COUNT(*) FROM detections WHERE video_id=?", (g["loser_id"],)
+                ).fetchone()[0]
+                loser_video_exists = conn.execute(
+                    "SELECT COUNT(*) FROM videos WHERE id=?", (g["loser_id"],)
+                ).fetchone()[0]
+                loser_corrections = conn.execute(
+                    "SELECT COUNT(*) FROM video_corrections WHERE video_id=?", (g["loser_id"],)
+                ).fetchone()[0]
+
+            ok = (
+                plan.winner_id == g["winner_id"]
+                and remaining == [g["winner_id"]]
+                and winner_dets == 2
+                and loser_dets == 0
+                and loser_video_exists == 0
+                and loser_corrections == 0
+                and deleted_counts.get("detections") == 2
+                and deleted_counts.get("crops") == 2
+                and deleted_counts.get("species") == 2
+                and deleted_counts.get("videos") == 1
+            )
+            _check(
+                case_id, ok,
+                f"remaining={remaining}, winner_dets={winner_dets}, loser_dets={loser_dets}, "
+                f"loser_video_exists={loser_video_exists}, deleted_counts={deleted_counts}",
+            )
+            if ok:
+                passed += 1
+
+        # 2. consolidate/dry-run-writes-nothing
+        case_id = "consolidate/dry-run-writes-nothing"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            g = _seed_tracer_group(tmpdir, filename="tracer2.mp4")
+
+            snapshot_before = _table_snapshot()
+            dir_before = _dir_snapshot(tmpdir)
+
+            buf = io.StringIO()
+            exit_code = None
+            try:
+                with redirect_stdout(buf):
+                    backfill_dedup_videos.main(["--db", db_path, "--consolidate"])
+            except SystemExit as exc:
+                exit_code = exc.code
+            output = buf.getvalue()
+
+            snapshot_after = _table_snapshot()
+            dir_after = _dir_snapshot(tmpdir)
+
+            ok = (
+                exit_code in (0, None)
+                and snapshot_before == snapshot_after
+                and dir_before == dir_after
+                and str(g["winner_id"]) in output
+                and str(g["loser_id"]) in output
+            )
+            _check(
+                case_id, ok,
+                f"exit_code={exit_code}, snapshot_equal={snapshot_before == snapshot_after}, "
+                f"dir_equal={dir_before == dir_after}, output={output[:200]!r}",
+            )
+            if ok:
+                passed += 1
+
+        # 3. consolidate/apply-requires-confirmation
+        case_id = "consolidate/apply-requires-confirmation"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            _seed_tracer_group(tmpdir, filename="tracer3.mp4")
+
+            snapshot_before = _table_snapshot()
+
+            buf = io.StringIO()
+            exit_code = None
+            try:
+                with redirect_stdout(buf):
+                    backfill_dedup_videos.main(["--db", db_path, "--consolidate", "--apply"])
+            except SystemExit as exc:
+                exit_code = exc.code
+
+            snapshot_after = _table_snapshot()
+
+            ok = exit_code not in (0, None) and snapshot_before == snapshot_after
+            _check(
+                case_id, ok,
+                f"exit_code={exit_code}, snapshot_equal={snapshot_before == snapshot_after}",
+            )
+            if ok:
+                passed += 1
+
+        # 4. consolidate/loser-crop-file-removed
+        case_id = "consolidate/loser-crop-file-removed"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            g = _seed_tracer_group(tmpdir, filename="tracer4.mp4")
+            snapshot_dir = os.path.join(tmpdir, "snapshots")
+            audit_log_path = os.path.join(tmpdir, "audit4.jsonl")
+
+            loser_only_crop = g["loser_crop_paths"][0]
+            existed_before = os.path.exists(loser_only_crop)
+
+            buf = io.StringIO()
+            exit_code = None
+            try:
+                with redirect_stdout(buf):
+                    backfill_dedup_videos.main([
+                        "--db", db_path, "--consolidate", "--apply", "--confirm-irreversible",
+                        "--snapshot-dir", snapshot_dir, "--audit-log", audit_log_path,
+                    ])
+            except SystemExit as exc:
+                exit_code = exc.code
+
+            exists_after = os.path.exists(loser_only_crop)
+            ok = existed_before and exit_code == 0 and not exists_after
+            _check(
+                case_id, ok,
+                f"exit_code={exit_code}, existed_before={existed_before}, exists_after={exists_after}",
+            )
+            if ok:
+                passed += 1
+
+        # 5. consolidate/shared-thumbnail-retained
+        case_id = "consolidate/shared-thumbnail-retained"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            g = _seed_tracer_group(tmpdir, filename="tracer5.mp4")
+            snapshot_dir = os.path.join(tmpdir, "snapshots")
+            audit_log_path = os.path.join(tmpdir, "audit5.jsonl")
+
+            buf = io.StringIO()
+            exit_code = None
+            try:
+                with redirect_stdout(buf):
+                    backfill_dedup_videos.main([
+                        "--db", db_path, "--consolidate", "--apply", "--confirm-irreversible",
+                        "--snapshot-dir", snapshot_dir, "--audit-log", audit_log_path,
+                    ])
+            except SystemExit as exc:
+                exit_code = exc.code
+
+            thumb_exists = os.path.exists(g["shared_thumbnail"])
+            ok = exit_code == 0 and thumb_exists
+            _check(case_id, ok, f"exit_code={exit_code}, thumbnail_exists={thumb_exists}")
+            if ok:
+                passed += 1
+
+        # 6. consolidate/idempotent-rerun
+        case_id = "consolidate/idempotent-rerun"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            _seed_tracer_group(tmpdir, filename="tracer6.mp4")
+            snapshot_dir = os.path.join(tmpdir, "snapshots")
+            audit_log_path = os.path.join(tmpdir, "audit6.jsonl")
+            run_args = [
+                "--db", db_path, "--consolidate", "--apply", "--confirm-irreversible",
+                "--snapshot-dir", snapshot_dir, "--audit-log", audit_log_path,
+            ]
+
+            exit1 = None
+            try:
+                with redirect_stdout(io.StringIO()):
+                    backfill_dedup_videos.main(list(run_args))
+            except SystemExit as exc:
+                exit1 = exc.code
+
+            snapshot_between = _table_snapshot()
+
+            exit2 = None
+            try:
+                with redirect_stdout(io.StringIO()):
+                    backfill_dedup_videos.main(list(run_args))
+            except SystemExit as exc:
+                exit2 = exc.code
+
+            snapshot_after_second = _table_snapshot()
+
+            ok = exit1 == 0 and exit2 == 0 and snapshot_between == snapshot_after_second
+            _check(
+                case_id, ok,
+                f"exit1={exit1}, exit2={exit2}, "
+                f"snapshots_equal={snapshot_between == snapshot_after_second}",
+            )
+            if ok:
+                passed += 1
+
+        # 7. consolidate/interrupt-leaves-group-whole
+        case_id = "consolidate/interrupt-leaves-group-whole"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            g = _seed_tracer_group(tmpdir, filename="tracer7.mp4")
+
+            snapshot_before = _table_snapshot()
+
+            raised = False
+            try:
+                with database.get_conn() as conn:
+                    plan = backfill_dedup_videos.plan_group(conn, g["filename"], g["camera_name"])
+                    proxy = _FlakyConnProxy(conn, fail_on_call=2)
+                    backfill_dedup_videos.apply_group(proxy, plan)
+            except sqlite3.OperationalError:
+                raised = True
+
+            snapshot_after = _table_snapshot()
+
+            ok = raised and snapshot_before == snapshot_after
+            _check(
+                case_id, ok,
+                f"raised={raised}, snapshot_equal={snapshot_before == snapshot_after}",
+            )
+            if ok:
+                passed += 1
+
+    except AttributeError as exc:
+        print(f"FAIL: consolidate-tracer/function-missing — {exc}")
+        return (passed, total)
+
+    return (passed, total)
+
+
+def suite_fk_integrity():
+    """Three cases confirming apply_group() leaves the fixture DB with zero
+    foreign-key violations, zero orphaned children, and zero broken
+    dual-lens pairings."""
+    passed = 0
+    total = 3
+    try:
+        # 1. fk-integrity/zero-violations-after-apply
+        case_id = "fk-integrity/zero-violations-after-apply"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            g = _seed_tracer_group(tmpdir, filename="fk1.mp4")
+            with database.get_conn() as conn:
+                plan = backfill_dedup_videos.plan_group(conn, g["filename"], g["camera_name"])
+                backfill_dedup_videos.apply_group(conn, plan)
+            with database.get_conn() as conn:
+                violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            ok = violations == []
+            _check(case_id, ok, f"violations={violations}")
+            if ok:
+                passed += 1
+
+        # 2. fk-integrity/no-orphaned-children
+        case_id = "fk-integrity/no-orphaned-children"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            g = _seed_tracer_group(tmpdir, filename="fk2.mp4")
+            with database.get_conn() as conn:
+                plan = backfill_dedup_videos.plan_group(conn, g["filename"], g["camera_name"])
+                backfill_dedup_videos.apply_group(conn, plan)
+            with database.get_conn() as conn:
+                orphan_detections = conn.execute(
+                    "SELECT COUNT(*) FROM detections d LEFT JOIN videos v ON d.video_id = v.id "
+                    "WHERE v.id IS NULL"
+                ).fetchone()[0]
+                orphan_species = conn.execute(
+                    "SELECT COUNT(*) FROM species s LEFT JOIN detections d ON s.detection_id = d.id "
+                    "WHERE d.id IS NULL"
+                ).fetchone()[0]
+                orphan_crops = conn.execute(
+                    "SELECT COUNT(*) FROM crops c LEFT JOIN detections d ON c.detection_id = d.id "
+                    "WHERE d.id IS NULL"
+                ).fetchone()[0]
+            ok = orphan_detections == 0 and orphan_species == 0 and orphan_crops == 0
+            _check(
+                case_id, ok,
+                f"orphan_detections={orphan_detections}, orphan_species={orphan_species}, "
+                f"orphan_crops={orphan_crops}",
+            )
+            if ok:
+                passed += 1
+
+        # 3. fk-integrity/pairing-consistency-zero
+        case_id = "fk-integrity/pairing-consistency-zero"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            g = _seed_tracer_group(tmpdir, filename="fk3.mp4")
+            with database.get_conn() as conn:
+                plan = backfill_dedup_videos.plan_group(conn, g["filename"], g["camera_name"])
+                backfill_dedup_videos.apply_group(conn, plan)
+            broken = database.check_pairing_consistency()
+            ok = broken == 0
+            _check(case_id, ok, f"broken={broken}")
+            if ok:
+                passed += 1
+
+    except AttributeError as exc:
+        print(f"FAIL: fk-integrity/function-missing — {exc}")
+        return (passed, total)
+
+    return (passed, total)
 
 
 def suite_grouping():
@@ -296,12 +796,22 @@ def suite_audit_readonly():
 
 def main():
     parser = argparse.ArgumentParser(description="Dedup backfill verification harness")
-    parser.add_argument("--suite", choices=["grouping", "audit-readonly", "all"], default="all")
+    parser.add_argument(
+        "--suite",
+        choices=[
+            "grouping", "audit-readonly", "tiebreak", "consolidate-tracer",
+            "fk-integrity", "all",
+        ],
+        default="all",
+    )
     args = parser.parse_args()
 
     suites = {
         "grouping": suite_grouping,
         "audit-readonly": suite_audit_readonly,
+        "tiebreak": suite_tiebreak,
+        "consolidate-tracer": suite_consolidate_tracer,
+        "fk-integrity": suite_fk_integrity,
     }
     selected = suites.keys() if args.suite == "all" else [args.suite]
 
