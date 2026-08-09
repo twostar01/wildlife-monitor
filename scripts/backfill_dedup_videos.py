@@ -112,6 +112,33 @@ def child_stats(conn, video_id):
     }
 
 
+def correction_signal(conn, video_id):
+    """Return True when this video carries an operator correction signal
+    from either write path: a species row (joined via detections) with
+    non-NULL corrected_at, or any video_corrections row for this video_id.
+    Both sources must be consulted — database.correct_species() writes the
+    first, the video-correction endpoint writes the second, and checking
+    only one silently misses half of the operator's manual labeling."""
+    species_row = conn.execute(
+        "SELECT 1 FROM species s JOIN detections d ON s.detection_id = d.id "
+        "WHERE d.video_id = ? AND s.corrected_at IS NOT NULL LIMIT 1",
+        (video_id,),
+    ).fetchone()
+    if species_row is not None:
+        return True
+    correction_row = conn.execute(
+        "SELECT 1 FROM video_corrections WHERE video_id = ? LIMIT 1",
+        (video_id,),
+    ).fetchone()
+    return correction_row is not None
+
+
+def group_correction_holders(conn, member_ids):
+    """Return the subset of member_ids for which correction_signal() is
+    True, preserving member_ids' original order."""
+    return [vid for vid in member_ids if correction_signal(conn, vid)]
+
+
 @dataclasses.dataclass
 class GroupPlan:
     """One duplicate group's consolidation plan. skipped_reason is always
@@ -136,17 +163,36 @@ class GroupPlan:
 
 
 def select_winner(conn, member_ids):
-    """Return (winner_id, rule) for a duplicate group's already tie-break-
-    ordered member ids. member_ids arrives ordered by group_member_ids()'s
-    `ORDER BY (filepath IS NULL), id` expression, so the winner is simply
-    its first element — this function does not re-sort and does not
-    introduce a second ordering expression. PROJECT.md records this
-    tie-break as confirmed correct against production data in Phase 5; D-01
-    locks it as the rule for groups whose siblings disagree with no
-    correction present. `conn` is accepted (and currently unused) so 09-03
-    can extend this signature for correction-precedence lookups without an
-    incompatible change."""
-    return member_ids[0], "default-tiebreak"
+    """Return (winner_id, rule, skipped_reason) for a duplicate group's
+    already tie-break-ordered member ids, applying D-01/D-02's correction
+    precedence ahead of the default tie-break:
+
+    - Exactly one member carries a correction signal (species.corrected_at
+      or a video_corrections row, per correction_signal()) -> that member
+      wins outright, rule "correction-precedence", no skip. This overrides
+      the ordering result even when the holder sorts last.
+    - Two or more distinct members carry a correction signal -> per D-02
+      this is not a machine's call to make: the group is not auto-resolved.
+      The winner still falls back to the default tie-break pick so a plan
+      exists to report, but skipped_reason is set to
+      "conflicting-corrections" and apply_group() must leave the group
+      exactly as found.
+    - Zero holders -> the default tie-break, member_ids[0]. member_ids
+      arrives ordered by group_member_ids()'s `ORDER BY (filepath IS NULL),
+      id` expression, so the winner is simply its first element — this
+      function does not re-sort and does not introduce a second ordering
+      expression. PROJECT.md records this tie-break as confirmed correct
+      against production data in Phase 5. D-01 requires no extra code here:
+      siblings disagreeing on species label or crop quality with no
+      correction present fall straight into this branch as normal ML
+      scoring variance, not a signal requiring special handling.
+    """
+    holders = group_correction_holders(conn, member_ids)
+    if len(holders) == 1:
+        return holders[0], "correction-precedence", ""
+    if len(holders) >= 2:
+        return member_ids[0], "default-tiebreak", "conflicting-corrections"
+    return member_ids[0], "default-tiebreak", ""
 
 
 def collect_candidate_files(conn, loser_ids):
@@ -179,10 +225,16 @@ def plan_group(conn, filename, camera_name):
     """Build and return a GroupPlan with no side effects at all — safe to
     call in dry-run mode against production. Gathers member ids, selects the
     winner, sums each loser's child_stats() into the count fields, and
-    collects candidate_files via collect_candidate_files()."""
+    collects candidate_files via collect_candidate_files().
+
+    loser_ids is every member id that is not the winner — computed by
+    exclusion rather than member_ids[1:], because correction-precedence
+    (D-02) can select a winner that does not sort first in tie-break order,
+    and member_ids[1:] would then wrongly still count the true default-first
+    member as a loser to delete while leaving the real loser undeleted."""
     member_ids = group_member_ids(conn, filename, camera_name)
-    winner_id, rule = select_winner(conn, member_ids)
-    loser_ids = list(member_ids[1:])
+    winner_id, rule, skipped_reason = select_winner(conn, member_ids)
+    loser_ids = [vid for vid in member_ids if vid != winner_id]
 
     detections = species = crops = corrections = 0
     for loser_id in loser_ids:
@@ -192,19 +244,24 @@ def plan_group(conn, filename, camera_name):
         crops += stats["crops"]
         corrections += stats["video_corrections"]
 
+    # A skipped group is never touched, so it has nothing to clean up —
+    # collecting candidate files for it would be meaningless work and could
+    # confuse the report into implying files are slated for removal.
+    candidate_files = [] if skipped_reason else collect_candidate_files(conn, loser_ids)
+
     return GroupPlan(
         filename=filename,
         camera_name=camera_name,
         winner_id=winner_id,
         loser_ids=loser_ids,
         rule=rule,
-        skipped_reason="",
+        skipped_reason=skipped_reason,
         reparent_from=None,
         detections=detections,
         species=species,
         crops=crops,
         corrections=corrections,
-        candidate_files=collect_candidate_files(conn, loser_ids),
+        candidate_files=candidate_files,
         pairing_repoints=[],
     )
 
@@ -219,8 +276,14 @@ def apply_group(conn, plan):
     sqlite3.IntegrityError (Pitfall 2's safety backstop, never routed
     around). Returns the actual row counts removed per table, measured via
     cursor.rowcount, so the audit log records measured values rather than
-    the plan's projections."""
+    the plan's projections.
+
+    A skipped group (plan.skipped_reason set) returns immediately with no
+    statement issued at all — not even a no-op one. A skipped group must
+    leave production exactly as found."""
     counts = {"crops": 0, "species": 0, "detections": 0, "video_corrections": 0, "videos": 0}
+    if plan.skipped_reason:
+        return counts
     for loser_id in plan.loser_ids:
         cur = conn.execute(
             "DELETE FROM crops WHERE detection_id IN "
@@ -379,6 +442,7 @@ def render_plan_report(plans, as_json=False):
         print(
             f"{p.filename} (camera={p.camera_name}): "
             f"winner={p.winner_id} losers={p.loser_ids} rule={p.rule}"
+            + (f" skipped={p.skipped_reason}" if p.skipped_reason else "")
         )
         print(
             f"    detections={p.detections} species={p.species} "
@@ -386,8 +450,45 @@ def render_plan_report(plans, as_json=False):
             f"candidate_files={len(p.candidate_files)}"
         )
     print("-" * 44)
+    correction_groups = sum(1 for p in plans if p.rule == "correction-precedence")
+    skipped_groups = sum(1 for p in plans if p.skipped_reason)
     print(f"Total groups: {len(plans)}")
     print(f"Total loser rows: {sum(len(p.loser_ids) for p in plans)}")
+    print(f"Groups resolved by correction-precedence: {correction_groups}")
+    print(f"Groups skipped: {skipped_groups}")
+
+
+def render_skipped_report(plans, as_json=False):
+    """List every skipped group's identity and reason — the manual-review
+    queue Pitfall 3 requires the operator see before authorizing the real
+    run. Groups with no skipped_reason are omitted entirely."""
+    skipped = [p for p in plans if p.skipped_reason]
+    if as_json:
+        print(json.dumps(
+            [
+                {
+                    "filename": p.filename,
+                    "camera_name": p.camera_name,
+                    "member_ids": [p.winner_id] + p.loser_ids,
+                    "reason": p.skipped_reason,
+                }
+                for p in skipped
+            ],
+            indent=2,
+        ))
+        return
+
+    print("Skipped Groups (manual review required)")
+    print("=" * 44)
+    if not skipped:
+        print("No skipped groups.")
+        return
+    for p in skipped:
+        member_ids = [p.winner_id] + p.loser_ids
+        print(
+            f"{p.filename} (camera={p.camera_name}): "
+            f"members={member_ids} reason={p.skipped_reason}"
+        )
 
 
 def _top_species_label(conn, video_id):

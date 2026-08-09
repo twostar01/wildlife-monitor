@@ -245,7 +245,7 @@ def suite_tiebreak():
             id_live = _seed_video("tie1.mp4", filepath="/nas/archive/tie1.mp4", camera_name="CamA")
             with database.get_conn() as conn:
                 member_ids = backfill_dedup_videos.group_member_ids(conn, "tie1.mp4", "CamA")
-                winner_id, rule = backfill_dedup_videos.select_winner(conn, member_ids)
+                winner_id, rule, _skipped = backfill_dedup_videos.select_winner(conn, member_ids)
             ok = winner_id == id_live and rule == "default-tiebreak"
             _check(case_id, ok, f"winner_id={winner_id}, expected={id_live}, rule={rule}")
             if ok:
@@ -257,7 +257,7 @@ def suite_tiebreak():
             ids = [_seed_video("tie2.mp4", filepath=None, camera_name="CamA") for _ in range(3)]
             with database.get_conn() as conn:
                 member_ids = backfill_dedup_videos.group_member_ids(conn, "tie2.mp4", "CamA")
-                winner_id, _rule = backfill_dedup_videos.select_winner(conn, member_ids)
+                winner_id, _rule, _skipped = backfill_dedup_videos.select_winner(conn, member_ids)
             ok = winner_id == min(ids)
             _check(case_id, ok, f"winner_id={winner_id}, expected={min(ids)}")
             if ok:
@@ -272,7 +272,7 @@ def suite_tiebreak():
             ]
             with database.get_conn() as conn:
                 member_ids = backfill_dedup_videos.group_member_ids(conn, "tie3.mp4", "CamA")
-                winner_id, _rule = backfill_dedup_videos.select_winner(conn, member_ids)
+                winner_id, _rule, _skipped = backfill_dedup_videos.select_winner(conn, member_ids)
             ok = winner_id == min(ids)
             _check(case_id, ok, f"winner_id={winner_id}, expected={min(ids)}")
             if ok:
@@ -306,7 +306,7 @@ def suite_tiebreak():
             _seed_video("tie5.mp4", filepath="/nas/archive/tie5.mp4", camera_name="CamA")
             with database.get_conn() as conn:
                 member_ids = backfill_dedup_videos.group_member_ids(conn, "tie5.mp4", "CamA")
-                winner_id, _rule = backfill_dedup_videos.select_winner(conn, member_ids)
+                winner_id, _rule, _skipped = backfill_dedup_videos.select_winner(conn, member_ids)
             db_row = database.find_existing_video("tie5.mp4", "CamA")
             ok = db_row is not None and winner_id == db_row["id"]
             _check(
