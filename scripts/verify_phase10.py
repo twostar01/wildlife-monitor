@@ -28,8 +28,11 @@ Usage:
 """
 
 import argparse
+import json
 import os
+import re
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -355,8 +358,342 @@ def suite_fix01():
     return (passed, total)
 
 
+# ── FIX-03 fixture ───────────────────────────────────────────────────────
+
+
+def _seed_dup_fixture_db(path, tmpdir):
+    """Build the FIX-03 fixture database: one duplicate (filename,
+    camera_name) group — two `videos` rows sharing filename
+    'dup_fixture_00.mp4' and camera_name 'World Watch', each with a
+    distinct filepath pointing at a real placeholder file in `tmpdir`.
+    Both members carry a detection/species/crop row: the winner (lower id,
+    since group_member_ids() orders by (filepath IS NULL), id and both
+    filepaths are non-NULL here) must hold at least one detection itself,
+    or choose_reparent_source() re-parents the loser's children onto it
+    instead of deleting them — leaving the crops/species/detections delete
+    counts at zero, which would defeat B3/B4's non-zero-delete assertions.
+    Returns the real autoincrement winner/loser ids."""
+    database.set_db_path(path)
+    database.init_db(path)
+    now = "2026-08-06T04:00:00"
+
+    winner_file = os.path.join(tmpdir, "dup_fixture_winner.mp4")
+    loser_file = os.path.join(tmpdir, "dup_fixture_loser.mp4")
+    Path(winner_file).write_bytes(b"placeholder")
+    Path(loser_file).write_bytes(b"placeholder")
+
+    with database.get_conn() as conn:
+
+        def _insert_video(filepath):
+            conn.execute(
+                "INSERT INTO videos (filename, filepath, camera_name, kept, recorded_at, processed_at) "
+                "VALUES (?, ?, ?, 1, ?, ?)",
+                ("dup_fixture_00.mp4", filepath, "World Watch", now, now),
+            )
+            return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        def _add_detection_with_crop(video_id, crop_path):
+            conn.execute(
+                "INSERT INTO detections (video_id, category, confidence) VALUES (?, 'animal', 0.9)",
+                (video_id,),
+            )
+            det_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                "INSERT INTO species (detection_id, label, common_name, scientific_name, confidence) "
+                "VALUES (?, 'domestic cat', 'Domestic Cat', 'Felis catus', 0.9)",
+                (det_id,),
+            )
+            Path(crop_path).write_bytes(b"placeholder")
+            conn.execute(
+                "INSERT INTO crops (detection_id, crop_path, quality_score, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (det_id, crop_path, 75.0, now),
+            )
+            return det_id
+
+        winner_id = _insert_video(winner_file)
+        loser_id = _insert_video(loser_file)
+        _add_detection_with_crop(winner_id, os.path.join(tmpdir, "dup_fixture_winner_crop.jpg"))
+        _add_detection_with_crop(loser_id, os.path.join(tmpdir, "dup_fixture_loser_crop.jpg"))
+
+    return {"winner_id": winner_id, "loser_id": loser_id}
+
+
+def _video_count(db_path):
+    """Read the `videos` row count from `db_path`, via database.get_conn()
+    per CLAUDE.md's rule that all database access goes through it."""
+    database.set_db_path(db_path)
+    with database.get_conn() as conn:
+        return conn.execute("SELECT COUNT(*) FROM videos").fetchone()[0]
+
+
+def _parse_deleted_videos_count(stdout):
+    """Extract the integer 'videos' count from the Go/No-Go summary's
+    'Rows that ... deleted: {...}' line — the dict's 'videos' key is the
+    only sub-count that tracks the actual `videos` table row drop (the
+    crops/species/detections sub-counts can be zero even for a real delete,
+    e.g. when the group's children are re-parented rather than removed).
+    Returns None if the line or key is not found."""
+    m = re.search(r"Rows that .*deleted:.*'videos':\s*(\d+)", stdout)
+    return int(m.group(1)) if m else None
+
+
+def _run_backfill(args_list):
+    """Run scripts/backfill_dedup_videos.py via subprocess with the given
+    argument list. Must never be called without an explicit --db argument —
+    raises immediately if one is missing, so no call site can silently fall
+    through to the script's own data/wildlife.db default (T-10-01-01)."""
+    if "--db" not in args_list:
+        raise ValueError("_run_backfill requires an explicit --db argument")
+    return subprocess.run(
+        [sys.executable, str(_repo_root() / "scripts" / "backfill_dedup_videos.py"), *args_list],
+        capture_output=True,
+        text=True,
+    )
+
+
+def suite_fix03():
+    """FIX-03 cases B1-B7 (7 total), proving the backfill script's Go/No-Go
+    summary correctly conditions its 'would be'/actual wording on
+    args.apply, without changing any of the underlying data it reports
+    (D-06/D-07). Because --apply is destructive, every --db value this
+    suite uses is tracked and safety-checked before the subprocess ever
+    runs — the suite raises immediately (not merely a failed case) if a
+    --db value is ever outside its own temp directory or equals the
+    production database path (T-10-01-01)."""
+    passed = 0
+    total = 7
+
+    original_db_path = database.get_db_path()
+    tmpdir_obj = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    tmpdir = tmpdir_obj.name
+    tmp_root = Path(tmpdir).resolve()
+    forbidden_db = (_repo_root() / "data" / "wildlife.db").resolve()
+    used_db_paths = []
+
+    def _run(args_list):
+        db_idx = args_list.index("--db")
+        db_value = Path(args_list[db_idx + 1]).resolve()
+        used_db_paths.append(db_value)
+        if db_value == forbidden_db:
+            raise RuntimeError(
+                f"suite_fix03 refused a --db value equal to the production database: {db_value}"
+            )
+        if not db_value.is_relative_to(tmp_root):
+            raise RuntimeError(
+                f"suite_fix03 refused a --db value outside its temp directory: {db_value}"
+            )
+        return _run_backfill(args_list)
+
+    try:
+        zero_rows = {
+            "crops": 0,
+            "species": 0,
+            "detections": 0,
+            "video_corrections": 0,
+            "videos": 0,
+        }
+        expected_zero_rows_line = f"Rows that would be deleted: {zero_rows}"
+        expected_zero_files_line = "Files that would be removed: 0"
+
+        # B1 — dry-run wording on an empty database. Must pass before and
+        # after (roadmap AC3's guard).
+        case_id = "B1"
+        empty_db = os.path.join(tmpdir, "b1_empty.db")
+        database.init_db(empty_db)
+        proc_b1 = _run(["--consolidate", "--db", empty_db])
+        ok = expected_zero_rows_line in proc_b1.stdout and expected_zero_files_line in proc_b1.stdout
+        _check(case_id, ok, f"stdout={proc_b1.stdout!r}")
+        if ok:
+            passed += 1
+
+        # B2 — apply-mode wording on an empty database. Expected RED now.
+        case_id = "B2"
+        empty_db2 = os.path.join(tmpdir, "b2_empty.db")
+        database.init_db(empty_db2)
+        proc_b2 = _run(
+            [
+                "--consolidate",
+                "--apply",
+                "--confirm-irreversible",
+                "--db",
+                empty_db2,
+                "--snapshot-dir",
+                os.path.join(tmpdir, "b2_snap"),
+                "--audit-log",
+                os.path.join(tmpdir, "b2_audit.jsonl"),
+            ]
+        )
+        stdout_lines = proc_b2.stdout.splitlines()
+        rows_line = next(
+            (ln for ln in stdout_lines if ln.startswith("Rows that ") and "deleted:" in ln), None
+        )
+        files_line = next(
+            (ln for ln in stdout_lines if ln.startswith("Files that ") and "removed:" in ln), None
+        )
+        no_dryrun_wording = (
+            "would be deleted" not in proc_b2.stdout and "would be removed" not in proc_b2.stdout
+        )
+        ok = (
+            proc_b2.returncode == 0
+            and rows_line is not None
+            and files_line is not None
+            and no_dryrun_wording
+        )
+        _check(
+            case_id,
+            ok,
+            f"returncode={proc_b2.returncode}, rows_line={rows_line!r}, files_line={files_line!r}",
+        )
+        if ok:
+            passed += 1
+
+        # B3 — dry-run does not mutate. Must pass before and after.
+        case_id = "B3"
+        b3_dir = os.path.join(tmpdir, "b3")
+        os.makedirs(b3_dir, exist_ok=True)
+        b3_db = os.path.join(b3_dir, "b3.db")
+        _seed_dup_fixture_db(b3_db, b3_dir)
+        count_before_b3 = _video_count(b3_db)
+        proc_b3 = _run(["--consolidate", "--db", b3_db])
+        deleted_videos_b3 = _parse_deleted_videos_count(proc_b3.stdout)
+        count_after_b3 = _video_count(b3_db)
+        ok = (
+            deleted_videos_b3 is not None
+            and deleted_videos_b3 > 0
+            and count_after_b3 == count_before_b3
+        )
+        _check(
+            case_id,
+            ok,
+            f"deleted_videos={deleted_videos_b3}, before={count_before_b3}, after={count_after_b3}",
+        )
+        if ok:
+            passed += 1
+
+        # B4 — apply-mode report matches reality. Expected RED now (wording
+        # half); the numeric half documents the roadmap goal.
+        case_id = "B4"
+        b4_dir = os.path.join(tmpdir, "b4")
+        os.makedirs(b4_dir, exist_ok=True)
+        b4_db = os.path.join(b4_dir, "b4.db")
+        _seed_dup_fixture_db(b4_db, b4_dir)
+        count_before_b4 = _video_count(b4_db)
+        proc_b4 = _run(
+            [
+                "--consolidate",
+                "--apply",
+                "--confirm-irreversible",
+                "--db",
+                b4_db,
+                "--snapshot-dir",
+                os.path.join(b4_dir, "snap"),
+                "--audit-log",
+                os.path.join(b4_dir, "audit.jsonl"),
+            ]
+        )
+        deleted_videos_b4 = _parse_deleted_videos_count(proc_b4.stdout)
+        count_after_b4 = _video_count(b4_db)
+        wording_ok_b4 = (
+            "would be deleted" not in proc_b4.stdout and "would be removed" not in proc_b4.stdout
+        )
+        ok = (
+            deleted_videos_b4 is not None
+            and deleted_videos_b4 == (count_before_b4 - count_after_b4)
+            and wording_ok_b4
+        )
+        _check(
+            case_id,
+            ok,
+            f"deleted_videos={deleted_videos_b4}, drop={count_before_b4 - count_after_b4}, "
+            f"wording_ok={wording_ok_b4}",
+        )
+        if ok:
+            passed += 1
+
+        # B5 — idempotency (the FIX-03 idempotency edge probe's resolution).
+        # Expected RED now (wording half).
+        case_id = "B5"
+        count_before_b5 = _video_count(b4_db)
+        proc_b5 = _run(
+            [
+                "--consolidate",
+                "--apply",
+                "--confirm-irreversible",
+                "--db",
+                b4_db,
+                "--snapshot-dir",
+                os.path.join(b4_dir, "snap"),
+                "--audit-log",
+                os.path.join(b4_dir, "audit.jsonl"),
+            ]
+        )
+        count_after_b5 = _video_count(b4_db)
+        wording_ok_b5 = (
+            "would be deleted" not in proc_b5.stdout and "would be removed" not in proc_b5.stdout
+        )
+        ok = (
+            proc_b5.returncode == 0
+            and "Groups discovered: 0" in proc_b5.stdout
+            and count_after_b5 == count_before_b5
+            and wording_ok_b5
+        )
+        _check(
+            case_id,
+            ok,
+            f"returncode={proc_b5.returncode}, before={count_before_b5}, after={count_after_b5}, "
+            f"wording_ok={wording_ok_b5}",
+        )
+        if ok:
+            passed += 1
+
+        # B6 — production-safety guard. Must pass before and after.
+        case_id = "B6"
+        all_inside_tmp = all(p.is_relative_to(tmp_root) for p in used_db_paths)
+        none_is_production = all(p != forbidden_db for p in used_db_paths)
+        ok = bool(used_db_paths) and all_inside_tmp and none_is_production
+        _check(case_id, ok, f"used_db_paths={used_db_paths}")
+        if ok:
+            passed += 1
+
+        # B7 — out-of-scope surfaces unchanged (D-06). Must pass before and
+        # after.
+        case_id = "B7"
+        header = "Dedup Backfill Consolidation Plan (dry-run unless --apply --confirm-irreversible)"
+        header_in_dry = header in proc_b1.stdout
+        header_in_apply = header in proc_b2.stdout
+        json_db = os.path.join(tmpdir, "b7.db")
+        database.init_db(json_db)
+        proc_json = _run(["--consolidate", "--json", "--db", json_db])
+        json_ok = False
+        json_detail = ""
+        try:
+            parsed = json.loads(proc_json.stdout)
+            summary_keys = set(parsed.get("summary", {}).keys())
+            json_ok = {"rows_deleted_projected", "files_would_remove", "files_would_retain"} <= (
+                summary_keys
+            )
+            json_detail = f"summary_keys={sorted(summary_keys)}"
+        except json.JSONDecodeError as exc:
+            json_detail = str(exc)
+        ok = header_in_dry and header_in_apply and json_ok
+        _check(
+            case_id,
+            ok,
+            f"header_in_dry={header_in_dry}, header_in_apply={header_in_apply}, {json_detail}",
+        )
+        if ok:
+            passed += 1
+    finally:
+        database.set_db_path(original_db_path)
+        tmpdir_obj.cleanup()
+
+    return (passed, total)
+
+
 SUITES = {
     "fix01": (suite_fix01, 11),
+    "fix03": (suite_fix03, 7),
 }
 
 
