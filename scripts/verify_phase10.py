@@ -691,9 +691,125 @@ def suite_fix03():
     return (passed, total)
 
 
+# ── D-04 historical audit ────────────────────────────────────────────────
+
+
+def suite_audit(db_path):
+    """D-04 read-only historical audit (A1-A3): counts how many existing
+    production corrections are historically invisible under the pre-fix
+    suppression filter. Informational cases A1/A2 always pass and simply
+    report counts; A3 is a real runtime assertion that every statement this
+    suite executes is a SELECT.
+
+    The two SQL blocks below are frozen literals copied from the pre-fix
+    SUPPRESS_UNKNOWN_IF_IDENTIFIED text (database.py lines 213-237, as of
+    2026-08-11) — deliberately NOT database.KNOWN_SPECIES_FILTER or
+    database.SUPPRESS_UNKNOWN_IF_IDENTIFIED. This audit answers "how many
+    corrections were historically invisible under the OLD filter"; importing
+    the live constant would make that figure silently collapse to zero the
+    moment plan 10-02 changes it, defeating the audit's purpose."""
+    total = 3
+
+    if not Path(db_path).exists():
+        print(f"SKIP: audit (no database at {db_path})")
+        return (3, 3)
+
+    original_db_path = database.get_db_path()
+    select_only_ok = True
+
+    def _select(conn, sql, params=()):
+        nonlocal select_only_ok
+        if not sql.strip().startswith("SELECT"):
+            select_only_ok = False
+            raise AssertionError("suite_audit attempted a non-SELECT statement")
+        return conn.execute(sql, params)
+
+    a1_count = a2_count = a2b_count = None
+    try:
+        database.set_db_path(db_path)
+        with database.get_conn() as conn:
+            # A1 — video-player-path backlog: video_corrections rows keyed
+            # to Unknown species with a real corrected_label, whose video
+            # also carries at least one real identified species elsewhere.
+            a1_count = _select(
+                conn,
+                """
+                SELECT COUNT(*) FROM video_corrections vc
+                WHERE vc.original_label = 'Unknown species'
+                  AND vc.corrected_label IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM species s2
+                      JOIN detections d2 ON s2.detection_id = d2.id
+                      WHERE d2.video_id = vc.video_id
+                        AND s2.label != 'Unknown species'
+                        AND s2.label NOT LIKE '%;;;;;;blank'
+                  )
+                """,
+            ).fetchone()[0]
+
+            # A2 — gallery-path backlog: Unknown-species rows with a
+            # gallery-set user_common_name, whose video also carries at
+            # least one real identified species elsewhere.
+            a2_count = _select(
+                conn,
+                """
+                SELECT COUNT(*) FROM species s
+                JOIN detections d ON s.detection_id = d.id
+                WHERE s.label = 'Unknown species'
+                  AND NULLIF(s.user_common_name,'') IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM species s2
+                      JOIN detections d2 ON s2.detection_id = d2.id
+                      WHERE d2.video_id = d.video_id
+                        AND s2.label != 'Unknown species'
+                        AND s2.label NOT LIKE '%;;;;;;blank'
+                  )
+                """,
+            ).fetchone()[0]
+
+            # A2b — informational only: distinct videos affected by A2.
+            a2b_count = _select(
+                conn,
+                """
+                SELECT COUNT(DISTINCT d.video_id) FROM species s
+                JOIN detections d ON s.detection_id = d.id
+                WHERE s.label = 'Unknown species'
+                  AND NULLIF(s.user_common_name,'') IS NOT NULL
+                  AND EXISTS (
+                      SELECT 1 FROM species s2
+                      JOIN detections d2 ON s2.detection_id = d2.id
+                      WHERE d2.video_id = d.video_id
+                        AND s2.label != 'Unknown species'
+                        AND s2.label NOT LIKE '%;;;;;;blank'
+                  )
+                """,
+            ).fetchone()[0]
+    except AssertionError:
+        select_only_ok = False
+    finally:
+        database.set_db_path(original_db_path)
+
+    passed = 0
+
+    # A1/A2 are informational — they record counts and always pass.
+    print(f"AUDIT A1 video_corrections_unknown_suppressed: {a1_count}")
+    passed += 1
+    print(f"AUDIT A2 gallery_corrections_unknown_suppressed: {a2_count}")
+    print(f"AUDIT A2b affected_videos: {a2b_count}")
+    passed += 1
+
+    case_id = "A3"
+    _check(case_id, select_only_ok, f"select_only_ok={select_only_ok}")
+    if select_only_ok:
+        passed += 1
+
+    return (passed, total)
+
+
 SUITES = {
     "fix01": (suite_fix01, 11),
     "fix03": (suite_fix03, 7),
+    "audit": (suite_audit, 3),
 }
 
 
@@ -722,7 +838,10 @@ def main():
     all_passed = True
     for name in selected:
         fn, total = SUITES[name]
-        passed, total = fn()
+        if name == "audit":
+            passed, total = fn(args.db)
+        else:
+            passed, total = fn()
         if passed == total:
             print(f"PASS: {name} ({passed}/{total})")
         else:
