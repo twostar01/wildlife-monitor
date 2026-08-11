@@ -253,9 +253,9 @@ NOT_EFFECTIVELY_UNKNOWN = """(
 # no way to reach them again. That's the opposite of the trust problem this
 # filter exists to fix, so the subquery errs toward showing data.
 #
-# KNOWN_SPECIES_FILTER requires both an `s` (species) and a `d` (detections)
-# alias in scope at every interpolation site, since NOT_EFFECTIVELY_UNKNOWN's
-# correlated subquery references d.video_id.
+# The combined filter below requires both an `s` (species) and a `d`
+# (detections) alias in scope at every interpolation site, since
+# NOT_EFFECTIVELY_UNKNOWN's correlated subquery references d.video_id.
 SUPPRESS_UNKNOWN_IF_IDENTIFIED = f"""(
     {NOT_EFFECTIVELY_UNKNOWN}
     OR NOT EXISTS (
