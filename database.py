@@ -214,12 +214,50 @@ ALTER TABLE runs ADD COLUMN raw_cleanup_skipped INTEGER;
 # SpeciesNet returns ';;;;;;blank' when it determines a crop has no animal.
 BLANK_LABEL_FILTER = "s.label NOT LIKE '%;;;;;;blank'"
 
+# True when a species row's *effective* (post-correction) label is something
+# other than 'Unknown species' — i.e. the row was never Unknown, OR it was
+# corrected away from Unknown via one of the two correction paths:
+#   - gallery path: correct_species() sets s.user_common_name directly on
+#     this species row (it never mutates s.label itself).
+#   - video-player path: save_video_correction() writes a video_corrections
+#     row keyed by (video_id, original_label). A NULL corrected_label means
+#     "suppress this label" per the schema comment and apply_corrections_to_
+#     species()'s NULL-means-suppress semantics, so it must NOT count as a
+#     correction away from Unknown here.
+# Disjunct order matters for cost, not just correctness: SQL OR short-
+# circuits left to right, so for the overwhelming majority of rows (label is
+# not 'Unknown species') the EXISTS subquery below is never evaluated.
+NOT_EFFECTIVELY_UNKNOWN = """(
+    s.label != 'Unknown species'
+    OR NULLIF(s.user_common_name, '') IS NOT NULL
+    OR EXISTS (
+        SELECT 1 FROM video_corrections vc
+        WHERE vc.video_id = d.video_id
+          AND vc.original_label = s.label
+          AND vc.corrected_label IS NOT NULL
+    )
+)"""
+
 # Suppression filter — exclude Unknown species and blank labels for any video
 # that also has at least one real identified species. If a video has a known
 # species, the Unknown/blank entries are just low-confidence frames of the
 # same animal and clutter the display.
-SUPPRESS_UNKNOWN_IF_IDENTIFIED = """(
-    s.label != 'Unknown species'
+#
+# The row's own visibility is decided against its corrected/effective label
+# (NOT_EFFECTIVELY_UNKNOWN) so a corrected Unknown-species row is no longer
+# suppressed. The inner NOT EXISTS sibling-detection subquery deliberately
+# keeps testing the raw s2.label rather than becoming correction-aware (P-01):
+# making it correction-aware would mean correcting one crop on an all-Unknown
+# video causes that video's remaining uncorrected Unknown crops to vanish —
+# the operator would correct one crop and watch its siblings disappear with
+# no way to reach them again. That's the opposite of the trust problem this
+# filter exists to fix, so the subquery errs toward showing data.
+#
+# KNOWN_SPECIES_FILTER requires both an `s` (species) and a `d` (detections)
+# alias in scope at every interpolation site, since NOT_EFFECTIVELY_UNKNOWN's
+# correlated subquery references d.video_id.
+SUPPRESS_UNKNOWN_IF_IDENTIFIED = f"""(
+    {NOT_EFFECTIVELY_UNKNOWN}
     OR NOT EXISTS (
         SELECT 1 FROM species s2
         JOIN detections d2 ON s2.detection_id = d2.id
