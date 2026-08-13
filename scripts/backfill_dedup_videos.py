@@ -1383,7 +1383,13 @@ def main(argv=None):
         print(f"Groups skipped: {summary['groups_skipped']}")
         print(f"  conflicting-corrections: {summary['groups_skipped_conflicting_corrections']}")
         print(f"  winner-crops-migrated: {summary['groups_skipped_winner_crops_migrated']}")
-        print(f"Rows that would be deleted: {summary['rows_deleted_projected']}")
+        # P-02: this summary prints BEFORE the `if not args.apply` guard
+        # below -- nothing has been snapshotted, batched, or deleted yet at
+        # this point, even in apply mode. So apply-mode wording must stay
+        # definite future ("will be"), never past tense ("were"): past
+        # tense would just be a second, worse version of the inaccuracy
+        # FIX-03 exists to remove. Dry-run wording is unchanged (D-07).
+        print(f"Rows that {'will be' if args.apply else 'would be'} deleted: {summary['rows_deleted_projected']}")
         print(
             f"Groups resolved by correction-precedence: "
             f"{summary['groups_correction_precedence']}"
@@ -1392,7 +1398,7 @@ def main(argv=None):
         print(f"Groups resolved by re-parenting: {summary['groups_reparented']}")
         print(f"Detections moved by re-parenting: {summary['detections_moved_by_reparenting']}")
         print(f"Pairings re-pointed: {summary['pairings_repointed']}")
-        print(f"Files that would be removed: {summary['files_would_remove']}")
+        print(f"Files that {'will be' if args.apply else 'would be'} removed: {summary['files_would_remove']}")
         print(f"Files retained (still referenced): {summary['files_would_retain']}")
         print(f"Resolved snapshot destination: {args.snapshot_dir}")
         print(f"Resolved audit-log path: {args.audit_log}")
