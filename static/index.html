@@ -2146,8 +2146,8 @@ async function openVideo(id) {
   // Build detection chips — merge both lenses, prefer telephoto crops
   // Use a map of label → best chip, preferring higher quality_score
   const allDets = [
-    ...(d.detections      || []).map(x => ({...x, _lens: v.lens_index ?? 0})),
-    ...(d.pair_detections || []).map(x => ({...x, _lens: paired?.lens_index ?? 1})),
+    ...(d.detections      || []).map(x => ({...x, _lens: v.lens_index ?? 0, _videoId: v.id})),
+    ...(d.pair_detections || []).map(x => ({...x, _lens: paired?.lens_index ?? 1, _videoId: paired?.id})),
   ];
   const seen = {};
   for (const det of allDets) {
@@ -2181,6 +2181,7 @@ async function openVideo(id) {
           </span>
           ${det.label ? `<span class="chip-correct-btn" title="Correct species"
             data-chip-correct data-label="${escHtml(det.label)}" data-common="${escHtml(det.common_name||det.category||'')}"
+            data-video-id="${det._videoId ?? ''}"
             style="margin-left:4px;opacity:0.5;cursor:pointer;font-size:10px">✏</span>` : ''}
         </div>
       `).join('')
@@ -2193,7 +2194,12 @@ async function openVideo(id) {
     el.addEventListener('click', (ev) => {
       ev.stopPropagation();
       const label = el.dataset.label;
-      openCorrectionModal(state.currentVideoId, label, el.dataset.common, window._detectionCandidates[label] || '[]');
+      // A chip's crop may belong to either lens of a dual-lens pair, so use the
+      // video id it actually came from rather than state.currentVideoId (always
+      // the primary video) — otherwise a correction on a paired-lens crop
+      // silently attaches to the wrong video and never displays.
+      const videoId = el.dataset.videoId ? parseInt(el.dataset.videoId, 10) : state.currentVideoId;
+      openCorrectionModal(videoId, label, el.dataset.common, window._detectionCandidates[label] || '[]');
     });
   });
 }
