@@ -183,7 +183,14 @@ def suite_logging():
     settings_region = d01_regions["api_save_settings"]
     no_password_leak = True
     for line in settings_region.splitlines():
-        if "log." in line and "smtp_password" in line:
+        if "log." not in line:
+            continue
+        # Calling redact_smtp_password(...) is the sanctioned way to log the
+        # settings payload — that identifier itself contains the substring
+        # "smtp_password", so it must be excluded before testing for a raw
+        # reference to the plaintext field (e.g. data["smtp_password"]).
+        scrubbed = line.replace("redact_smtp_password", "")
+        if "smtp_password" in scrubbed:
             no_password_leak = False
     case_id = "L8"
     _check(case_id, no_password_leak, "api_save_settings log. line references smtp_password directly")
