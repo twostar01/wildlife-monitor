@@ -18,7 +18,7 @@ import os
 import shutil
 import sys
 import tempfile
-from contextlib import contextmanager, redirect_stdout
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -126,6 +126,252 @@ def _run_cli(argv):
     except SystemExit as exc:
         exit_code = exc.code if exc.code is not None else 0
     return exit_code, buf.getvalue()
+
+
+def _run_cli_capture(argv):
+    """Like _run_cli but also captures stderr. Returns
+    (exit_code, stdout, stderr)."""
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    exit_code = 0
+    try:
+        with redirect_stdout(out_buf), redirect_stderr(err_buf):
+            migrate_stale_paths.main(argv)
+    except SystemExit as exc:
+        exit_code = exc.code if exc.code is not None else 0
+    return exit_code, out_buf.getvalue(), err_buf.getvalue()
+
+
+def _strip_runvar_lines(text):
+    """Drop every line marked RUNVAR: (timestamp, snapshot path, audit-log
+    path) so two otherwise-identical reports can be compared byte-for-byte."""
+    return "\n".join(line for line in text.splitlines() if not line.startswith("RUNVAR:"))
+
+
+FUTURE_TENSE_MARKER = "would be rewritten"
+PAST_TENSE_MARKER = "were rewritten"
+
+
+def suite_apply_gate():
+    """Write-authorization gate: --apply alone, --apply
+    --confirm-irreversible missing --snapshot-dir/--audit-log, and an
+    unwritable snapshot directory all exit non-zero and write nothing to
+    the database."""
+    passed = 0
+    total = 4
+    try:
+        # 1. --apply alone
+        case_id = "apply-gate/apply-alone-fails-and-writes-nothing"
+        with _fixture_db() as db_path:
+            det_id = _seed_detection(_seed_video("gate1.mp4", camera_name="CamA"))
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/gate1.jpg")
+
+            snapshot_before = _table_snapshot()
+            exit_code, _stdout, stderr = _run_cli_capture(["--db", db_path, "--apply"])
+            snapshot_after = _table_snapshot()
+
+            ok = (
+                exit_code not in (0, None)
+                and "--confirm-irreversible" in stderr
+                and snapshot_before == snapshot_after
+            )
+            _check(
+                case_id, ok,
+                f"exit_code={exit_code}, stderr={stderr[:200]!r}, "
+                f"snapshot_equal={snapshot_before == snapshot_after}",
+            )
+            if ok:
+                passed += 1
+
+        # 2. --apply --confirm-irreversible with no --snapshot-dir
+        case_id = "apply-gate/missing-snapshot-dir-fails-and-writes-nothing"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            det_id = _seed_detection(_seed_video("gate2.mp4", camera_name="CamA"))
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/gate2.jpg")
+
+            snapshot_before = _table_snapshot()
+            exit_code, _stdout, _stderr = _run_cli_capture([
+                "--db", db_path, "--apply", "--confirm-irreversible",
+                "--audit-log", os.path.join(tmpdir, "audit.jsonl"),
+            ])
+            snapshot_after = _table_snapshot()
+
+            ok = exit_code not in (0, None) and snapshot_before == snapshot_after
+            _check(
+                case_id, ok,
+                f"exit_code={exit_code}, snapshot_equal={snapshot_before == snapshot_after}",
+            )
+            if ok:
+                passed += 1
+
+        # 3. --apply --confirm-irreversible with no --audit-log
+        case_id = "apply-gate/missing-audit-log-fails-and-writes-nothing"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            det_id = _seed_detection(_seed_video("gate3.mp4", camera_name="CamA"))
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/gate3.jpg")
+
+            snapshot_before = _table_snapshot()
+            exit_code, _stdout, _stderr = _run_cli_capture([
+                "--db", db_path, "--apply", "--confirm-irreversible",
+                "--snapshot-dir", os.path.join(tmpdir, "snap"),
+            ])
+            snapshot_after = _table_snapshot()
+
+            ok = exit_code not in (0, None) and snapshot_before == snapshot_after
+            _check(
+                case_id, ok,
+                f"exit_code={exit_code}, snapshot_equal={snapshot_before == snapshot_after}",
+            )
+            if ok:
+                passed += 1
+
+        # 4. unwritable snapshot directory -- parent path is an existing
+        #    regular file, portable across platforms, no reliance on
+        #    permission bits
+        case_id = "apply-gate/unwritable-snapshot-dir-fails-and-writes-nothing"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            det_id = _seed_detection(_seed_video("gate4.mp4", camera_name="CamA"))
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/gate4.jpg")
+
+            blocker_file = os.path.join(tmpdir, "blocker")
+            with open(blocker_file, "w") as f:
+                f.write("blocker")
+            bad_snapshot_dir = os.path.join(blocker_file, "nested")
+
+            snapshot_before = _table_snapshot()
+            exit_code, _stdout, stderr = _run_cli_capture([
+                "--db", db_path, "--apply", "--confirm-irreversible",
+                "--snapshot-dir", bad_snapshot_dir,
+                "--audit-log", os.path.join(tmpdir, "audit.jsonl"),
+            ])
+            snapshot_after = _table_snapshot()
+
+            ok = exit_code not in (0, None) and snapshot_before == snapshot_after
+            _check(
+                case_id, ok,
+                f"exit_code={exit_code}, stderr={stderr[:200]!r}, "
+                f"snapshot_equal={snapshot_before == snapshot_after}",
+            )
+            if ok:
+                passed += 1
+    except Exception as exc:
+        print(f"FAIL: suite_apply_gate raised {exc!r}")
+
+    return (passed, total)
+
+
+def suite_dry_run():
+    """Default (no-flag) invocation is truly read-only; dry-run and
+    apply-mode reports use disjoint tense vocabularies; two consecutive
+    dry-runs against an unchanged fixture are byte-identical once
+    RUNVAR-marked lines are stripped; --json emits parseable JSON."""
+    passed = 0
+    total = 4
+    try:
+        # 1. default invocation writes nothing, creates no snapshot/audit files
+        case_id = "dry-run/default-invocation-writes-nothing"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            det_id = _seed_detection(_seed_video("dry1.mp4", camera_name="CamA"))
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/dry1.jpg")
+
+            snapshot_before = _table_snapshot()
+            files_before = set(os.listdir(tmpdir))
+            exit_code, _output = _run_cli(["--db", db_path])
+            snapshot_after = _table_snapshot()
+            files_after = set(os.listdir(tmpdir))
+
+            ok = (
+                exit_code == 0
+                and snapshot_before == snapshot_after
+                and files_after == files_before
+            )
+            _check(
+                case_id, ok,
+                f"exit_code={exit_code}, snapshot_equal={snapshot_before == snapshot_after}, "
+                f"new_files={files_after - files_before}",
+            )
+            if ok:
+                passed += 1
+
+        # 2. tense vocabularies are disjoint between dry-run and apply reports
+        case_id = "dry-run/tense-vocabularies-disjoint"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            det_id = _seed_detection(_seed_video("dry2.mp4", camera_name="CamA"))
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/dry2.jpg")
+
+            _dry_exit, dry_output = _run_cli(["--db", db_path])
+            apply_exit, apply_output = _run_cli([
+                "--db", db_path, "--apply", "--confirm-irreversible",
+                "--snapshot-dir", os.path.join(tmpdir, "snap"),
+                "--audit-log", os.path.join(tmpdir, "audit.jsonl"),
+            ])
+
+            # main() in --apply mode always prints the pre-write preview
+            # report (applied=False, "would be rewritten") FIRST, then the
+            # post-write report (applied=True, "were rewritten") -- so only
+            # the second report block (after the header repeats) is the
+            # apply-mode report the mirror-image assertion is about.
+            report_header = "Stale Path Migration -- Go/No-Go Summary"
+            report_blocks = apply_output.split(report_header)
+            apply_report_only = report_blocks[-1] if len(report_blocks) > 1 else apply_output
+
+            dry_ok = FUTURE_TENSE_MARKER in dry_output and PAST_TENSE_MARKER not in dry_output
+            apply_ok = (
+                PAST_TENSE_MARKER in apply_report_only
+                and FUTURE_TENSE_MARKER not in apply_report_only
+            )
+            ok = apply_exit == 0 and dry_ok and apply_ok
+            _check(case_id, ok, f"apply_exit={apply_exit}, dry_ok={dry_ok}, apply_ok={apply_ok}")
+            if ok:
+                passed += 1
+
+        # 3. two consecutive dry-runs against an unchanged fixture are
+        #    byte-identical once RUNVAR lines are stripped
+        case_id = "dry-run/two-consecutive-dry-runs-byte-identical"
+        with _fixture_db() as db_path:
+            det_id = _seed_detection(_seed_video("dry3.mp4", camera_name="CamA"))
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/dry3.jpg")
+
+            _exit1, output1 = _run_cli(["--db", db_path])
+            _exit2, output2 = _run_cli(["--db", db_path])
+
+            ok = _strip_runvar_lines(output1) == _strip_runvar_lines(output2)
+            _check(case_id, ok, f"output1={output1[:200]!r}, output2={output2[:200]!r}")
+            if ok:
+                passed += 1
+
+        # 4. --json emits parseable JSON with per-column counts, total, applied
+        case_id = "dry-run/json-mode-emits-parseable-json"
+        with _fixture_db() as db_path:
+            det_id = _seed_detection(_seed_video("dry4.mp4", camera_name="CamA"))
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/dry4.jpg")
+
+            exit_code, output = _run_cli(["--db", db_path, "--json"])
+            try:
+                parsed = json.loads(output)
+            except json.JSONDecodeError:
+                parsed = None
+
+            ok = (
+                exit_code == 0
+                and parsed is not None
+                and "crops.crop_path" in parsed
+                and "videos.thumbnail_path" in parsed
+                and "total" in parsed
+                and parsed.get("applied") is False
+            )
+            _check(case_id, ok, f"exit_code={exit_code}, parsed={parsed}")
+            if ok:
+                passed += 1
+    except Exception as exc:
+        print(f"FAIL: suite_dry_run raised {exc!r}")
+
+    return (passed, total)
 
 
 def suite_rewrite():
@@ -421,7 +667,9 @@ def suite_apply():
 
 def build_parser():
     parser = argparse.ArgumentParser(description="Stale path migration verification harness")
-    parser.add_argument("--suite", choices=["rewrite", "apply", "all"], default="all")
+    parser.add_argument(
+        "--suite", choices=["rewrite", "dry-run", "apply-gate", "apply", "all"], default="all"
+    )
     return parser
 
 
@@ -431,6 +679,8 @@ def main():
 
     suites = {
         "rewrite": suite_rewrite,
+        "dry-run": suite_dry_run,
+        "apply-gate": suite_apply_gate,
         "apply": suite_apply,
     }
     selected = suites.keys() if args.suite == "all" else [args.suite]
