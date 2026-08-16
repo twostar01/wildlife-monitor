@@ -370,6 +370,45 @@ VIDEO_CORRECTION_SCIENTIFIC = """(
 EFFECTIVE_COMMON = f"COALESCE(NULLIF({VIDEO_CORRECTION_COMMON},''), {DISPLAY_COMMON})"
 EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({VIDEO_CORRECTION_SCIENTIFIC},''), {DISPLAY_SCIENTIFIC})"
 
+# ── Deliberately NOT converted to EFFECTIVE_COMMON/EFFECTIVE_SCIENTIFIC ──
+#
+# The following readers stay on DISPLAY_COMMON/DISPLAY_SCIENTIFIC (or never
+# used them), on purpose, and case P10 (scripts/verify_phase12.py) pins
+# this boundary as a regression:
+#
+#   - get_species_list()      (GROUP BY s.label)
+#   - get_stats() top_species  (GROUP BY s.label)
+#   - get_timeline()           (GROUP BY period, s.label)
+#     These three GROUP BY the raw label. Selecting an effective name over
+#     a group keyed on the raw label makes SQLite return an arbitrary
+#     member row's value, so a label with some corrected and some
+#     uncorrected detections would display non-deterministically —
+#     strictly worse than the current stable-if-stale behaviour.
+#
+#   - get_stats() activity_raw (selects the raw s.common_name directly)
+#     Already selects the raw common_name and has never used DISPLAY_COMMON
+#     at all — stale for BOTH correction paths. That predates this phase
+#     and is unrelated to it.
+#
+#   - search()
+#     Never used DISPLAY_COMMON, and its species query has no `d`
+#     (detections) alias in scope, so EFFECTIVE_COMMON cannot be
+#     interpolated there without a join change.
+#
+#   - get_gallery()'s species filter (s.label = ?) and get_videos()'s
+#     species filter and its `s.common_name LIKE ?` search predicate
+#     Match on raw values — a video-corrected crop still answers to its
+#     original label in those filters.
+#
+# Correcting any of the above means grouping and filtering by the
+# EFFECTIVE (post-correction) label instead of the raw one, which changes
+# the drilldown key get_species_detail(label) accepts, the <option> values
+# populateSpeciesFilters() emits (static/index.html), and chart series
+# identity. No source artifact decides what that key should be, so this
+# plan records the boundary rather than acting on it. If case P10 ever
+# fails, that decision has not been made yet — it failing is a request for
+# one, not a bug.
+
 
 def init_db(db_path: Optional[str] = None):
     if db_path:
@@ -1940,7 +1979,7 @@ def get_videos(
                    v.has_animal, v.has_person, v.thumbnail_path,
                    v.lens_index, v.paired_video_id,
                    GROUP_CONCAT(DISTINCT CASE WHEN {KNOWN_SPECIES_FILTER}
-                       THEN {DISPLAY_COMMON} END) as species_list
+                       THEN {EFFECTIVE_COMMON} END) as species_list
             FROM videos v
             LEFT JOIN detections d ON v.id = d.video_id
             LEFT JOIN species s ON s.detection_id = d.id
@@ -1967,7 +2006,7 @@ def get_video_by_id(video_id: int) -> dict:
 
         detections = conn.execute(f"""
             SELECT d.id, d.frame_number, d.timestamp_secs, d.category, d.confidence,
-                   s.label, {DISPLAY_COMMON} as common_name, s.scientific_name,
+                   s.label, {EFFECTIVE_COMMON} as common_name, s.scientific_name,
                    s.top_candidates_json,
                    c.crop_path, c.quality_score
             FROM detections d
@@ -1994,7 +2033,7 @@ def get_video_by_id(video_id: int) -> dict:
                 paired = dict(paired_row)
                 raw_pair_dets = [dict(r) for r in conn.execute(f"""
                     SELECT d.id, d.frame_number, d.timestamp_secs, d.category, d.confidence,
-                           s.label, {DISPLAY_COMMON} as common_name, s.scientific_name,
+                           s.label, {EFFECTIVE_COMMON} as common_name, s.scientific_name,
                            s.top_candidates_json,
                            c.crop_path, c.quality_score
                     FROM detections d
