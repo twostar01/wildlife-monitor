@@ -33,7 +33,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
-from sqlite3 import connect as sqlite_connect
+from sqlite3 import connect as sqlite_connect, OperationalError
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -383,27 +383,48 @@ def render_plan_report(counts, rows, applied, digests=None, existence_pre=None,
     print(f"RUNVAR: report_generated_at={datetime.now().isoformat()}")
 
 
-def apply_rewrite(conn, rows, audit_handle):
+def _apply_single_row_update(conn, row):
+    """Perform the parameterised UPDATE for exactly one row. Extracted as
+    its own module-level function -- rather than inlined in
+    apply_rewrite()'s loop -- so a test can monkeypatch this single
+    seam to force a failure partway through the row loop (Task 3's
+    partial-failure proof) without needing to touch sqlite3 internals.
+    Table and column names come only from the fixed TARGETS allowlist,
+    never from user input; every value is a bound parameter."""
+    conn.execute(
+        f"UPDATE {row.table} SET {row.column} = ? WHERE id = ?",
+        (row.new_path, row.row_id),
+    )
+
+
+def apply_rewrite(conn, rows):
     """Inside a single transaction on the passed connection, issue one
-    parameterised UPDATE per row and write one audit line per row. Table
-    and column names come only from the fixed TARGETS allowlist, never
-    from user input; every value is a bound parameter. Returns the total
-    rows changed."""
+    parameterised UPDATE per row via _apply_single_row_update(). Returns
+    (changed, audit_payloads): audit_payloads is collected in memory here
+    and deliberately NOT written to the audit-log file yet. Per T-11-11,
+    an audit line must never claim a row was rewritten before the
+    transaction that rewrote it has actually committed -- if any row in
+    this loop raises (a forced exception, a lock timeout surfacing as
+    sqlite3.OperationalError, anything else), the exception propagates out
+    of this function with nothing yet written to the audit log, and
+    database.get_conn()'s own except/rollback undoes every UPDATE issued
+    so far in the same run. The caller is responsible for writing
+    audit_payloads to the audit log only after the `with
+    database.get_conn()` block that calls this has returned successfully
+    (i.e. after the commit)."""
     changed = 0
+    audit_payloads = []
     for row in rows:
-        conn.execute(
-            f"UPDATE {row.table} SET {row.column} = ? WHERE id = ?",
-            (row.new_path, row.row_id),
-        )
+        _apply_single_row_update(conn, row)
         changed += 1
-        write_audit_line(audit_handle, {
+        audit_payloads.append({
             "table": row.table,
             "column": row.column,
             "row_id": row.row_id,
             "old_path": row.old_path,
             "new_path": row.new_path,
         })
-    return changed
+    return changed, audit_payloads
 
 
 def verify_post_conditions(conn):
@@ -547,61 +568,96 @@ def main(argv=None):
         sys.exit(1)
 
     try:
+        # Under D-03 the nightly pipeline stays live during this run, so
+        # lock contention from a concurrent writer is a foreseeable,
+        # benign outcome -- it must fail clean (nothing written, nothing
+        # claimed in the audit log) rather than fail half-way.
+        try:
+            with database.get_conn() as conn:
+                changed, audit_payloads = apply_rewrite(conn, rows)
+        except OperationalError as exc:
+            print(
+                f"ERROR: database is locked by a concurrent writer ({exc}); "
+                "aborting before any row was committed. No rows were "
+                "modified -- this operation is idempotent, so it is safe "
+                "to retry once the lock clears.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except Exception as exc:
+            print(
+                f"ERROR: apply failed and the transaction was rolled back "
+                f"({exc}); no rows were modified.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Commit succeeded -- only now is it true that these rows were
+        # rewritten, so only now do we durably record it (T-11-11: an
+        # aborted run must leave no past-tense claim in the audit log).
+        for payload in audit_payloads:
+            write_audit_line(audit_handle, payload)
+
         with database.get_conn() as conn:
-            changed = apply_rewrite(conn, rows, audit_handle)
+            verification = verify_post_conditions(conn)
+            after_digests = {
+                table: non_path_digest(conn, table, column) for table, column in TARGETS
+            }
+
+        mismatches = {
+            table: (before_digests[table], after_digests[table])
+            for table, _column in TARGETS
+            if before_digests[table] != after_digests[table]
+        }
+        if mismatches:
+            print(
+                "ERROR: non_path_digest mismatch after apply -- a non-path column "
+                "changed unexpectedly. Aborting.",
+                file=sys.stderr,
+            )
+            for table, (before, after) in mismatches.items():
+                print(f"  {table}: before={before} after={after}", file=sys.stderr)
+            sys.exit(1)
+
+        # D-01 post-write confirmation pass -- same ordered path set,
+        # re-stated after the commit, in its own labelled block.
+        existence_post = check_paths_exist(ordered_new_paths)
+        post_write_counts = _existence_counts(existence_post, ordered_new_paths)
+        if not args.json:
+            render_existence_block("post-write", post_write_counts)
+        if post_write_counts["unresolved"] > 0:
+            print(
+                "ERROR: post-write existence check found a rewritten path that "
+                "does not resolve on disk. Aborting.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        write_audit_line(audit_handle, {
+            "event": "summary",
+            "rows_changed": changed,
+            "non_path_digest_crops": after_digests.get("crops"),
+            "non_path_digest_videos": after_digests.get("videos"),
+            "snapshot_path": snapshot_path,
+        })
+
+        render_plan_report(
+            counts, rows, applied=True, digests=after_digests,
+            existence_pre=pre_write_counts, existence_post=post_write_counts,
+            as_json=args.json,
+        )
+        if not args.json:
+            print(f"Rows changed: {changed}")
+            print(f"RUNVAR: snapshot_path={snapshot_path}")
+            print(f"RUNVAR: audit_log_path={args.audit_log}")
+            print("Post-run verification:")
+            print(json.dumps(verification, sort_keys=True))
+
+        if verification["remaining_stale"] != 0:
+            sys.exit(1)
+        sys.exit(0)
     finally:
         audit_handle.close()
-
-    with database.get_conn() as conn:
-        verification = verify_post_conditions(conn)
-        after_digests = {
-            table: non_path_digest(conn, table, column) for table, column in TARGETS
-        }
-
-    mismatches = {
-        table: (before_digests[table], after_digests[table])
-        for table, _column in TARGETS
-        if before_digests[table] != after_digests[table]
-    }
-    if mismatches:
-        print(
-            "ERROR: non_path_digest mismatch after apply -- a non-path column "
-            "changed unexpectedly. Aborting.",
-            file=sys.stderr,
-        )
-        for table, (before, after) in mismatches.items():
-            print(f"  {table}: before={before} after={after}", file=sys.stderr)
-        sys.exit(1)
-
-    # D-01 post-write confirmation pass -- same ordered path set, re-stated
-    # after the commit, in its own labelled block.
-    existence_post = check_paths_exist(ordered_new_paths)
-    post_write_counts = _existence_counts(existence_post, ordered_new_paths)
-    if not args.json:
-        render_existence_block("post-write", post_write_counts)
-    if post_write_counts["unresolved"] > 0:
-        print(
-            "ERROR: post-write existence check found a rewritten path that "
-            "does not resolve on disk. Aborting.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    render_plan_report(
-        counts, rows, applied=True, digests=after_digests,
-        existence_pre=pre_write_counts, existence_post=post_write_counts,
-        as_json=args.json,
-    )
-    if not args.json:
-        print(f"Rows changed: {changed}")
-        print(f"RUNVAR: snapshot_path={snapshot_path}")
-        print(f"RUNVAR: audit_log_path={args.audit_log}")
-        print("Post-run verification:")
-        print(json.dumps(verification, sort_keys=True))
-
-    if verification["remaining_stale"] != 0:
-        sys.exit(1)
-    sys.exit(0)
 
 
 if __name__ == "__main__":

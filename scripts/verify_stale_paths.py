@@ -16,6 +16,7 @@ import io
 import json
 import os
 import shutil
+import sqlite3
 import sys
 import tempfile
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
@@ -671,11 +672,13 @@ def suite_rewrite():
 def suite_apply():
     """Tracer: one stale crops.crop_path row travels the whole CLI pipeline
     -- dry-run report, then --apply with snapshot + audit log, verifying
-    the row was rewritten and every other column is untouched. Existence
-    is stubbed to always-true since this fixture's synthetic
-    /home/nash/... path never resolves on the test runner's filesystem."""
+    the row was rewritten and every other column is untouched. Also proves
+    Task 3's interruption/concurrency guarantees: a locked database fails
+    clean and is safely retryable, and a forced mid-loop exception rolls
+    back every row. Existence is stubbed to always-true throughout --
+    these cases are about transactional/locking behavior, not D-01/D-02."""
     passed = 0
-    total = 2
+    total = 6
     original_check = _patch_existence_always_true()
     try:
         # 1. apply/dry-run-reports-one-candidate-and-writes-nothing
@@ -746,6 +749,175 @@ def suite_apply():
                 f"exit_code={exit_code}, new_path_ok={new_path_ok}, other_cols_ok={other_cols_ok}, "
                 f"snapshot_ok={snapshot_ok}, audit_lines_ok={audit_lines_ok}",
             )
+            if ok:
+                passed += 1
+
+        # 3. apply/locked-db-fails-clean-and-retry-succeeds -- a second raw
+        #    connection holds BEGIN EXCLUSIVE while the CLI attempts to
+        #    write; the CLI must exit non-zero, name the lock, and leave
+        #    the database untouched. After the lock is released, a retry
+        #    must succeed and rewrite the row -- proving the failure left
+        #    a clean, retryable state (D-03's live-services posture).
+        case_id = "apply/locked-db-fails-clean-and-retry-succeeds"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            det_id = _seed_detection(_seed_video("lock.mp4", camera_name="CamA"))
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/lock.jpg")
+
+            snapshot_dir = os.path.join(tmpdir, "snap-lock")
+            audit_log = os.path.join(tmpdir, "audit-lock.jsonl")
+
+            snapshot_before = _table_snapshot()
+
+            lock_conn = sqlite3.connect(db_path)
+            lock_conn.execute("BEGIN EXCLUSIVE")
+            try:
+                exit_code, _stdout, stderr = _run_cli_capture([
+                    "--db", db_path, "--apply", "--confirm-irreversible",
+                    "--snapshot-dir", snapshot_dir, "--audit-log", audit_log,
+                ])
+            finally:
+                lock_conn.rollback()
+                lock_conn.close()
+
+            snapshot_after = _table_snapshot()
+            locked_ok = (
+                exit_code not in (0, None)
+                and "lock" in stderr.lower()
+                and snapshot_before == snapshot_after
+            )
+
+            retry_exit, retry_output = _run_cli([
+                "--db", db_path, "--apply", "--confirm-irreversible",
+                "--snapshot-dir", snapshot_dir, "--audit-log", audit_log,
+            ])
+            retry_ok = retry_exit == 0 and "Rows rewritten this run: 1" in retry_output
+
+            ok = locked_ok and retry_ok
+            _check(
+                case_id, ok,
+                f"exit_code={exit_code}, stderr={stderr[:200]!r}, locked_ok={locked_ok}, "
+                f"retry_exit={retry_exit}, retry_ok={retry_ok}",
+            )
+            if ok:
+                passed += 1
+
+        # 4. apply/forced-exception-mid-loop-rolls-back-everything -- a
+        #    three-row fixture with the module-level per-row update
+        #    monkeypatched to raise on the second row; every row must
+        #    retain its original value (no partial application).
+        case_id = "apply/forced-exception-mid-loop-rolls-back-everything"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            det_id = _seed_detection(_seed_video("exc.mp4", camera_name="CamA"))
+            crop1 = _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/exc1.jpg")
+            crop2 = _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/exc2.jpg")
+            crop3 = _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/exc3.jpg")
+
+            snapshot_before = _table_snapshot()
+
+            original_update = migrate_stale_paths._apply_single_row_update
+            call_count = {"n": 0}
+
+            def _fail_on_second(conn, row, _orig=original_update, _count=call_count):
+                _count["n"] += 1
+                if _count["n"] == 2:
+                    raise RuntimeError("forced failure for Task 3 proof")
+                return _orig(conn, row)
+
+            migrate_stale_paths._apply_single_row_update = _fail_on_second
+            try:
+                exit_code, _stdout, _stderr = _run_cli_capture([
+                    "--db", db_path, "--apply", "--confirm-irreversible",
+                    "--snapshot-dir", os.path.join(tmpdir, "snap-exc"),
+                    "--audit-log", os.path.join(tmpdir, "audit-exc.jsonl"),
+                ])
+            finally:
+                migrate_stale_paths._apply_single_row_update = original_update
+
+            snapshot_after = _table_snapshot()
+            with database.get_conn() as conn:
+                after = {
+                    "1": conn.execute("SELECT crop_path FROM crops WHERE id=?", (crop1,)).fetchone()[0],
+                    "2": conn.execute("SELECT crop_path FROM crops WHERE id=?", (crop2,)).fetchone()[0],
+                    "3": conn.execute("SELECT crop_path FROM crops WHERE id=?", (crop3,)).fetchone()[0],
+                }
+
+            ok = (
+                exit_code not in (0, None)
+                and snapshot_before == snapshot_after
+                and after["1"] == "/home/nash/wildlife-monitor/data/crops/exc1.jpg"
+                and after["2"] == "/home/nash/wildlife-monitor/data/crops/exc2.jpg"
+                and after["3"] == "/home/nash/wildlife-monitor/data/crops/exc3.jpg"
+            )
+            _check(
+                case_id, ok,
+                f"exit_code={exit_code}, snapshot_equal={snapshot_before == snapshot_after}, after={after}",
+            )
+            if ok:
+                passed += 1
+
+        # 5. apply/dry-run-after-aborted-run-reports-same-candidate-count
+        case_id = "apply/dry-run-after-aborted-run-reports-same-candidate-count"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            det_id = _seed_detection(_seed_video("abort.mp4", camera_name="CamA"))
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/abort1.jpg")
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/abort2.jpg")
+
+            _before_exit, before_output = _run_cli(["--db", db_path])
+            before_total = "Total: 2" in before_output
+
+            original_update = migrate_stale_paths._apply_single_row_update
+
+            def _always_fail(conn, row):
+                raise RuntimeError("forced failure")
+
+            migrate_stale_paths._apply_single_row_update = _always_fail
+            try:
+                _run_cli_capture([
+                    "--db", db_path, "--apply", "--confirm-irreversible",
+                    "--snapshot-dir", os.path.join(tmpdir, "snap-abort"),
+                    "--audit-log", os.path.join(tmpdir, "audit-abort.jsonl"),
+                ])
+            finally:
+                migrate_stale_paths._apply_single_row_update = original_update
+
+            after_exit, after_output = _run_cli(["--db", db_path])
+            after_total = "Total: 2" in after_output
+
+            ok = before_total and after_exit == 0 and after_total
+            _check(
+                case_id, ok,
+                f"before_total={before_total}, after_exit={after_exit}, after_total={after_total}",
+            )
+            if ok:
+                passed += 1
+
+        # 6. apply/rolled-back-run-stdout-has-no-past-tense-claim
+        case_id = "apply/rolled-back-run-stdout-has-no-past-tense-claim"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            det_id = _seed_detection(_seed_video("claim.mp4", camera_name="CamA"))
+            _seed_crop(det_id, "/home/nash/wildlife-monitor/data/crops/claim.jpg")
+
+            original_update = migrate_stale_paths._apply_single_row_update
+
+            def _always_fail(conn, row):
+                raise RuntimeError("forced failure")
+
+            migrate_stale_paths._apply_single_row_update = _always_fail
+            try:
+                exit_code, stdout, _stderr = _run_cli_capture([
+                    "--db", db_path, "--apply", "--confirm-irreversible",
+                    "--snapshot-dir", os.path.join(tmpdir, "snap-claim"),
+                    "--audit-log", os.path.join(tmpdir, "audit-claim.jsonl"),
+                ])
+            finally:
+                migrate_stale_paths._apply_single_row_update = original_update
+
+            ok = exit_code not in (0, None) and PAST_TENSE_MARKER not in stdout
+            _check(case_id, ok, f"exit_code={exit_code}, stdout={stdout[:300]!r}")
             if ok:
                 passed += 1
     except Exception as exc:
