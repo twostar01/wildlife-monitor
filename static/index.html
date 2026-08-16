@@ -1632,7 +1632,7 @@ async function openSpecies(label) {
               <div class="quality-bar"><div class="quality-bar-fill" style="width:${c.quality_score||0}%"></div></div>
             </div>
             <div class="badge-pair">
-              ${confidenceBadge(c.species_confidence)}
+              ${confidenceBadge(c.species_confidence, c.has_correction)}
               <div class="quality-score">${Math.round(c.quality_score||0)}</div>
             </div>
           </div>
@@ -1837,7 +1837,7 @@ async function loadGallery(page) {
           <div class="quality-bar"><div class="quality-bar-fill" style="width:${item.quality_score||0}%"></div></div>
         </div>
         <div class="badge-pair">
-          ${confidenceBadge(item.species_confidence)}
+          ${confidenceBadge(item.species_confidence, item.has_correction)}
           <div class="quality-score">${Math.round(item.quality_score||0)}</div>
         </div>
       </div>
@@ -2485,7 +2485,17 @@ function populateSpeciesFilters(speciesList) {
 }
 
 // ── Util ──────────────────────────────────────────────────────────────────────
-function confidenceBadge(value) {
+function confidenceBadge(value, hasCorrection) {
+  // Corrected branch checked FIRST, before the null/undefined guard below —
+  // a crop whose species was human-corrected shows the pencil indicator
+  // instead of a (possibly stale, possibly absent) AI confidence score.
+  // No percentage is shown here: per D-03, a stale AI confidence for an
+  // overridden label would be actively misleading, not just imprecise.
+  // Reuses the existing badge-corrected class and ✏ glyph — the same
+  // visual language already established next to corrected species names.
+  if (hasCorrection) {
+    return `<span class="badge-corrected" title="Species corrected by operator — AI confidence no longer applies">✏</span>`;
+  }
   // Explicit !== null / !== undefined check, not a truthiness test — 0.0 is a
   // real, meaningful confidence score and is falsy in JS, so `if (value)`
   // would suppress the badge on exactly the tiles the operator most needs to
