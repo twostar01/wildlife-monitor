@@ -3,17 +3,36 @@ verify_phase12.py — stdlib-only verification harness for Phase 12
 (Observability, UX & Monitoring Decisions), plan 12-01.
 
 Suites:
-    badge — UI-05/D-05/D-06, the has_correction signal is accurate for BOTH
-            correction write paths (Gallery popover and video-player editor)
-            in get_gallery(), get_species_detail() and get_species_list()
-            (B1-B8).
-    ui    — UI-05/D-03/D-04, confidenceBadge() renders the pencil indicator
-            instead of a stale confidence percentage on a corrected tile,
-            and the Gallery grid carries exactly one corrected signal per
-            tile (U1-U8), verified as pure source assertions over
-            static/index.html — no browser, no DOM.
-
-Plan 12-03 later adds suite `propagation`.
+    badge       — UI-05/D-05/D-06, the has_correction signal is accurate for
+                  BOTH correction write paths (Gallery popover and
+                  video-player editor) in get_gallery(), get_species_detail()
+                  and get_species_list() (B1-B8).
+    ui          — UI-05/D-03/D-04, confidenceBadge() renders the pencil
+                  indicator instead of a stale confidence percentage on a
+                  corrected tile, and the Gallery grid carries exactly one
+                  corrected signal per tile (U1-U8), verified as pure source
+                  assertions over static/index.html — no browser, no DOM.
+    propagation — UI-05/D-05 (plan 12-03), display-name propagation from
+                  video_corrections widened to get_gallery(),
+                  get_species_detail(), get_videos() and get_video_by_id()
+                  (P1-P10). P1, P2, P5 and P6 are RED before this plan's
+                  task 2 (P1, P2, P5) and task 3 (P6) land. P3, P4, P7, P9
+                  and P10 must pass both before and after — those five are
+                  the guards that stop the fix being "achieved" by breaking
+                  something else: P3 (the pre-existing Gallery-popover
+                  path), P4 (an uncorrected crop), P7 (get_video_by_id()'s
+                  Python-side apply_corrections_to_species() overlay, which
+                  this plan never touches and which already produced the
+                  correct value before this plan existed), P9 (the
+                  suppression sentinel and the blank-corrected-name guard),
+                  and P10 (the non-goal pin — get_species_list(),
+                  get_stats() and get_timeline() stay on the raw label).
+                  P8 (the video_corrections-vs-species.user_common_name
+                  precedence case) checks get_gallery() AND
+                  get_video_by_id() together — the get_video_by_id() half is
+                  green from the start (same reason as P7), so P8 only
+                  turns fully green once task 2 fixes the get_gallery()
+                  half.
 
 Follows scripts/verify_phase10.py's structure: a `_check(case_id, condition,
 detail)` helper, per-suite `(passed, total)` returns, a dict suite
@@ -30,7 +49,7 @@ That is the intended and required outcome — this task's database.py edit is
 the change that turns cases B1/B4/B5/B6 green.
 
 Usage:
-    python scripts/verify_phase12.py --suite badge|ui|all
+    python scripts/verify_phase12.py --suite badge|ui|propagation|all
     python scripts/verify_phase12.py --list
 """
 
@@ -87,17 +106,21 @@ def _strip_comment_lines(text):
 
 
 def _seed_fixture_db(path):
-    """Build the badge-suite fixture: one camera "World Watch", three
-    videos.
+    """Build the shared badge/propagation fixture: one camera "World Watch".
       - video A / detection dA, species label "domestic cat" — a
         video_corrections row (video_id=A, original_label="domestic cat",
         corrected_label="Northern raccoon") is seeded here, i.e. the
-        VIDEO PLAYER path. species.corrected_at stays NULL.
+        VIDEO PLAYER path. species.corrected_at stays NULL. Filename
+        "WorldWatch_00_videoA.mp4" is already distinguishable from every
+        other video in this fixture (substring search matches only this
+        row) — plan 12-03's case P6 relies on that, no further change
+        needed.
       - video B / detection dB, species label "domestic cat" — left
-        UNCORRECTED by this helper; suite_badge() applies the GALLERY
-        POPOVER correction (via the real database.correct_species() write
-        path) later, after the cases that must observe dB as uncorrected
-        have already run (B6 in particular — see suite_badge()).
+        UNCORRECTED by this helper; suite_badge() and suite_propagation()
+        each apply the GALLERY POPOVER correction (via the real
+        database.correct_species() write path) themselves, after any case
+        that must observe dB as uncorrected has already run (B6 in
+        particular — see suite_badge()).
       - video C / detection dC, species label "Northern raccoon", NO
         correction of either kind. species.confidence is 0.0, anchoring
         the zero-confidence display case downstream (task 2/U4).
@@ -105,7 +128,33 @@ def _seed_fixture_db(path):
         "domestic cat", plus a video_corrections row with corrected_label
         NULL — the suppress sentinel (video_corrections.corrected_label
         schema comment: "NULL means suppress").
+      - video E / detection dE, species label "domestic cat" — carries
+        BOTH a species.user_common_name correction ("Bobcat", via the real
+        database.correct_species() write path, applied below the INSERT
+        block so it runs in its own committed transaction) AND a
+        video_corrections row (corrected_label="Northern raccoon",
+        corrected_common="Northern Raccoon") — plan 12-03's case P8, the
+        both-paths precedence collision.
+      - video F / detection dF, species label "domestic cat" — a
+        video_corrections row whose corrected_label is set (a real
+        correction, not a suppress sentinel) but whose corrected_common is
+        the empty string — plan 12-03's case P9, the blank-corrected-name
+        guard.
     Returns a dict of the real autoincrement ids assigned to each row.
+
+    Adding video E/F to this shared fixture is a deliberate, plan-12-03-
+    directed choice, not an oversight — see the corresponding <action> in
+    12-03-PLAN.md task 1, which calls out fixture contamination as "the
+    most likely failure mode here" and requires `--suite badge` to be
+    re-confirmed 8/8 immediately after this edit. It is safe here because
+    suite_badge()'s B1-B8 cases only look up specific ids by detection_id
+    or a specific species label's crop list — none of them assert an exact
+    row count or set membership that video E/F's presence would perturb,
+    and B6's aggregate has_correction==1 check for "domestic cat" was
+    already going to be 1 from dA's video-player correction alone, so dE's
+    additional species.corrected_at stamp doesn't change B6's asserted
+    value (verified empirically, not just by inspection, before this
+    plan's task 1 commit).
     """
     database.set_db_path(path)
     database.init_db(path)
@@ -142,11 +191,15 @@ def _seed_fixture_db(path):
         video_a = _insert_video("WorldWatch_00_videoA.mp4")
         video_b = _insert_video("WorldWatch_00_videoB.mp4")
         video_c = _insert_video("WorldWatch_00_videoC.mp4")
+        video_e = _insert_video("WorldWatch_00_videoE.mp4")
+        video_f = _insert_video("WorldWatch_00_videoF.mp4")
 
         d_a = _add_detection(video_a, "domestic cat", "Domestic Cat")
         d_b = _add_detection(video_b, "domestic cat", "Domestic Cat")
         d_c = _add_detection(video_c, "Northern raccoon", "Northern Raccoon", confidence=0.0)
         d_d = _add_detection(video_c, "domestic cat", "Domestic Cat")
+        d_e = _add_detection(video_e, "domestic cat", "Domestic Cat")
+        d_f = _add_detection(video_f, "domestic cat", "Domestic Cat")
 
         # Video-player-path correction on video A (dA).
         conn.execute(
@@ -165,14 +218,46 @@ def _seed_fixture_db(path):
             (video_c, "domestic cat", now),
         )
 
+        # Video-player-path correction on video E (dE) — the precedence
+        # half of case P8. The species.user_common_name half ("Bobcat") is
+        # applied via correct_species() below, after this INSERT block
+        # commits.
+        conn.execute(
+            "INSERT INTO video_corrections "
+            "(video_id, original_label, corrected_label, corrected_common, "
+            " corrected_scientific, corrected_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (video_e, "domestic cat", "Northern raccoon", "Northern Raccoon", "Procyon lotor", now),
+        )
+
+        # Blank-corrected-name case on video F (dF) — corrected_label is a
+        # real (non-NULL, non-suppress) correction, but corrected_common is
+        # the empty string. Case P9's second half.
+        conn.execute(
+            "INSERT INTO video_corrections "
+            "(video_id, original_label, corrected_label, corrected_common, "
+            " corrected_scientific, corrected_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (video_f, "domestic cat", "Northern raccoon", "", "", now),
+        )
+
+    # Gallery-popover correction on video E's species row. Deliberately run
+    # in its OWN transaction, after the INSERT block above has committed —
+    # correct_species() opens its own get_conn(), and calling it while the
+    # block above's connection is still open would be a second writer
+    # against an uncommitted transaction on the same file.
+    database.correct_species(d_e, "Bobcat", "Lynx rufus")
+
     return {
         "video_a": video_a,
         "video_b": video_b,
         "video_c": video_c,
+        "video_e": video_e,
+        "video_f": video_f,
         "d_a": d_a,
         "d_b": d_b,
         "d_c": d_c,
         "d_d": d_d,
+        "d_e": d_e,
+        "d_f": d_f,
     }
 
 
@@ -482,9 +567,229 @@ def suite_ui():
     return (passed, total)
 
 
+# ── `propagation` suite (plan 12-03) ─────────────────────────────────────
+
+
+def suite_propagation():
+    """Propagation-suite cases P1-P10 (10 total), UI-05/D-05 (plan 12-03):
+    a species corrected through the video player's per-crop editor
+    (video_corrections) now shows its corrected common/scientific name in
+    the Gallery grid, the species-detail modal, the Videos tab and filename
+    search — not only inside that one video's own detail view — while the
+    five readers that group or filter on the raw species label
+    (get_species_list(), get_stats(), get_timeline(), search(), and the
+    species-filter predicates in get_gallery()/get_videos()) stay
+    unchanged, on purpose, pinned by case P10.
+
+    Reuses `_seed_fixture_db()` as-is, then applies the Gallery-popover
+    correction to dB itself (mirroring `suite_badge()`'s own post-seed
+    correction) so case P3's no-regression anchor has something to anchor
+    against. Unlike `suite_badge()`, there is no cross-case aggregate
+    ordering constraint here (P10's aggregate checks are grouping-key pins,
+    not corrected-vs-uncorrected counts), so the correction can be applied
+    once, up front, before any case runs.
+
+    Every case runs against a `tempfile.TemporaryDirectory
+    (ignore_cleanup_errors=True)` and restores `database.set_db_path
+    (original)` in a `finally` block, exactly as `suite_badge()` does.
+    """
+    passed = 0
+    total = 10
+
+    original_db_path = database.get_db_path()
+    tmpdir_obj = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    try:
+        db_path = os.path.join(tmpdir_obj.name, "propagation.db")
+        ids = _seed_fixture_db(db_path)
+        video_a = ids["video_a"]
+        video_e = ids["video_e"]
+        d_a, d_b, d_c, d_d = ids["d_a"], ids["d_b"], ids["d_c"], ids["d_d"]
+        d_e, d_f = ids["d_e"], ids["d_f"]
+
+        # Gallery-popover correction on video B — case P3's anchor.
+        database.correct_species(d_b, "Northern Raccoon", "Procyon lotor")
+
+        def _gallery_item(det_id):
+            items = database.get_gallery(per_page=100)["items"]
+            return next((it for it in items if it.get("detection_id") == det_id), None)
+
+        def _species_detail_crops(label):
+            return database.get_species_detail(label)["crops"]
+
+        def _crop_by_detection(crops, det_id):
+            return next((c for c in crops if c.get("detection_id") == det_id), None)
+
+        # P1 — get_gallery() returns common_name "Northern Raccoon" for
+        # dA's crop (video-player path). RED before task 2.
+        case_id = "P1"
+        item_a = _gallery_item(d_a)
+        ok = item_a is not None and item_a.get("common_name") == "Northern Raccoon"
+        _check(case_id, ok, f"item_a={item_a}")
+        if ok:
+            passed += 1
+
+        # P2 — get_gallery() returns scientific_name "Procyon lotor" for
+        # dA's crop. RED before task 2.
+        case_id = "P2"
+        ok = item_a is not None and item_a.get("scientific_name") == "Procyon lotor"
+        _check(case_id, ok, f"item_a={item_a}")
+        if ok:
+            passed += 1
+
+        # P3 — get_gallery() returns the gallery-popover-corrected name for
+        # dB's crop. Green before AND after — no-regression anchor.
+        case_id = "P3"
+        item_b = _gallery_item(d_b)
+        ok = item_b is not None and item_b.get("common_name") == "Northern Raccoon"
+        _check(case_id, ok, f"item_b={item_b}")
+        if ok:
+            passed += 1
+
+        # P4 — get_gallery() returns the raw SpeciesNet common_name for
+        # dC's uncorrected crop.
+        case_id = "P4"
+        item_c = _gallery_item(d_c)
+        ok = item_c is not None and item_c.get("common_name") == "Northern Raccoon"
+        _check(case_id, ok, f"item_c={item_c}")
+        if ok:
+            passed += 1
+
+        # P5 — get_species_detail("domestic cat")'s crops row for dA
+        # returns common_name "Northern Raccoon". RED before task 2.
+        case_id = "P5"
+        crops_cat = _species_detail_crops("domestic cat")
+        crop_a = _crop_by_detection(crops_cat, d_a)
+        ok = crop_a is not None and crop_a.get("common_name") == "Northern Raccoon"
+        _check(case_id, ok, f"crop_a={crop_a}")
+        if ok:
+            passed += 1
+
+        # P6 — get_videos(search=<video A's filename>)'s single item has a
+        # species_list containing "Northern Raccoon" and NOT containing the
+        # original AI common name for "domestic cat". RED before task 3 —
+        # the exact symptom the folded todo reported.
+        case_id = "P6"
+        video_a_filename = database.get_video_by_id(video_a)["video"]["filename"]
+        videos_result = database.get_videos(search=video_a_filename, per_page=100)
+        video_a_item = next(
+            (v for v in videos_result["items"] if v.get("id") == video_a), None
+        )
+        species_list = (video_a_item or {}).get("species_list") or ""
+        ok = (
+            video_a_item is not None
+            and "Northern Raccoon" in species_list
+            and "Domestic Cat" not in species_list
+        )
+        _check(case_id, ok, f"video_a_item={video_a_item}")
+        if ok:
+            passed += 1
+
+        # P7 — get_video_by_id(A)'s detections still report "Northern
+        # Raccoon" — the SQL result and apply_corrections_to_species()'s
+        # overlay agree, so the overlay is idempotent rather than masking a
+        # divergence. Green before AND after: the Python overlay already
+        # produced this value before this plan touched any SQL.
+        case_id = "P7"
+        detail_a = database.get_video_by_id(video_a)
+        det_a = next((d for d in detail_a["detections"] if d.get("id") == d_a), None)
+        ok = det_a is not None and det_a.get("common_name") == "Northern Raccoon"
+        _check(case_id, ok, f"det_a={det_a}")
+        if ok:
+            passed += 1
+
+        # P8 — precedence: get_gallery()'s row for dE returns "Northern
+        # Raccoon" (the video_corrections value), NOT "Bobcat" (the
+        # species.user_common_name value) — matching get_video_by_id(E)'s
+        # existing behaviour, which this same case asserts alongside so the
+        # two can never drift apart. The get_video_by_id() half is green
+        # from the start (same reason as P7); the get_gallery() half is RED
+        # until task 2, so the combined case only turns fully green then.
+        case_id = "P8"
+        item_e = _gallery_item(d_e)
+        detail_e = database.get_video_by_id(video_e)
+        det_e = next((d for d in detail_e["detections"] if d.get("id") == d_e), None)
+        ok = (
+            item_e is not None
+            and item_e.get("common_name") == "Northern Raccoon"
+            and det_e is not None
+            and det_e.get("common_name") == "Northern Raccoon"
+        )
+        _check(case_id, ok, f"item_e={item_e}, det_e={det_e}")
+        if ok:
+            passed += 1
+
+        # P9 — suppression and blank handling: dD's crop (corrected_label
+        # NULL) returns its ORIGINAL common name, not NULL and not empty;
+        # and dF's crop (corrected_label set, corrected_common empty
+        # string) also returns its original common name rather than a
+        # blank. Green before AND after.
+        case_id = "P9"
+        crops_cat = _species_detail_crops("domestic cat")
+        crop_d = _crop_by_detection(crops_cat, d_d)
+        crop_f = _crop_by_detection(crops_cat, d_f)
+        ok = (
+            crop_d is not None
+            and crop_d.get("common_name") == "Domestic Cat"
+            and crop_f is not None
+            and crop_f.get("common_name") == "Domestic Cat"
+        )
+        _check(case_id, ok, f"crop_d={crop_d}, crop_f={crop_f}")
+        if ok:
+            passed += 1
+
+        # P10 — non-goal pin: get_species_list()'s "domestic cat" row still
+        # reports the RAW SpeciesNet common name (via its unambiguous
+        # ai_common_name column — every "domestic cat" detection in this
+        # fixture shares the same raw s.common_name, so this check is
+        # deterministic regardless of which group member SQLite's bare
+        # GROUP BY column selection happens to pick), get_stats()
+        # ['top_species'] still keys on the raw label, and get_timeline()'s
+        # rows still carry the raw-label grouping key. Green before AND
+        # after. Grouping/filtering by an effective (post-correction) label
+        # is a DELIBERATE, DOCUMENTED NON-GOAL of this plan — see the
+        # comment block beneath EFFECTIVE_SCIENTIFIC in database.py —
+        # because it would change the drilldown key get_species_detail()
+        # accepts, the <option> values populateSpeciesFilters() emits, and
+        # chart series identity, and no source artifact decides what that
+        # key should be. If this case ever fails, that decision has not
+        # been made yet — it failing is a request for one, not a bug.
+        case_id = "P10"
+        species_rows = database.get_species_list()
+        cat_row = next((r for r in species_rows if r.get("label") == "domestic cat"), None)
+        stats = database.get_stats()
+        stats_cat_row = next(
+            (r for r in stats["top_species"] if r.get("label") == "domestic cat"), None
+        )
+        timeline = database.get_timeline()
+        timeline_cat_rows = [r for r in timeline["rows"] if r.get("label") == "domestic cat"]
+        ok = (
+            cat_row is not None
+            and cat_row.get("ai_common_name") == "Domestic Cat"
+            and stats_cat_row is not None
+            and bool(timeline_cat_rows)
+        )
+        _check(
+            case_id,
+            ok,
+            "deliberate non-goal — grouping/filtering by an effective "
+            "label requires a decision on the drilldown key that no source "
+            "artifact has made (see database.py's EFFECTIVE_SCIENTIFIC "
+            f"comment block); cat_row={cat_row}, stats_cat_row={stats_cat_row}, "
+            f"timeline_cat_rows={timeline_cat_rows}",
+        )
+        if ok:
+            passed += 1
+    finally:
+        database.set_db_path(original_db_path)
+        tmpdir_obj.cleanup()
+
+    return (passed, total)
+
+
 SUITES = {
     "badge": (suite_badge, 8),
     "ui": (suite_ui, 8),
+    "propagation": (suite_propagation, 10),
 }
 
 

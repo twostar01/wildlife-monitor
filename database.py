@@ -309,6 +309,106 @@ HAS_VIDEO_CORRECTION = """EXISTS (
 # NOT_EFFECTIVELY_UNKNOWN's own comment makes above (lines 227-229).
 HAS_CORRECTION = f"CASE WHEN s.corrected_at IS NOT NULL OR {HAS_VIDEO_CORRECTION} THEN 1 ELSE 0 END"
 
+# Scalar correlated subquery returning the VIDEO PLAYER's corrected common
+# name for a species row, or NULL when no matching, non-suppressed
+# video_corrections row exists. The predicate is character-for-character
+# the one inside HAS_VIDEO_CORRECTION above, deliberately — the flag and
+# the name must agree about what counts as a correction, or a tile could
+# show a pencil next to an uncorrected name. LIMIT 1 is defensive rather
+# than load-bearing: save_video_correction() deletes before inserting so at
+# most one row can match a given (video_id, original_label), but no UNIQUE
+# constraint enforces that at the schema level — a scalar subquery
+# returning two rows would raise at runtime on production data rather than
+# in the fixture.
+#
+# Suppression semantics: a NULL corrected_label means "suppress this
+# species" (video_corrections.corrected_label schema comment), not "this
+# species was corrected" — the third conjunct excludes those rows, so a
+# suppress-sentinel row never supplies a name.
+#
+# Every interpolation site MUST have both an `s` (species) and a `d`
+# (detections) alias in scope, since this correlated subquery references
+# d.video_id — the same precondition NOT_EFFECTIVELY_UNKNOWN's and
+# HAS_VIDEO_CORRECTION's own comments document above.
+VIDEO_CORRECTION_COMMON = """(
+    SELECT vc.corrected_common FROM video_corrections vc
+    WHERE vc.video_id = d.video_id
+      AND vc.original_label = s.label
+      AND vc.corrected_label IS NOT NULL
+    LIMIT 1
+)"""
+
+# Same shape as VIDEO_CORRECTION_COMMON, selecting the corrected scientific
+# name instead.
+VIDEO_CORRECTION_SCIENTIFIC = """(
+    SELECT vc.corrected_scientific FROM video_corrections vc
+    WHERE vc.video_id = d.video_id
+      AND vc.original_label = s.label
+      AND vc.corrected_label IS NOT NULL
+    LIMIT 1
+)"""
+
+# The effective display name: the VIDEO PLAYER's correction when present
+# and non-blank, else the existing DISPLAY_COMMON/DISPLAY_SCIENTIFIC chain
+# (Gallery-popover correction, else the raw SpeciesNet value).
+# NULLIF(...,'') is what makes a correction saved with a blank name fall
+# through to the existing chain instead of blanking the display — the same
+# guard DISPLAY_COMMON already applies to s.user_common_name.
+#
+# Ordering the video-corrections value FIRST is a deliberate precedence
+# choice with no source decision behind it: get_video_by_id() already
+# resolves this exact collision the same way, because
+# apply_corrections_to_species() overwrites the DISPLAY_COMMON-derived
+# common_name with corrected_common regardless of what species.
+# user_common_name says. Ordering it the other way would silently change a
+# shipped behaviour while fixing a display gap. Case P8 (scripts/
+# verify_phase12.py) pins this choice — it asserts get_gallery() and
+# get_video_by_id() agree on the same crop.
+#
+# Same alias precondition as VIDEO_CORRECTION_COMMON above: every
+# interpolation site needs both `s` and `d` in scope.
+EFFECTIVE_COMMON = f"COALESCE(NULLIF({VIDEO_CORRECTION_COMMON},''), {DISPLAY_COMMON})"
+EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({VIDEO_CORRECTION_SCIENTIFIC},''), {DISPLAY_SCIENTIFIC})"
+
+# ── Deliberately NOT converted to EFFECTIVE_COMMON/EFFECTIVE_SCIENTIFIC ──
+#
+# The following readers stay on DISPLAY_COMMON/DISPLAY_SCIENTIFIC (or never
+# used them), on purpose, and case P10 (scripts/verify_phase12.py) pins
+# this boundary as a regression:
+#
+#   - get_species_list()      (GROUP BY s.label)
+#   - get_stats() top_species  (GROUP BY s.label)
+#   - get_timeline()           (GROUP BY period, s.label)
+#     These three GROUP BY the raw label. Selecting an effective name over
+#     a group keyed on the raw label makes SQLite return an arbitrary
+#     member row's value, so a label with some corrected and some
+#     uncorrected detections would display non-deterministically —
+#     strictly worse than the current stable-if-stale behaviour.
+#
+#   - get_stats() activity_raw (selects the raw s.common_name directly)
+#     Already selects the raw common_name and has never used DISPLAY_COMMON
+#     at all — stale for BOTH correction paths. That predates this phase
+#     and is unrelated to it.
+#
+#   - search()
+#     Never used DISPLAY_COMMON, and its species query has no `d`
+#     (detections) alias in scope, so EFFECTIVE_COMMON cannot be
+#     interpolated there without a join change.
+#
+#   - get_gallery()'s species filter (s.label = ?) and get_videos()'s
+#     species filter and its `s.common_name LIKE ?` search predicate
+#     Match on raw values — a video-corrected crop still answers to its
+#     original label in those filters.
+#
+# Correcting any of the above means grouping and filtering by the
+# EFFECTIVE (post-correction) label instead of the raw one, which changes
+# the drilldown key get_species_detail(label) accepts, the <option> values
+# populateSpeciesFilters() emits (static/index.html), and chart series
+# identity. No source artifact decides what that key should be, so this
+# plan records the boundary rather than acting on it. If case P10 ever
+# fails, that decision has not been made yet — it failing is a request for
+# one, not a bug.
+
 
 def init_db(db_path: Optional[str] = None):
     if db_path:
@@ -1597,8 +1697,8 @@ def get_species_detail(label: str) -> dict:
                    v.filename, v.recorded_at,
                    s.label, s.detection_id, s.top_candidates_json,
                    s.confidence          AS species_confidence,
-                   {DISPLAY_COMMON}     AS common_name,
-                   {DISPLAY_SCIENTIFIC} AS scientific_name,
+                   {EFFECTIVE_COMMON}     AS common_name,
+                   {EFFECTIVE_SCIENTIFIC} AS scientific_name,
                    {HAS_CORRECTION}     AS has_correction
             FROM crops c
             JOIN detections d ON c.detection_id = d.id
@@ -1672,8 +1772,8 @@ def get_gallery(
         rows = conn.execute(f"""
             SELECT c.crop_path, c.quality_score, c.width, c.height,
                    s.label,
-                   {DISPLAY_COMMON}     AS common_name,
-                   {DISPLAY_SCIENTIFIC} AS scientific_name,
+                   {EFFECTIVE_COMMON}     AS common_name,
+                   {EFFECTIVE_SCIENTIFIC} AS scientific_name,
                    s.common_name        AS ai_common_name,
                    s.detection_id,
                    s.top_candidates_json,
@@ -1879,7 +1979,7 @@ def get_videos(
                    v.has_animal, v.has_person, v.thumbnail_path,
                    v.lens_index, v.paired_video_id,
                    GROUP_CONCAT(DISTINCT CASE WHEN {KNOWN_SPECIES_FILTER}
-                       THEN {DISPLAY_COMMON} END) as species_list
+                       THEN {EFFECTIVE_COMMON} END) as species_list
             FROM videos v
             LEFT JOIN detections d ON v.id = d.video_id
             LEFT JOIN species s ON s.detection_id = d.id
@@ -1906,7 +2006,7 @@ def get_video_by_id(video_id: int) -> dict:
 
         detections = conn.execute(f"""
             SELECT d.id, d.frame_number, d.timestamp_secs, d.category, d.confidence,
-                   s.label, {DISPLAY_COMMON} as common_name, s.scientific_name,
+                   s.label, {EFFECTIVE_COMMON} as common_name, s.scientific_name,
                    s.top_candidates_json,
                    c.crop_path, c.quality_score
             FROM detections d
@@ -1933,7 +2033,7 @@ def get_video_by_id(video_id: int) -> dict:
                 paired = dict(paired_row)
                 raw_pair_dets = [dict(r) for r in conn.execute(f"""
                     SELECT d.id, d.frame_number, d.timestamp_secs, d.category, d.confidence,
-                           s.label, {DISPLAY_COMMON} as common_name, s.scientific_name,
+                           s.label, {EFFECTIVE_COMMON} as common_name, s.scientific_name,
                            s.top_candidates_json,
                            c.crop_path, c.quality_score
                     FROM detections d
