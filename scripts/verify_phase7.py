@@ -402,14 +402,14 @@ def suite_confidence_badge():
 
     case_id = "confidence_badge/C6-main-grid-wired"
     main_grid_window = next((w for w in windows if "item.quality_score" in w), "")
-    ok = "confidenceBadge(item.species_confidence)" in main_grid_window and 'class="badge-pair"' in main_grid_window
+    ok = "confidenceBadge(item.species_confidence, item.has_correction)" in main_grid_window and 'class="badge-pair"' in main_grid_window
     _check(case_id, ok, f"main_grid_window_found={bool(main_grid_window)}")
     if ok:
         passed += 1
 
     case_id = "confidence_badge/C7-modal-grid-wired"
     modal_grid_window = next((w for w in windows if "c.quality_score" in w), "")
-    ok = "confidenceBadge(c.species_confidence)" in modal_grid_window and 'class="badge-pair"' in modal_grid_window
+    ok = "confidenceBadge(c.species_confidence, c.has_correction)" in modal_grid_window and 'class="badge-pair"' in modal_grid_window
     _check(case_id, ok, f"modal_grid_window_found={bool(modal_grid_window)}")
     if ok:
         passed += 1
