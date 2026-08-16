@@ -539,7 +539,12 @@ def suite_logging():
     enough_calls = log_call_count >= 8
     no_secrets = True
     for line in text.splitlines():
-        if "log." in line and ("password" in line.lower() or "smtp" in line.lower()):
+        # redact_smtp_password(...) is the sanctioned way to log a settings
+        # payload (Phase 12 OBS-02, api_save_settings) — that identifier
+        # itself contains "password" and "smtp", so scrub it before testing
+        # for a raw reference to the plaintext field.
+        scrubbed = line.replace("redact_smtp_password", "")
+        if "log." in scrubbed and ("password" in scrubbed.lower() or "smtp" in scrubbed.lower()):
             no_secrets = False
             break
     ok = order_ok and enough_calls and no_secrets
