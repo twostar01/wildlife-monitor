@@ -278,6 +278,37 @@ KNOWN_SPECIES_FILTER = (
 DISPLAY_COMMON     = "COALESCE(NULLIF(s.user_common_name,''), s.common_name)"
 DISPLAY_SCIENTIFIC = "COALESCE(NULLIF(s.user_scientific_name,''), s.scientific_name)"
 
+# True when a species row was corrected through the VIDEO PLAYER's per-crop
+# editor rather than the Gallery popover. The gallery path writes
+# species.user_common_name and stamps species.corrected_at directly via
+# correct_species(); the video-player path instead writes a
+# video_corrections row via save_video_correction(), keyed by
+# (video_id, original_label). A NULL corrected_label is the schema's
+# suppress sentinel (video_corrections.corrected_label, "NULL means
+# suppress") and apply_corrections_to_species() treats it as "skip this
+# species" rather than "this species was corrected" — the third conjunct
+# below is load-bearing, not defensive, and mirrors the identical conjunct
+# already present in NOT_EFFECTIVELY_UNKNOWN above for the same reason.
+#
+# Every interpolation site MUST have both an `s` (species) and a `d`
+# (detections) alias in scope, since this correlated subquery references
+# d.video_id — the same precondition NOT_EFFECTIVELY_UNKNOWN's own comment
+# documents at (see above, "requires both an `s` ... and a `d` ...").
+HAS_VIDEO_CORRECTION = """EXISTS (
+    SELECT 1 FROM video_corrections vc
+    WHERE vc.video_id = d.video_id
+      AND vc.original_label = s.label
+      AND vc.corrected_label IS NOT NULL
+)"""
+
+# True (1) when a row's species was corrected through EITHER write path
+# (Gallery popover OR video-player editor), else False (0). The cheap
+# `s.corrected_at IS NOT NULL` disjunct is placed FIRST so SQL's
+# left-to-right OR short-circuits the correlated HAS_VIDEO_CORRECTION
+# subquery for the overwhelming majority of rows — the same cost argument
+# NOT_EFFECTIVELY_UNKNOWN's own comment makes above (lines 227-229).
+HAS_CORRECTION = f"CASE WHEN s.corrected_at IS NOT NULL OR {HAS_VIDEO_CORRECTION} THEN 1 ELSE 0 END"
+
 
 def init_db(db_path: Optional[str] = None):
     if db_path:
@@ -1524,7 +1555,7 @@ def get_species_list() -> list:
                 COUNT(*) AS detection_count,
                 MAX(v.recorded_at) AS last_seen,
                 MIN(v.recorded_at) AS first_seen,
-                MAX(CASE WHEN s.corrected_at IS NOT NULL THEN 1 ELSE 0 END) AS has_correction,
+                MAX({HAS_CORRECTION}) AS has_correction,
                 (SELECT c.crop_path FROM crops c
                  JOIN detections d2 ON c.detection_id = d2.id
                  JOIN species s2 ON s2.detection_id = d2.id
@@ -1567,7 +1598,8 @@ def get_species_detail(label: str) -> dict:
                    s.label, s.detection_id, s.top_candidates_json,
                    s.confidence          AS species_confidence,
                    {DISPLAY_COMMON}     AS common_name,
-                   {DISPLAY_SCIENTIFIC} AS scientific_name
+                   {DISPLAY_SCIENTIFIC} AS scientific_name,
+                   {HAS_CORRECTION}     AS has_correction
             FROM crops c
             JOIN detections d ON c.detection_id = d.id
             JOIN species s ON s.detection_id = d.id
@@ -1646,7 +1678,7 @@ def get_gallery(
                    s.detection_id,
                    s.top_candidates_json,
                    s.confidence          AS species_confidence,
-                   CASE WHEN s.corrected_at IS NOT NULL THEN 1 ELSE 0 END AS has_correction,
+                   {HAS_CORRECTION} AS has_correction,
                    v.id as video_id, v.filename, v.recorded_at
             FROM crops c
             JOIN detections d ON c.detection_id = d.id
