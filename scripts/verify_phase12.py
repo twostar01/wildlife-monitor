@@ -10,9 +10,8 @@ Suites:
     ui    — UI-05/D-03/D-04, confidenceBadge() renders the pencil indicator
             instead of a stale confidence percentage on a corrected tile,
             and the Gallery grid carries exactly one corrected signal per
-            tile (U1-U6 as of task 2; U7-U8 added in task 3), verified as
-            pure source assertions over static/index.html — no browser,
-            no DOM.
+            tile (U1-U8), verified as pure source assertions over
+            static/index.html — no browser, no DOM.
 
 Plan 12-03 later adds suite `propagation`.
 
@@ -363,17 +362,16 @@ def suite_badge():
 
 
 def suite_ui():
-    """UI-suite cases U1-U6 (6 total, task 2), pure source assertions over
+    """UI-suite cases U1-U8 (8 total), pure source assertions over
     static/index.html — no browser, no DOM, no new dependency. Every
     assertion is scoped to the region it is about via `_slice()`, and every
     slice has comment lines (lstrip() starting with '//') stripped before
     testing, so an unrelated occurrence or explanatory comment elsewhere in
     this 3000-line single-file frontend can neither satisfy nor break a
-    case. Task 3 extends this suite to U7-U8 (8 total) once the D-04
-    text-tag removal and the applyDetectionCorrection() DOM-patch fix land.
+    case.
     """
     passed = 0
-    total = 6
+    total = 8
 
     text = _index_html_text()
 
@@ -459,17 +457,34 @@ def suite_ui():
     if ok:
         passed += 1
 
-    # NOTE: apply_detection_slice/apply_detection_slice_stripped are computed
-    # above (used by task 3's U7/U8, added once the D-04 removal and the
-    # DOM-patch fix land) but are unused by U1-U6 above.
-    _ = apply_detection_slice_stripped
+    # U7 — within the gallery-grid slice, the identifier correctedBadge does
+    # not occur (D-04: the text tag was removed, subsumed by the badge-slot
+    # indicator). Region-scoped and comment-stripped so an explanatory
+    # comment naming the removed identifier can't fail this case.
+    case_id = "U7"
+    ok = "correctedBadge" not in gallery_slice_stripped
+    _check(case_id, ok, "")
+    if ok:
+        passed += 1
+
+    # U8 — within the applyDetectionCorrection slice, a badge-pair
+    # reference occurs AND a confidenceBadge( call occurs — the in-place
+    # DOM patch reaches the badge slot, not only the name element.
+    case_id = "U8"
+    ok = (
+        "badge-pair" in apply_detection_slice_stripped
+        and "confidenceBadge(" in apply_detection_slice_stripped
+    )
+    _check(case_id, ok, "")
+    if ok:
+        passed += 1
 
     return (passed, total)
 
 
 SUITES = {
     "badge": (suite_badge, 8),
-    "ui": (suite_ui, 6),
+    "ui": (suite_ui, 8),
 }
 
 

@@ -1809,9 +1809,6 @@ async function loadGallery(page) {
   }
 
   grid.innerHTML = data.items.map(item => {
-    const correctedBadge = item.has_correction
-      ? `<span class="badge-corrected">✏ corrected</span>`
-      : '';
     const displayName = item.common_name || item.label || 'Unknown';
     const aiName = (!item.has_correction && item.ai_common_name) ? '' :
       (item.ai_common_name && item.ai_common_name !== item.common_name
@@ -1832,7 +1829,7 @@ async function loadGallery(page) {
       </div>
       <div class="gallery-item-meta">
         <div>
-          <div class="gallery-item-name">${escHtml(displayName)} ${correctedBadge}</div>
+          <div class="gallery-item-name">${escHtml(displayName)}</div>
           ${aiName}
           <div class="quality-bar"><div class="quality-bar-fill" style="width:${item.quality_score||0}%"></div></div>
         </div>
@@ -2901,8 +2898,26 @@ async function applyDetectionCorrection(common, sci) {
     closeModal('correctionModal');
     const item = document.getElementById(`gitem-${detectionId}`);
     if (item) {
+      // Patch to the same shape a full re-render produces (D-04): the name
+      // element carries the corrected common name only — no separate
+      // corrected text tag — and the badge-pair slot gets the pencil
+      // indicator the shared badge helper already renders for a corrected
+      // tile with no confidence value handy here. This also reaches
+      // species-detail modal tiles, which have no .gallery-item-name but
+      // do have .badge-pair, and previously fell through this patch
+      // silently.
       const nameEl = item.querySelector('.gallery-item-name');
-      if (nameEl) nameEl.innerHTML = `${escHtml(common)} <span class="badge-corrected">✏ corrected</span>`;
+      if (nameEl) nameEl.innerHTML = escHtml(common);
+      const badgePair = item.querySelector('.badge-pair');
+      if (badgePair) {
+        const badgeHtml = confidenceBadge(null, true);
+        const firstChild = badgePair.firstElementChild;
+        if (firstChild && firstChild.tagName === 'SPAN') {
+          firstChild.outerHTML = badgeHtml;
+        } else {
+          badgePair.insertAdjacentHTML('afterbegin', badgeHtml);
+        }
+      }
       item.dataset.common = common;
       item.dataset.sci = sci;
     }
