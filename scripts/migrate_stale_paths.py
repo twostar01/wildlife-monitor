@@ -121,6 +121,38 @@ def find_collisions(conn, rows):
     return collisions
 
 
+def suffix_violations(rows):
+    """Return the StaleRows where the text after STALE_PREFIX in old_path
+    differs from the text after CURRENT_PREFIX in new_path. Must always be
+    empty -- a non-empty result means rewrite_path() has been broken and
+    the run must not proceed."""
+    violations = []
+    for row in rows:
+        if row.old_path[len(STALE_PREFIX):] != row.new_path[len(CURRENT_PREFIX):]:
+            violations.append(row)
+    return violations
+
+
+def non_path_digest(conn, table, exclude_column):
+    """SHA-256 hex digest over every row's every column except
+    exclude_column, ordered by id -- the "nothing else changed"
+    fingerprint (ROADMAP Success Criterion 4's verification hook, used by
+    plan 11-04). Each value is serialised via json.dumps(sort_keys=True) so
+    NULL and the empty string hash distinctly, then joined by a NUL
+    separator; rows are separated by a double-NUL. Stable across runs and
+    independent of row insertion order because the SELECT is ordered by
+    id."""
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    cols = [c for c in cols if c != exclude_column]
+    col_list = ", ".join(cols)
+    digest = hashlib.sha256()
+    for row in conn.execute(f"SELECT {col_list} FROM {table} ORDER BY id ASC").fetchall():
+        serialized = "\x00".join(json.dumps(v, sort_keys=True) for v in row)
+        digest.update(serialized.encode("utf-8"))
+        digest.update(b"\x00\x00")
+    return digest.hexdigest()
+
+
 def snapshot_db(src_path, dest_path):
     """Take an online backup of the database at src_path into dest_path
     using sqlite3.Connection.backup(). Copied verbatim (mechanism only)
@@ -163,14 +195,18 @@ def write_audit_line(handle, payload):
     handle.flush()
 
 
-def render_plan_report(counts, rows, applied, as_json=False):
+def render_plan_report(counts, rows, applied, digests=None, as_json=False):
     """Print a Go/No-Go summary. applied=False describes what the run
     would do (future tense); applied=True describes what the run did
     (past tense) — never the reverse, per the FIX-03 / P-02 honesty lesson
-    (backfill_dedup_videos.py's args.apply-branched summary)."""
+    (backfill_dedup_videos.py's args.apply-branched summary). digests, if
+    given, is a {table: hex_digest} mapping from non_path_digest() -- the
+    "nothing else changed" fingerprint for each target table."""
     if as_json:
         payload = dict(counts)
         payload["applied"] = applied
+        if digests:
+            payload["non_path_digests"] = dict(digests)
         print(json.dumps(payload, sort_keys=True))
         return
 
@@ -188,6 +224,10 @@ def render_plan_report(counts, rows, applied, as_json=False):
             "Status: DRY-RUN -- rows would be rewritten as counted above; "
             "nothing has been written."
         )
+    if digests:
+        label = "verified unchanged" if applied else "before write"
+        for table, _column in TARGETS:
+            print(f"non_path_digest[{table}] ({label}): {digests.get(table, '')}")
     print(f"RUNVAR: report_generated_at={datetime.now().isoformat()}")
 
 
@@ -270,8 +310,23 @@ def main(argv=None):
     with database.get_conn() as conn:
         rows = select_stale_rows(conn)
         counts = count_stale_rows(conn)
+        before_digests = {
+            table: non_path_digest(conn, table, column) for table, column in TARGETS
+        }
 
-    render_plan_report(counts, rows, applied=False, as_json=args.json)
+    violations = suffix_violations(rows)
+    if violations:
+        print(
+            "ERROR: suffix_violations found -- rewrite_path() produced a value "
+            "whose suffix does not match the original suffix. Aborting before "
+            "any write.",
+            file=sys.stderr,
+        )
+        for v in violations:
+            print(f"  {v.table}.{v.column} id={v.row_id}: {v.old_path!r} -> {v.new_path!r}", file=sys.stderr)
+        sys.exit(1)
+
+    render_plan_report(counts, rows, applied=False, digests=before_digests, as_json=args.json)
 
     if not args.apply:
         sys.exit(0)
@@ -318,8 +373,26 @@ def main(argv=None):
 
     with database.get_conn() as conn:
         verification = verify_post_conditions(conn)
+        after_digests = {
+            table: non_path_digest(conn, table, column) for table, column in TARGETS
+        }
 
-    render_plan_report(counts, rows, applied=True, as_json=args.json)
+    mismatches = {
+        table: (before_digests[table], after_digests[table])
+        for table, _column in TARGETS
+        if before_digests[table] != after_digests[table]
+    }
+    if mismatches:
+        print(
+            "ERROR: non_path_digest mismatch after apply -- a non-path column "
+            "changed unexpectedly. Aborting.",
+            file=sys.stderr,
+        )
+        for table, (before, after) in mismatches.items():
+            print(f"  {table}: before={before} after={after}", file=sys.stderr)
+        sys.exit(1)
+
+    render_plan_report(counts, rows, applied=True, digests=after_digests, as_json=args.json)
     if not args.json:
         print(f"Rows changed: {changed}")
         print(f"RUNVAR: snapshot_path={snapshot_path}")
