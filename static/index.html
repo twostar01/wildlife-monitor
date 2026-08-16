@@ -1632,7 +1632,7 @@ async function openSpecies(label) {
               <div class="quality-bar"><div class="quality-bar-fill" style="width:${c.quality_score||0}%"></div></div>
             </div>
             <div class="badge-pair">
-              ${confidenceBadge(c.species_confidence)}
+              ${confidenceBadge(c.species_confidence, c.has_correction)}
               <div class="quality-score">${Math.round(c.quality_score||0)}</div>
             </div>
           </div>
@@ -1809,9 +1809,6 @@ async function loadGallery(page) {
   }
 
   grid.innerHTML = data.items.map(item => {
-    const correctedBadge = item.has_correction
-      ? `<span class="badge-corrected">✏ corrected</span>`
-      : '';
     const displayName = item.common_name || item.label || 'Unknown';
     const aiName = (!item.has_correction && item.ai_common_name) ? '' :
       (item.ai_common_name && item.ai_common_name !== item.common_name
@@ -1832,12 +1829,12 @@ async function loadGallery(page) {
       </div>
       <div class="gallery-item-meta">
         <div>
-          <div class="gallery-item-name">${escHtml(displayName)} ${correctedBadge}</div>
+          <div class="gallery-item-name">${escHtml(displayName)}</div>
           ${aiName}
           <div class="quality-bar"><div class="quality-bar-fill" style="width:${item.quality_score||0}%"></div></div>
         </div>
         <div class="badge-pair">
-          ${confidenceBadge(item.species_confidence)}
+          ${confidenceBadge(item.species_confidence, item.has_correction)}
           <div class="quality-score">${Math.round(item.quality_score||0)}</div>
         </div>
       </div>
@@ -2485,7 +2482,17 @@ function populateSpeciesFilters(speciesList) {
 }
 
 // ── Util ──────────────────────────────────────────────────────────────────────
-function confidenceBadge(value) {
+function confidenceBadge(value, hasCorrection) {
+  // Corrected branch checked FIRST, before the null/undefined guard below —
+  // a crop whose species was human-corrected shows the pencil indicator
+  // instead of a (possibly stale, possibly absent) AI confidence score.
+  // No percentage is shown here: per D-03, a stale AI confidence for an
+  // overridden label would be actively misleading, not just imprecise.
+  // Reuses the existing badge-corrected class and ✏ glyph — the same
+  // visual language already established next to corrected species names.
+  if (hasCorrection) {
+    return `<span class="badge-corrected" title="Species corrected by operator — AI confidence no longer applies">✏</span>`;
+  }
   // Explicit !== null / !== undefined check, not a truthiness test — 0.0 is a
   // real, meaningful confidence score and is falsy in JS, so `if (value)`
   // would suppress the badge on exactly the tiles the operator most needs to
@@ -2891,8 +2898,26 @@ async function applyDetectionCorrection(common, sci) {
     closeModal('correctionModal');
     const item = document.getElementById(`gitem-${detectionId}`);
     if (item) {
+      // Patch to the same shape a full re-render produces (D-04): the name
+      // element carries the corrected common name only — no separate
+      // corrected text tag — and the badge-pair slot gets the pencil
+      // indicator the shared badge helper already renders for a corrected
+      // tile with no confidence value handy here. This also reaches
+      // species-detail modal tiles, which have no .gallery-item-name but
+      // do have .badge-pair, and previously fell through this patch
+      // silently.
       const nameEl = item.querySelector('.gallery-item-name');
-      if (nameEl) nameEl.innerHTML = `${escHtml(common)} <span class="badge-corrected">✏ corrected</span>`;
+      if (nameEl) nameEl.innerHTML = escHtml(common);
+      const badgePair = item.querySelector('.badge-pair');
+      if (badgePair) {
+        const badgeHtml = confidenceBadge(null, true);
+        const firstChild = badgePair.firstElementChild;
+        if (firstChild && firstChild.tagName === 'SPAN') {
+          firstChild.outerHTML = badgeHtml;
+        } else {
+          badgePair.insertAdjacentHTML('afterbegin', badgeHtml);
+        }
+      }
       item.dataset.common = common;
       item.dataset.sci = sci;
     }
