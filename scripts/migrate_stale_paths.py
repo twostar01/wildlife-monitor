@@ -129,20 +129,116 @@ def check_paths_exist(paths, batch_size=2000):
     return results
 
 
+def find_orphans(rows, existence):
+    """Return the StaleRows whose new_path maps to False in `existence`
+    (the D-01 pre-write existence dict), preserving plan order. This is
+    the D-02 blocking set: a genuinely orphaned reference where even the
+    rewritten path doesn't exist, distinct from the known-stale-prefix
+    condition every candidate row already has."""
+    return [row for row in rows if not existence.get(row.new_path, False)]
+
+
+def render_orphan_report(orphans, total_checked):
+    """Print the D-02 blocking report to stderr: the orphan count out of
+    total_checked, the first 25 offending rows in plan order (table,
+    column, row id, old path, rewritten path), how many more were
+    omitted, and an explicit statement that the entire run is blocked.
+    Per D-02, these rows are never described as skipped and no bypass is
+    offered or hinted at."""
+    print("Orphaned Reference Block -- RUN BLOCKED", file=sys.stderr)
+    print("=" * 44, file=sys.stderr)
+    print(
+        f"{len(orphans)} of {total_checked} candidate rows rewrite to a path "
+        "that does not exist on disk.",
+        file=sys.stderr,
+    )
+    print("The entire run is blocked. No rows have been modified.", file=sys.stderr)
+    shown = orphans[:25]
+    for o in shown:
+        print(
+            f"  {o.table}.{o.column} id={o.row_id}: {o.old_path!r} -> {o.new_path!r}",
+            file=sys.stderr,
+        )
+    remaining = len(orphans) - len(shown)
+    if remaining > 0:
+        print(f"  ... and {remaining} more orphaned rows not shown.", file=sys.stderr)
+
+
 def find_collisions(conn, rows):
-    """Return the subset of rows whose new_path already exists in
-    crops.crop_path — the UNIQUE constraint guard. crops.crop_path is the
-    only UNIQUE target column (database.py SCHEMA); a collision here would
-    make the UPDATE fail at the database layer, so callers can use this to
-    report a clear pre-write diagnostic instead of a raw IntegrityError."""
+    """Return a list of collision dicts describing either (a) a candidate
+    crops row whose new_path already exists in a *different* crops row
+    (crops.crop_path is the only UNIQUE target column -- database.py
+    SCHEMA), or (b) two candidate rows in this same run that rewrite to
+    the same new_path (an adjacency collision no existing-table lookup
+    would catch). Existing-table lookups are batched via a chunked IN
+    clause -- mirrors _still_referenced_paths() in
+    backfill_dedup_videos.py -- rather than one query per row."""
     collisions = []
+
+    # (a) candidate crops rows vs. the existing crops table.
+    crop_candidates = [row for row in rows if row.table == "crops"]
+    if crop_candidates:
+        by_new_path = {}
+        for row in crop_candidates:
+            by_new_path.setdefault(row.new_path, []).append(row)
+        unique_new_paths = list(by_new_path.keys())
+        chunk_size = 500
+        for start in range(0, len(unique_new_paths), chunk_size):
+            chunk = unique_new_paths[start:start + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            for existing_id, existing_path in conn.execute(
+                f"SELECT id, crop_path FROM crops WHERE crop_path IN ({placeholders})",
+                tuple(chunk),
+            ):
+                for row in by_new_path[existing_path]:
+                    if existing_id == row.row_id:
+                        continue  # a row never collides with its own pre-rewrite value
+                    collisions.append({
+                        "kind": "existing",
+                        "row": row,
+                        "conflict_row_id": existing_id,
+                    })
+
+    # (b) two candidate rows (either table) rewriting to the same new_path.
+    by_new_path_all = {}
     for row in rows:
-        existing = conn.execute(
-            "SELECT COUNT(*) FROM crops WHERE crop_path = ?", (row.new_path,)
-        ).fetchone()[0]
-        if existing:
-            collisions.append(row)
+        by_new_path_all.setdefault(row.new_path, []).append(row)
+    for new_path, group in by_new_path_all.items():
+        if len(group) > 1:
+            for i in range(len(group)):
+                for j in range(i + 1, len(group)):
+                    collisions.append({
+                        "kind": "candidate-pair",
+                        "row": group[i],
+                        "conflict_row_id": group[j].row_id,
+                    })
+
     return collisions
+
+
+def render_collision_report(collisions, total_checked):
+    """Print the UNIQUE-collision blocking report to stderr, naming the
+    conflicting row ids for each collision so an operator can act on it.
+    Blocks before the snapshot and before any write -- a constraint
+    violation must never be discovered mid-transaction (T-11-09)."""
+    print("Collision Block -- RUN BLOCKED", file=sys.stderr)
+    print("=" * 44, file=sys.stderr)
+    print(
+        f"{len(collisions)} collision(s) found among {total_checked} candidate rows.",
+        file=sys.stderr,
+    )
+    print("The entire run is blocked. No rows have been modified.", file=sys.stderr)
+    shown = collisions[:25]
+    for c in shown:
+        row = c["row"]
+        print(
+            f"  {row.table}.{row.column} id={row.row_id} rewrites to {row.new_path!r}, "
+            f"conflicting with row id={c['conflict_row_id']} ({c['kind']})",
+            file=sys.stderr,
+        )
+    remaining = len(collisions) - len(shown)
+    if remaining > 0:
+        print(f"  ... and {remaining} more collisions not shown.", file=sys.stderr)
 
 
 def suffix_violations(rows):
@@ -391,6 +487,22 @@ def main(argv=None):
     pre_write_counts = _existence_counts(existence_pre, ordered_new_paths)
     if not args.json:
         render_existence_block("pre-write", pre_write_counts)
+
+    # D-02 orphan gate -- blocks the entire run before the snapshot and
+    # before any write, in both dry-run and apply mode. No skip/bypass
+    # flag exists; a genuinely orphaned reference always stops the run.
+    orphans = find_orphans(rows, existence_pre)
+    if orphans:
+        render_orphan_report(orphans, len(rows))
+        sys.exit(1)
+
+    # UNIQUE-collision gate -- also blocks before the snapshot and before
+    # any write. A constraint violation must never surface mid-transaction.
+    with database.get_conn() as conn:
+        collisions = find_collisions(conn, rows)
+    if collisions:
+        render_collision_report(collisions, len(rows))
+        sys.exit(1)
 
     render_plan_report(
         counts, rows, applied=False, digests=before_digests,

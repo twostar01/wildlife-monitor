@@ -8,7 +8,7 @@ real shipped CLI entry point, not a re-implementation. Never touches the
 production database file.
 
 Usage:
-    python scripts/verify_stale_paths.py --suite rewrite|dry-run|apply-gate|file-existence|apply|all
+    python scripts/verify_stale_paths.py --suite rewrite|dry-run|apply-gate|file-existence|collision|apply|all
 """
 
 import argparse
@@ -221,9 +221,14 @@ def suite_apply_gate():
     """Write-authorization gate: --apply alone, --apply
     --confirm-irreversible missing --snapshot-dir/--audit-log, and an
     unwritable snapshot directory all exit non-zero and write nothing to
-    the database."""
+    the database. This suite's fixtures use synthetic /home/nash/... paths
+    that never resolve on the test runner's filesystem -- since it's
+    testing the confirm-irreversible/snapshot-dir/audit-log gates, not
+    D-01/D-02, existence is stubbed to always-true so those gates aren't
+    masked by the unrelated D-02 orphan block, which now runs before them."""
     passed = 0
     total = 4
+    original_check = _patch_existence_always_true()
     try:
         # 1. --apply alone
         case_id = "apply-gate/apply-alone-fails-and-writes-nothing"
@@ -324,6 +329,8 @@ def suite_apply_gate():
                 passed += 1
     except Exception as exc:
         print(f"FAIL: suite_apply_gate raised {exc!r}")
+    finally:
+        _unpatch_existence(original_check)
 
     return (passed, total)
 
@@ -752,10 +759,12 @@ def suite_apply():
 def suite_file_existence():
     """D-01 check_paths_exist() unit behaviors (basic mix, empty list,
     5000-path batching, directory-counts-as-existing, OSError caught as
-    missing) and the CLI's labelled pre-write/post-write existence
-    blocks."""
+    missing), the CLI's labelled pre-write/post-write existence blocks,
+    and D-02's orphan-blocking gate (dry-run block, full-apply block
+    before the snapshot, a clean fixture applying normally, and the
+    25-row report cap)."""
     passed = 0
-    total = 7
+    total = 11
     try:
         # 1. basic mix: one real file, one missing path
         case_id = "file-existence/check-paths-exist-basic-mix"
@@ -872,8 +881,212 @@ def suite_file_existence():
                 )
                 if ok:
                     passed += 1
+
+        # 8. an orphaned candidate row blocks in dry-run mode and leaves
+        #    the database byte-identical
+        case_id = "file-existence/orphan-blocks-dry-run-and-leaves-db-unchanged"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            with _patched_prefixes(tmpdir) as (stale, current):
+                det_id = _seed_detection(_seed_video("orphan1.mp4", camera_name="CamA"))
+                old_path = stale + "crops/orphan1.jpg"
+                # deliberately no backing file at the rewritten path
+                _seed_crop(det_id, old_path)
+
+                snapshot_before = _table_snapshot()
+                exit_code, _stdout, stderr = _run_cli_capture(["--db", db_path])
+                snapshot_after = _table_snapshot()
+
+                ok = (
+                    exit_code not in (0, None)
+                    and "RUN BLOCKED" in stderr
+                    and snapshot_before == snapshot_after
+                )
+                _check(case_id, ok, f"exit_code={exit_code}, stderr={stderr[:300]!r}")
+                if ok:
+                    passed += 1
+
+        # 9. the same orphan also blocks full --apply, and the block
+        #    precedes the snapshot -- --snapshot-dir stays empty
+        case_id = "file-existence/orphan-blocks-full-apply-before-snapshot"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            with _patched_prefixes(tmpdir) as (stale, current):
+                det_id = _seed_detection(_seed_video("orphan2.mp4", camera_name="CamA"))
+                old_path = stale + "crops/orphan2.jpg"
+                _seed_crop(det_id, old_path)
+
+                snapshot_dir = os.path.join(tmpdir, "snap-orphan2")
+                snapshot_before = _table_snapshot()
+                exit_code, _stdout, stderr = _run_cli_capture([
+                    "--db", db_path, "--apply", "--confirm-irreversible",
+                    "--snapshot-dir", snapshot_dir,
+                    "--audit-log", os.path.join(tmpdir, "audit-orphan2.jsonl"),
+                ])
+                snapshot_after = _table_snapshot()
+
+                snapshot_dir_empty = (
+                    not os.path.isdir(snapshot_dir) or os.listdir(snapshot_dir) == []
+                )
+                ok = (
+                    exit_code not in (0, None)
+                    and "RUN BLOCKED" in stderr
+                    and snapshot_before == snapshot_after
+                    and snapshot_dir_empty
+                )
+                _check(
+                    case_id, ok,
+                    f"exit_code={exit_code}, snapshot_dir_empty={snapshot_dir_empty}, "
+                    f"stderr={stderr[:200]!r}",
+                )
+                if ok:
+                    passed += 1
+
+        # 10. a fixture where every rewritten path resolves applies
+        #     normally and exits 0 -- the gate is specific, not blanket
+        case_id = "file-existence/all-paths-exist-applies-normally"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            with _patched_prefixes(tmpdir) as (stale, current):
+                det_id = _seed_detection(_seed_video("clean.mp4", camera_name="CamA"))
+                old_path = stale + "crops/clean.jpg"
+                new_path = current + "crops/clean.jpg"
+                _write_file_at(new_path)
+                _seed_crop(det_id, old_path)
+
+                exit_code, output = _run_cli([
+                    "--db", db_path, "--apply", "--confirm-irreversible",
+                    "--snapshot-dir", os.path.join(tmpdir, "snap-clean"),
+                    "--audit-log", os.path.join(tmpdir, "audit-clean.jsonl"),
+                ])
+                ok = exit_code == 0 and "Rows rewritten this run: 1" in output
+                _check(case_id, ok, f"exit_code={exit_code}, output={output[:300]!r}")
+                if ok:
+                    passed += 1
+
+        # 11. more than 25 orphans -- report shows the first 25 and states
+        #     how many more were omitted
+        case_id = "file-existence/orphan-report-caps-at-25-and-reports-omitted-count"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            with _patched_prefixes(tmpdir) as (stale, current):
+                det_id = _seed_detection(_seed_video("many.mp4", camera_name="CamA"))
+                for i in range(30):
+                    _seed_crop(det_id, stale + f"crops/many{i}.jpg")
+
+                exit_code, _stdout, stderr = _run_cli_capture(["--db", db_path])
+                ok = (
+                    exit_code not in (0, None)
+                    and "and 5 more orphaned rows not shown" in stderr
+                )
+                _check(case_id, ok, f"exit_code={exit_code}, stderr_tail={stderr[-300:]!r}")
+                if ok:
+                    passed += 1
     except Exception as exc:
         print(f"FAIL: suite_file_existence raised {exc!r}")
+
+    return (passed, total)
+
+
+def suite_collision():
+    """UNIQUE-collision gate: a candidate row colliding with an existing
+    crops row, two candidate rows colliding with each other, and a clean
+    fixture applying normally."""
+    passed = 0
+    total = 3
+    try:
+        # 1. a candidate crops row rewrites to a path an existing (different)
+        #    crops row already holds -- blocks, names both row ids, no
+        #    IntegrityError escapes
+        case_id = "collision/existing-crops-row-collision-blocks-and-names-both-ids"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            with _patched_prefixes(tmpdir) as (stale, current):
+                det_id = _seed_detection(_seed_video("coll1.mp4", camera_name="CamA"))
+                existing_path = current + "crops/shared.jpg"
+                _write_file_at(existing_path)
+                existing_id = _seed_crop(det_id, existing_path)
+
+                candidate_old_path = stale + "crops/shared.jpg"
+                candidate_id = _seed_crop(det_id, candidate_old_path)
+
+                snapshot_before = _table_snapshot()
+                exit_code, _stdout, stderr = _run_cli_capture(["--db", db_path])
+                snapshot_after = _table_snapshot()
+
+                ok = (
+                    exit_code not in (0, None)
+                    and str(existing_id) in stderr
+                    and str(candidate_id) in stderr
+                    and "IntegrityError" not in stderr
+                    and snapshot_before == snapshot_after
+                )
+                _check(
+                    case_id, ok,
+                    f"exit_code={exit_code}, stderr={stderr[:400]!r}, "
+                    f"snapshot_equal={snapshot_before == snapshot_after}",
+                )
+                if ok:
+                    passed += 1
+
+        # 2. two candidate rows (one crops, one videos) rewrite to the
+        #    identical new_path -- reported as a pair, blocks, neither
+        #    merged nor dropped
+        case_id = "collision/candidate-pair-collision-reported-and-blocks"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            with _patched_prefixes(tmpdir) as (stale, current):
+                shared_old_path = stale + "crops/pair.jpg"
+                shared_new_path = current + "crops/pair.jpg"
+                _write_file_at(shared_new_path)
+
+                video_id = _seed_video(
+                    "coll2.mp4", camera_name="CamA", thumbnail_path=shared_old_path
+                )
+                det_id = _seed_detection(video_id)
+                crop_id = _seed_crop(det_id, shared_old_path)
+
+                snapshot_before = _table_snapshot()
+                exit_code, _stdout, stderr = _run_cli_capture(["--db", db_path])
+                snapshot_after = _table_snapshot()
+
+                ok = (
+                    exit_code not in (0, None)
+                    and str(crop_id) in stderr
+                    and str(video_id) in stderr
+                    and "IntegrityError" not in stderr
+                    and snapshot_before == snapshot_after
+                )
+                _check(
+                    case_id, ok,
+                    f"exit_code={exit_code}, stderr={stderr[:400]!r}, "
+                    f"snapshot_equal={snapshot_before == snapshot_after}",
+                )
+                if ok:
+                    passed += 1
+
+        # 3. a fixture with no collisions applies normally and exits 0
+        case_id = "collision/no-collision-fixture-applies-normally"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            with _patched_prefixes(tmpdir) as (stale, current):
+                det_id = _seed_detection(_seed_video("clean-coll.mp4", camera_name="CamA"))
+                old_path = stale + "crops/clean-coll.jpg"
+                new_path = current + "crops/clean-coll.jpg"
+                _write_file_at(new_path)
+                _seed_crop(det_id, old_path)
+
+                exit_code, output = _run_cli([
+                    "--db", db_path, "--apply", "--confirm-irreversible",
+                    "--snapshot-dir", os.path.join(tmpdir, "snap-clean-coll"),
+                    "--audit-log", os.path.join(tmpdir, "audit-clean-coll.jsonl"),
+                ])
+                ok = exit_code == 0 and "Rows rewritten this run: 1" in output
+                _check(case_id, ok, f"exit_code={exit_code}, output={output[:300]!r}")
+                if ok:
+                    passed += 1
+    except Exception as exc:
+        print(f"FAIL: suite_collision raised {exc!r}")
 
     return (passed, total)
 
@@ -882,7 +1095,9 @@ def build_parser():
     parser = argparse.ArgumentParser(description="Stale path migration verification harness")
     parser.add_argument(
         "--suite",
-        choices=["rewrite", "dry-run", "apply-gate", "file-existence", "apply", "all"],
+        choices=[
+            "rewrite", "dry-run", "apply-gate", "file-existence", "collision", "apply", "all",
+        ],
         default="all",
     )
     return parser
@@ -897,6 +1112,7 @@ def main():
         "dry-run": suite_dry_run,
         "apply-gate": suite_apply_gate,
         "file-existence": suite_file_existence,
+        "collision": suite_collision,
         "apply": suite_apply,
     }
     selected = suites.keys() if args.suite == "all" else [args.suite]
