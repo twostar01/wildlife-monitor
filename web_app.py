@@ -503,6 +503,10 @@ def api_correct_species(body: SpeciesCorrectionRequest):
     # (IN-02).
     if rowcount == 0:
         raise HTTPException(404, "Detection not found")
+    log.info(
+        "Species correction saved: detection_id=%s common=%s scientific=%s",
+        body.detection_id, body.user_common_name, body.user_scientific_name,
+    )
     return {"ok": True}
 
 
@@ -718,12 +722,17 @@ def api_save_correction(req: CorrectionRequest):
     # meaningful happened (IN-02).
     if correction_id is None:
         raise HTTPException(404, "Video not found")
+    log.info(
+        "Video correction saved: id=%s video_id=%s original=%s corrected=%s",
+        correction_id, req.video_id, req.original_label, req.corrected_label,
+    )
     return {"ok": True, "id": correction_id}
 
 
 @app.delete("/api/corrections/{correction_id}")
 def api_delete_correction(correction_id: int):
     db.delete_video_correction(correction_id)
+    log.info("Video correction delete requested: correction_id=%s", correction_id)
     return {"ok": True}
 
 
@@ -981,6 +990,7 @@ def api_save_settings(body: ProcessingSettings):
     if not _HHMM_RE.fullmatch(data.get("run_time_hhmm", "")):
         raise HTTPException(400, "run_time_hhmm must be HH:MM (24-hour)")
     _save_settings(data)
+    log.info("Processing settings saved: %s", redact_smtp_password(data))
     return {"ok": True}
 
 
@@ -1088,6 +1098,7 @@ def api_save_schedule(body: ScheduleRequest):
                 f"{restart_result.stderr.strip()}",
             )
 
+        log.info("Schedule saved and applied: run_time=%s unit=%s", body.run_time, TIMER_UNIT)
         return {"ok": True, "run_time": body.run_time}
 
 
