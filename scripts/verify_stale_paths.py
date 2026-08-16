@@ -8,7 +8,7 @@ real shipped CLI entry point, not a re-implementation. Never touches the
 production database file.
 
 Usage:
-    python scripts/verify_stale_paths.py --suite rewrite|dry-run|apply-gate|apply|all
+    python scripts/verify_stale_paths.py --suite rewrite|dry-run|apply-gate|file-existence|apply|all
 """
 
 import argparse
@@ -101,6 +101,45 @@ def _seed_crop_file(tmpdir, name):
     return os.path.abspath(path)
 
 
+def _write_file_at(path):
+    """Create parent directories and write a small placeholder file at an
+    arbitrary absolute path. Used by the file-existence and collision
+    suites, which need a real file to exist at a *rewritten* (post-prefix)
+    path -- not just at the fixture's own tmpdir/crops convention -- so an
+    apply run through those rows passes the D-02 gate legitimately."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w") as f:
+        f.write("fixture-file")
+    return path
+
+
+@contextmanager
+def _patched_prefixes(tmpdir):
+    """Temporarily point migrate_stale_paths' STALE_PREFIX/CURRENT_PREFIX
+    at subdirectories of the fixture's own tmpdir, so the file-existence
+    and collision suites can create a real backing file at the *rewritten*
+    path without touching the real filesystem root (portable across
+    platforms, no special permissions needed -- the literal
+    "/home/nash/"->"/home/twostar/" prefixes only exist on the real
+    production box). Yields (stale_prefix, current_prefix) so callers can
+    build seed paths directly. Restores the originals on exit -- these are
+    shared module-level globals, so a test using this must not leak the
+    patched values past its own `with` block."""
+    orig_stale = migrate_stale_paths.STALE_PREFIX
+    orig_current = migrate_stale_paths.CURRENT_PREFIX
+    stale = os.path.join(tmpdir, "nash") + os.sep
+    current = os.path.join(tmpdir, "twostar") + os.sep
+    migrate_stale_paths.STALE_PREFIX = stale
+    migrate_stale_paths.CURRENT_PREFIX = current
+    try:
+        yield stale, current
+    finally:
+        migrate_stale_paths.STALE_PREFIX = orig_stale
+        migrate_stale_paths.CURRENT_PREFIX = orig_current
+
+
 def _table_snapshot():
     """Return a mapping of table name to the full sorted list of that
     table's rows as plain tuples — the equality fixture the read-only
@@ -140,6 +179,32 @@ def _run_cli_capture(argv):
     except SystemExit as exc:
         exit_code = exc.code if exc.code is not None else 0
     return exit_code, out_buf.getvalue(), err_buf.getvalue()
+
+
+def _patch_existence_always_true():
+    """Monkeypatch migrate_stale_paths.check_paths_exist() to report every
+    path as existing and return the original function so the caller can
+    restore it in a `finally` block. Task 1 wires check_paths_exist() as a
+    hard post-write gate (exit 1 if a rewritten path fails to resolve) --
+    so every suite that performs a real --apply with a synthetic
+    /home/nash/... path that never corresponds to a real file on the test
+    runner's filesystem (rewrite, dry-run's tense-vocabulary case,
+    suite_apply's original tracer case) needs this stub so the unrelated
+    D-01 existence gate doesn't mask the rewrite/reporting behavior those
+    suites actually test. suite_file_existence() and (from Task 2 onward)
+    suite_collision() are the suites that deliberately exercise the real
+    check, and must NOT use this stub."""
+    original = migrate_stale_paths.check_paths_exist
+    migrate_stale_paths.check_paths_exist = (
+        lambda paths, batch_size=2000: {p: True for p in dict.fromkeys(paths)}
+    )
+    return original
+
+
+def _unpatch_existence(original):
+    """Restore check_paths_exist() to the function returned by
+    _patch_existence_always_true()."""
+    migrate_stale_paths.check_paths_exist = original
 
 
 def _strip_runvar_lines(text):
@@ -267,9 +332,14 @@ def suite_dry_run():
     """Default (no-flag) invocation is truly read-only; dry-run and
     apply-mode reports use disjoint tense vocabularies; two consecutive
     dry-runs against an unchanged fixture are byte-identical once
-    RUNVAR-marked lines are stripped; --json emits parseable JSON."""
+    RUNVAR-marked lines are stripped; --json emits parseable JSON. This
+    suite's fixtures use synthetic /home/nash/... paths that never resolve
+    on the test runner's filesystem -- existence is stubbed to
+    always-true so the unrelated D-01 post-write gate doesn't mask the
+    read-only/tense/idempotency/JSON behavior this suite actually tests."""
     passed = 0
     total = 4
+    original_check = _patch_existence_always_true()
     try:
         # 1. default invocation writes nothing, creates no snapshot/audit files
         case_id = "dry-run/default-invocation-writes-nothing"
@@ -370,6 +440,8 @@ def suite_dry_run():
                 passed += 1
     except Exception as exc:
         print(f"FAIL: suite_dry_run raised {exc!r}")
+    finally:
+        _unpatch_existence(original_check)
 
     return (passed, total)
 
@@ -380,9 +452,14 @@ def suite_rewrite():
     (embedded-offset occurrence, second-occurrence-in-tail, exact-prefix,
     already-correct twostar path, unrelated path, NULL, empty string).
     Also proves suffix_violations()/non_path_digest() invariants, row-count
-    stability, and idempotency on a second --apply run."""
+    stability, and idempotency on a second --apply run. This suite's
+    fixtures use synthetic /home/nash/... paths that never resolve on the
+    test runner's filesystem -- existence is stubbed to always-true so the
+    unrelated D-01 post-write gate doesn't mask the rewrite-correctness
+    behavior this suite actually tests."""
     passed = 0
     total = 9
+    original_check = _patch_existence_always_true()
     try:
         with _fixture_db() as db_path:
             video_a = _seed_video("a.mp4", camera_name="CamA")
@@ -578,6 +655,8 @@ def suite_rewrite():
                 passed += 1
     except Exception as exc:
         print(f"FAIL: suite_rewrite raised {exc!r}")
+    finally:
+        _unpatch_existence(original_check)
 
     return (passed, total)
 
@@ -585,9 +664,12 @@ def suite_rewrite():
 def suite_apply():
     """Tracer: one stale crops.crop_path row travels the whole CLI pipeline
     -- dry-run report, then --apply with snapshot + audit log, verifying
-    the row was rewritten and every other column is untouched."""
+    the row was rewritten and every other column is untouched. Existence
+    is stubbed to always-true since this fixture's synthetic
+    /home/nash/... path never resolves on the test runner's filesystem."""
     passed = 0
     total = 2
+    original_check = _patch_existence_always_true()
     try:
         # 1. apply/dry-run-reports-one-candidate-and-writes-nothing
         case_id = "apply/dry-run-reports-one-candidate-and-writes-nothing"
@@ -661,6 +743,137 @@ def suite_apply():
                 passed += 1
     except Exception as exc:
         print(f"FAIL: suite_apply raised {exc!r}")
+    finally:
+        _unpatch_existence(original_check)
+
+    return (passed, total)
+
+
+def suite_file_existence():
+    """D-01 check_paths_exist() unit behaviors (basic mix, empty list,
+    5000-path batching, directory-counts-as-existing, OSError caught as
+    missing) and the CLI's labelled pre-write/post-write existence
+    blocks."""
+    passed = 0
+    total = 7
+    try:
+        # 1. basic mix: one real file, one missing path
+        case_id = "file-existence/check-paths-exist-basic-mix"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            real_path = os.path.join(tmpdir, "real.txt")
+            with open(real_path, "w") as f:
+                f.write("x")
+            missing_path = os.path.join(tmpdir, "missing.txt")
+            result = migrate_stale_paths.check_paths_exist([real_path, missing_path])
+            ok = result == {real_path: True, missing_path: False}
+            _check(case_id, ok, f"result={result}")
+            if ok:
+                passed += 1
+
+        # 2. empty list returns empty dict without raising
+        case_id = "file-existence/check-paths-exist-empty-list"
+        result = migrate_stale_paths.check_paths_exist([])
+        ok = result == {}
+        _check(case_id, ok, f"result={result}")
+        if ok:
+            passed += 1
+
+        # 3. 5000 synthetic paths -- batching boundary exercised, not just
+        #    the single-batch case
+        case_id = "file-existence/check-paths-exist-batching-5000-paths"
+        synthetic = [f"/nonexistent/synthetic/path/{i}.jpg" for i in range(5000)]
+        result = migrate_stale_paths.check_paths_exist(synthetic, batch_size=2000)
+        ok = len(result) == 5000 and all(v is False for v in result.values())
+        _check(case_id, ok, f"len(result)={len(result)}")
+        if ok:
+            passed += 1
+
+        # 4. a directory counts as existing -- matches os.path.exists
+        #    semantics, which wildlife_processor.py already relies on
+        case_id = "file-existence/check-paths-exist-directory-counts-as-existing"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            subdir = os.path.join(tmpdir, "adir")
+            os.makedirs(subdir)
+            result = migrate_stale_paths.check_paths_exist([subdir])
+            ok = result.get(subdir) is True
+            _check(case_id, ok, f"result={result}")
+            if ok:
+                passed += 1
+
+        # 5. a stat that raises OSError is reported as not existing, not
+        #    propagated
+        case_id = "file-existence/check-paths-exist-oserror-reported-as-missing"
+        original_exists = migrate_stale_paths.os.path.exists
+        sentinel = "/trigger-oserror-for-task1-proof"
+
+        def _raise_oserror(path, _orig=original_exists, _sentinel=sentinel):
+            if path == _sentinel:
+                raise OSError("simulated stat failure")
+            return _orig(path)
+
+        migrate_stale_paths.os.path.exists = _raise_oserror
+        try:
+            result = migrate_stale_paths.check_paths_exist([sentinel])
+        finally:
+            migrate_stale_paths.os.path.exists = original_exists
+        ok = result.get(sentinel) is False
+        _check(case_id, ok, f"result={result}")
+        if ok:
+            passed += 1
+
+        # 6. dry-run prints an exhaustive pre-write existence block whose
+        #    checked count equals the candidate-row total
+        case_id = "file-existence/dry-run-reports-exhaustive-pre-write-block"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            with _patched_prefixes(tmpdir) as (stale, current):
+                det_id = _seed_detection(_seed_video("exist1.mp4", camera_name="CamA"))
+                old_path = stale + "crops/exist1.jpg"
+                new_path = current + "crops/exist1.jpg"
+                _write_file_at(new_path)
+                _seed_crop(det_id, old_path)
+
+                exit_code, output = _run_cli(["--db", db_path])
+                ok = (
+                    exit_code == 0
+                    and "File-Existence Check (pre-write)" in output
+                    and "Paths checked: 1" in output
+                    and "Resolved: 1" in output
+                    and "Unresolved: 0" in output
+                )
+                _check(case_id, ok, f"exit_code={exit_code}, output={output[:400]!r}")
+                if ok:
+                    passed += 1
+
+        # 7. apply run prints two distinct existence blocks, pre-write and
+        #    post-write, each reporting the same path count
+        case_id = "file-existence/apply-run-prints-pre-and-post-write-blocks"
+        with _fixture_db() as db_path:
+            tmpdir = os.path.dirname(db_path)
+            with _patched_prefixes(tmpdir) as (stale, current):
+                det_id = _seed_detection(_seed_video("exist2.mp4", camera_name="CamA"))
+                old_path = stale + "crops/exist2.jpg"
+                new_path = current + "crops/exist2.jpg"
+                _write_file_at(new_path)
+                _seed_crop(det_id, old_path)
+
+                exit_code, output = _run_cli([
+                    "--db", db_path, "--apply", "--confirm-irreversible",
+                    "--snapshot-dir", os.path.join(tmpdir, "snap-exist2"),
+                    "--audit-log", os.path.join(tmpdir, "audit-exist2.jsonl"),
+                ])
+                pre_ok = "File-Existence Check (pre-write)" in output
+                post_ok = "File-Existence Check (post-write)" in output
+                counts_ok = output.count("Paths checked: 1") == 2
+                ok = exit_code == 0 and pre_ok and post_ok and counts_ok
+                _check(
+                    case_id, ok,
+                    f"exit_code={exit_code}, pre_ok={pre_ok}, post_ok={post_ok}, counts_ok={counts_ok}",
+                )
+                if ok:
+                    passed += 1
+    except Exception as exc:
+        print(f"FAIL: suite_file_existence raised {exc!r}")
 
     return (passed, total)
 
@@ -668,7 +881,9 @@ def suite_apply():
 def build_parser():
     parser = argparse.ArgumentParser(description="Stale path migration verification harness")
     parser.add_argument(
-        "--suite", choices=["rewrite", "dry-run", "apply-gate", "apply", "all"], default="all"
+        "--suite",
+        choices=["rewrite", "dry-run", "apply-gate", "file-existence", "apply", "all"],
+        default="all",
     )
     return parser
 
@@ -681,6 +896,7 @@ def main():
         "rewrite": suite_rewrite,
         "dry-run": suite_dry_run,
         "apply-gate": suite_apply_gate,
+        "file-existence": suite_file_existence,
         "apply": suite_apply,
     }
     selected = suites.keys() if args.suite == "all" else [args.suite]

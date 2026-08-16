@@ -105,6 +105,30 @@ def count_stale_rows(conn):
     return counts
 
 
+def check_paths_exist(paths, batch_size=2000):
+    """Return a dict mapping every path in `paths` to a bool -- whether it
+    resolves against the local filesystem. Paths are deduplicated (a path
+    appearing in two rows is stat'd once) and consumed in slices of
+    `batch_size` so peak memory stays bounded regardless of input size;
+    the batch boundary changes nothing about the result, only how it is
+    computed. Never shells out or spawns a child process to do this: this
+    script is deployed to and run directly on the box whose filesystem is
+    being checked (see 11-02-PLAN.md's <planning_note>), so a plain local
+    stat call already *is* a check against that box's live filesystem, and
+    no database-derived path string is ever interpolated into a command
+    line (T-11-07)."""
+    unique_paths = list(dict.fromkeys(paths))  # de-dupe, preserve order
+    results = {}
+    for start in range(0, len(unique_paths), batch_size):
+        batch = unique_paths[start:start + batch_size]
+        for path in batch:
+            try:
+                results[path] = os.path.exists(path)
+            except OSError:
+                results[path] = False
+    return results
+
+
 def find_collisions(conn, rows):
     """Return the subset of rows whose new_path already exists in
     crops.crop_path — the UNIQUE constraint guard. crops.crop_path is the
@@ -195,18 +219,50 @@ def write_audit_line(handle, payload):
     handle.flush()
 
 
-def render_plan_report(counts, rows, applied, digests=None, as_json=False):
+def _existence_counts(existence, ordered_paths):
+    """Return {'checked', 'resolved', 'unresolved'} counts over
+    ordered_paths (one entry per candidate row, duplicates preserved) by
+    looking each path up in the existence dict returned by
+    check_paths_exist(). 'checked' therefore always equals the candidate
+    row total -- the number the D-01 exhaustiveness claim is measured
+    against."""
+    checked = len(ordered_paths)
+    resolved = sum(1 for p in ordered_paths if existence.get(p))
+    return {"checked": checked, "resolved": resolved, "unresolved": checked - resolved}
+
+
+def render_existence_block(label, counts):
+    """Print one labelled D-01 file-existence block (pre-write or
+    post-write) to stdout, distinguishable from the other pass by
+    `label`."""
+    print(f"File-Existence Check ({label})")
+    print("-" * 44)
+    print(f"Paths checked: {counts['checked']}")
+    print(f"Resolved: {counts['resolved']}")
+    print(f"Unresolved: {counts['unresolved']}")
+
+
+def render_plan_report(counts, rows, applied, digests=None, existence_pre=None,
+                        existence_post=None, as_json=False):
     """Print a Go/No-Go summary. applied=False describes what the run
     would do (future tense); applied=True describes what the run did
     (past tense) — never the reverse, per the FIX-03 / P-02 honesty lesson
     (backfill_dedup_videos.py's args.apply-branched summary). digests, if
     given, is a {table: hex_digest} mapping from non_path_digest() -- the
-    "nothing else changed" fingerprint for each target table."""
+    "nothing else changed" fingerprint for each target table.
+    existence_pre/existence_post, if given, are the _existence_counts()
+    dicts for the D-01 pre-write and post-write passes -- folded into the
+    --json payload under distinct keys so JSON consumers see the same
+    exhaustive counts the text report's labelled blocks show."""
     if as_json:
         payload = dict(counts)
         payload["applied"] = applied
         if digests:
             payload["non_path_digests"] = dict(digests)
+        if existence_pre is not None:
+            payload["pre_write_existence"] = dict(existence_pre)
+        if existence_post is not None:
+            payload["post_write_existence"] = dict(existence_post)
         print(json.dumps(payload, sort_keys=True))
         return
 
@@ -326,7 +382,20 @@ def main(argv=None):
             print(f"  {v.table}.{v.column} id={v.row_id}: {v.old_path!r} -> {v.new_path!r}", file=sys.stderr)
         sys.exit(1)
 
-    render_plan_report(counts, rows, applied=False, digests=before_digests, as_json=args.json)
+    # D-01 pre-write existence pass -- exhaustive, in both dry-run and
+    # apply mode, since dry-run *is* D-01's pre-write half. Ordered
+    # exactly like the plan report (table, column, id ascending) so a
+    # dry-run and its post-write confirmation can be diffed line-for-line.
+    ordered_new_paths = [row.new_path for row in rows]
+    existence_pre = check_paths_exist(ordered_new_paths)
+    pre_write_counts = _existence_counts(existence_pre, ordered_new_paths)
+    if not args.json:
+        render_existence_block("pre-write", pre_write_counts)
+
+    render_plan_report(
+        counts, rows, applied=False, digests=before_digests,
+        existence_pre=pre_write_counts, as_json=args.json,
+    )
 
     if not args.apply:
         sys.exit(0)
@@ -392,7 +461,25 @@ def main(argv=None):
             print(f"  {table}: before={before} after={after}", file=sys.stderr)
         sys.exit(1)
 
-    render_plan_report(counts, rows, applied=True, digests=after_digests, as_json=args.json)
+    # D-01 post-write confirmation pass -- same ordered path set, re-stated
+    # after the commit, in its own labelled block.
+    existence_post = check_paths_exist(ordered_new_paths)
+    post_write_counts = _existence_counts(existence_post, ordered_new_paths)
+    if not args.json:
+        render_existence_block("post-write", post_write_counts)
+    if post_write_counts["unresolved"] > 0:
+        print(
+            "ERROR: post-write existence check found a rewritten path that "
+            "does not resolve on disk. Aborting.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    render_plan_report(
+        counts, rows, applied=True, digests=after_digests,
+        existence_pre=pre_write_counts, existence_post=post_write_counts,
+        as_json=args.json,
+    )
     if not args.json:
         print(f"Rows changed: {changed}")
         print(f"RUNVAR: snapshot_path={snapshot_path}")
