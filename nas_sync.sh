@@ -16,6 +16,10 @@
 #    ./nas_sync.sh --hours 48               # Sync last 48h
 #    ./nas_sync.sh --then-process           # Sync then run the processor
 #    ./nas_sync.sh --then-process --country US --dry-run
+#                                            # Sync + processor dry-run only — exits right
+#                                            # after the processor's own dry-run, no preview
+#    ./nas_sync.sh --dry-run                # Standalone: raw-cleanup preview only — no NAS
+#                                            # sync, no scan, nothing deleted or recorded
 #    ./nas_sync.sh --local-dir /data/tmp    # Override local staging directory
 #    ./nas_sync.sh --no-cleanup             # Keep local copies after processing
 # ==============================================================================
@@ -183,6 +187,144 @@ if [[ ! -d "$NAS_VIDEO_PATH" ]]; then
     err "Video path not found on NAS: $NAS_VIDEO_PATH"
     err "Check NAS_VIDEO_SUBDIR in $CONFIG_FILE or re-run ./nas_connect.sh"
     exit 1
+fi
+
+# ── Standalone raw-cleanup preview (--dry-run without --then-process, D-01) ──
+# Reachable from --dry-run alone (D-04: no env var required operator-side).
+# Read-only: queries already-archived DB rows and reports what a real sweep
+# would remove, then exits before the NAS video scan/copy/process/cleanup
+# path below ever runs. --dry-run combined with --then-process is untouched
+# by this branch (D-03) — it falls straight through to today's behavior.
+if [[ "$DRY_RUN" == true && "$THEN_PROCESS" == false ]]; then
+    echo ""
+    info "Preview-only run (--dry-run without --then-process). Nothing will be deleted or recorded."
+
+    NAS_ARCHIVE_SUBDIR="${NAS_ARCHIVE_SUBDIR:-wildlife_archive}"
+    NAS_ARCHIVE_ROOT="$NAS_MOUNT/$NAS_ARCHIVE_SUBDIR"
+    NAS_BLANK_ROOT="$NAS_ARCHIVE_ROOT/blanks"
+    DB_PATH="$DATA_DIR/wildlife.db"
+
+    python3 - <<PYEOF
+import os, sys, json
+from pathlib import Path
+
+sys.path.insert(0, "$SCRIPT_DIR")
+from database import init_db, get_raw_cleanup_candidates
+
+db_path        = "$DB_PATH"
+nas_video_path = "$NAS_VIDEO_PATH"
+archive_root   = "$NAS_ARCHIVE_ROOT"
+blank_root     = "$NAS_BLANK_ROOT"
+
+init_db(db_path)
+
+settings_path = "$DATA_DIR/settings.json"
+settings = {}
+try:
+    with open(settings_path) as f:
+        settings = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    pass
+
+raw_days = settings.get("raw_recordings_retention_days") or 0
+
+if not raw_days:
+    print("  Raw recordings retention not configured (raw_recordings_retention_days is 0/unset) — skipping.")
+else:
+    # >>> raw-cleanup-preview-verify-fns
+    def raw_path_for(filepath, archive_root, blank_root, nas_video_path):
+        """Reconstruct the NAS raw_recordings source path from an archived
+        videos.filepath by re-rooting its relative suffix under nas_video_path.
+        The blanks root is checked before the archive root since blanks are
+        nested under the archive root — checking archive_root first would
+        also match a blanks path and produce a wrong relative suffix."""
+        p = Path(filepath)
+        for root in (blank_root, archive_root):
+            try:
+                rel = p.relative_to(root)
+            except ValueError:
+                continue
+            return Path(nas_video_path) / rel
+        return None
+
+    def verify_raw_candidate(filepath, archive_root, blank_root, nas_video_path):
+        """Return (raw_path_or_None, reason). Performs no deletion. Reason
+        vocabulary and evaluation order: unmapped, escapes_root, same_file,
+        no_raw, no_archive, size_mismatch, io_error, ok."""
+        try:
+            raw_path = raw_path_for(filepath, archive_root, blank_root, nas_video_path)
+            if raw_path is None:
+                return (None, "unmapped")
+
+            video_root_resolved = Path(nas_video_path).resolve()
+            raw_path_resolved = raw_path.resolve()
+            if not raw_path_resolved.is_relative_to(video_root_resolved):
+                return (None, "escapes_root")
+
+            archive_path = Path(filepath)
+            archive_path_resolved = archive_path.resolve()
+            if raw_path_resolved == archive_path_resolved:
+                return (None, "same_file")
+            if raw_path.exists() and archive_path.exists() and os.path.samefile(raw_path, archive_path):
+                return (None, "same_file")
+
+            if not raw_path.exists():
+                return (None, "no_raw")
+            if not archive_path.exists():
+                return (None, "no_archive")
+
+            if raw_path.stat().st_size != archive_path.stat().st_size:
+                return (None, "size_mismatch")
+
+            return (raw_path, "ok")
+        except (OSError, RuntimeError):
+            # RuntimeError covers Path.resolve() raising "Symlink loop from ..."
+            # on a circular symlink on the NAS mount — must not crash the run.
+            return (None, "io_error")
+    # <<< raw-cleanup-preview-verify-fns
+
+    candidates = get_raw_cleanup_candidates(raw_days)
+
+    removed = 0
+    skipped = 0
+    freed_bytes = 0
+    reason_counts = {}
+
+    for row in candidates:
+        try:
+            raw_path, reason = verify_raw_candidate(
+                row["filepath"], archive_root, blank_root, nas_video_path
+            )
+
+            print(f"  [dry-run] {reason:<14s} {row['filepath']}")
+
+            if reason != "ok":
+                skipped += 1
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+                continue
+
+            size = raw_path.stat().st_size
+            removed += 1
+            freed_bytes += size
+        except (OSError, RuntimeError) as e:
+            print(f"  ✗  Unexpected filesystem error for {row.get('filepath')}: {e}", file=sys.stderr)
+            skipped += 1
+            reason_counts["io_error"] = reason_counts.get("io_error", 0) + 1
+
+    gb_reclaimed = freed_bytes / (1024 ** 3)
+
+    print(f"\n  Raw cleanup: {removed} removed   {skipped} skipped (verification failed)   {gb_reclaimed:.2f} GB reclaimed  [DRY RUN — nothing deleted]")
+    if reason_counts:
+        breakdown = "   ".join(f"{k}: {v}" for k, v in sorted(reason_counts.items()))
+        print(f"  Skip reasons: {breakdown}")
+PYEOF
+
+    PREVIEW_EXIT=$?
+    if [[ "$PREVIEW_EXIT" -ne 0 ]]; then
+        warn "Raw-cleanup preview encountered an unexpected error (see above)."
+    fi
+
+    exit 0
 fi
 
 # ── Find videos on NAS ────────────────────────────────────────────────────────
