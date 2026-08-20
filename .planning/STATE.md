@@ -2,19 +2,19 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Bug Fixes & Data Integrity
-current_phase: 11
-current_phase_name: stale-file-path-migration
-status: complete
-stopped_at: Phase 11 verified (11-VERIFICATION.md, PASS 4/4) — FIX-02 closed; production migration complete, independently re-verified against ubuntulaptop
-last_updated: "2026-08-16T05:39:02.134Z"
-last_activity: 2026-08-15
-last_activity_desc: Phase 11 (stale-file-path-migration) executed and verified — 14,354 production rows migrated, ROADMAP updated
+current_phase: 12
+status: completed
+stopped_at: "Completed 12-04-PLAN.md (Phase 12 closed: OBS-02, UI-05, NOTIFY-03 all Complete; production-verified on ubuntulaptop; operator-approved)"
+last_updated: "2026-08-20T16:29:26.213Z"
+last_activity: 2026-08-20
+last_activity_desc: Phase 12 marked complete
 progress:
   total_phases: 4
   completed_phases: 3
   total_plans: 11
   completed_plans: 11
   percent: 75
+current_phase_name: stale-file-path-migration
 ---
 
 # Project State
@@ -28,10 +28,10 @@ See: .planning/PROJECT.md (updated 2026-08-11)
 
 ## Current Position
 
-Phase: 11 (stale-file-path-migration) — EXECUTING
+Phase: 12 — COMPLETE
 Plan: 4 of 4
-Status: Phase complete — ready for verification
-Last activity: 2026-08-15 — Phase 11 execution started
+Status: Phase 12 complete
+Last activity: 2026-08-20 — Phase 12 marked complete
 
 Progress: [██████████] 100%
 
@@ -79,6 +79,7 @@ Progress: [██████████] 100%
 | Phase 11 P02 | 30min | 3 tasks | 2 files |
 | Phase 11 P03 | 25min | 2 tasks | 0 files |
 | Phase 11 P04 | 24min | 3 tasks | 2 files |
+| Phase 12 P04 | ~65min | 3 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -98,6 +99,7 @@ Recent decisions affecting current work:
 - [Phase ?]: 11-02: check_paths_exist()/find_orphans()/find_collisions() form an unconditional three-gate sequence (existence -> orphan -> collision) upstream of the snapshot in both dry-run and apply mode; audit-log lines deferred until after commit to avoid claiming an unrewritten row was rewritten (T-11-11)
 - [Phase ?]: Operator authorized GO on the 11-03 production rehearsal (exact match to 4,274/10,080/14,354 baseline, 0 orphans, 0 collisions, FA-1 confirmed dashboard never broken) — plan 11-04 authorized to run the production --apply write
 - [Phase ?]: 11-04: Production --apply write executed on ubuntulaptop -- 14,354 rows rewritten (4,274 crops.crop_path, 10,080 videos.thumbnail_path), reconciled byte-identical against 11-03 baseline (row counts, both non_path_digest values, zero FK violations, exhaustive existence check). Operator confirmed no dashboard regression (SC3). FIX-02 closed.
+- [Phase ?]: Phase 12 closed 2026-08-16: OBS-02, UI-05, NOTIFY-03 all Complete. Operator approved all 6 browser checkpoint items with no deviations, and requested a follow-up phase (7a) covering effective-label grouping/filter-matching plus whether to unify the two species-correction mechanisms (7b) -- filed as .planning/todos/pending/2026-08-16-effective-label-grouping-and-correction-unification.md. Video-player-correction-wins accepted as a stopgap precedence rule pending that follow-up.
 
 ### Pending Todos
 
@@ -145,8 +147,8 @@ None open. v1.3 roadmap created (Phases 10-13); ready to plan Phase 10.
 
 ## Session Continuity
 
-Last session: 2026-08-16T05:39:02.110Z
-Stopped at: Completed 11-04-PLAN.md (FIX-02 closed; production migration complete, operator-verified)
+Last session: 2026-08-20T16:24:19.293Z
+Stopped at: Completed 12-04-PLAN.md (Phase 12 closed: OBS-02, UI-05, NOTIFY-03 all Complete; production-verified on ubuntulaptop; operator-approved)
 Resume file: None
 
 ## Operator Next Steps

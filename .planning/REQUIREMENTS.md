@@ -10,8 +10,8 @@
 
 ### Observability & UX Decisions
 
-- [ ] **OBS-02**: `web_app.py` gains logging calls at additional operational events beyond the 18 `print()` sites already converted, per an explicit decision on which events matter
-- [ ] **UI-05**: Gallery confidence badge is suppressed or annotated on tiles whose species was human-corrected, so displayed confidence never misrepresents a corrected label
+- [x] **OBS-02**: `web_app.py` gains logging calls at additional operational events beyond the 18 `print()` sites already converted, per an explicit decision on which events matter
+- [x] **UI-05**: Gallery confidence badge is suppressed or annotated on tiles whose species was human-corrected, so displayed confidence never misrepresents a corrected label
 
 ### Raw Cleanup Hardening
 
@@ -38,8 +38,8 @@
 | FIX-01 | Phase 10 | Complete |
 | FIX-02 | Phase 11 | Complete |
 | FIX-03 | Phase 10 | Complete |
-| OBS-02 | Phase 12 | Pending |
-| UI-05 | Phase 12 | Pending |
+| OBS-02 | Phase 12 | Complete |
+| UI-05 | Phase 12 | Complete |
 | CLEANUP-04 | Phase 13 | Pending |
 | CLEANUP-05 | Phase 13 | Pending |
 | NOTIFY-03 | Phase 12 | Complete |
