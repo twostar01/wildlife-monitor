@@ -173,6 +173,15 @@ None - no external service configuration required.
 - CLEANUP-05 fully implemented and harness-verified at the code level; ready for plan 13-03's live-browser checkpoint on `ubuntulaptop` alongside CLEANUP-04 (13-01).
 - No blockers. `static/index.html` diff is isolated to the Retention Policy card and `updateRawRetentionWarning()` — no overlap with 13-01's `nas_sync.sh` surface (confirmed via `scripts/verify_raw_cleanup.py --suite all` passing unchanged).
 
+## Self-Check: PASSED
+
+- FOUND: static/index.html
+- FOUND: scripts/verify_raw_cleanup_ui.py
+- FOUND: .planning/phases/13-raw-cleanup-hardening/13-02-SUMMARY.md
+- FOUND commit: fdde139
+- FOUND commit: ab61611
+- FOUND commit: 0bd272b
+
 ---
 *Phase: 13-raw-cleanup-hardening*
 *Completed: 2026-08-20*
