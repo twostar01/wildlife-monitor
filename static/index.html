@@ -819,7 +819,7 @@
             </div>
             <div class="setting-row">
               <label class="setting-label">Delete after (days)</label>
-              <input class="setting-input" type="number" id="setKeptDays" min="0" style="width:100px">
+              <input class="setting-input" type="number" id="setKeptDays" min="0" style="width:100px" oninput="updateRawRetentionWarning()">
               <span class="setting-hint">e.g. 730 = keep 2 years of footage. Default: 730. Set 0 to keep forever.</span>
             </div>
             <div class="setting-row">
@@ -839,7 +839,7 @@
             </div>
           </div>
         </div>
-        <div id="rawRetentionWarning" style="display:none;font-size:11px;color:var(--gold);margin-top:10px"></div>
+        <div id="rawRetentionWarning" style="display:none;font-size:11px;color:var(--gold);margin-top:10px;white-space:pre-line"></div>
         <div style="margin-top:18px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
           <button class="btn-save" onclick="saveSettings()">Save Retention Settings</button>
           <button class="btn-save" style="background:transparent;color:var(--gold);border-color:var(--gold)"
@@ -3321,8 +3321,16 @@ function updateRawRetentionWarning() {
   const warning = document.getElementById('rawRetentionWarning');
   const rawDays   = parseInt(document.getElementById('setRawRecordingsDays').value) || 0;
   const blankDays = parseInt(document.getElementById('setBlankDays').value)         || 0;
+  const keptDays  = parseInt(document.getElementById('setKeptDays').value)          || 0;
+  const messages = [];
   if (rawDays !== 0 && blankDays !== 0 && rawDays >= blankDays) {
-    warning.textContent = `⚠ Raw retention of ${rawDays} days should be shorter than blank retention of ${blankDays} days, otherwise the archive copy could be purged before a raw file is ever verified, permanently stranding it on the NAS — lower raw retention or raise blank retention.`;
+    messages.push(`⚠ Raw retention of ${rawDays} days should be shorter than blank retention of ${blankDays} days, otherwise the archive copy could be purged before a raw file is ever verified, permanently stranding it on the NAS — lower raw retention or raise blank retention.`);
+  }
+  if (rawDays !== 0 && keptDays !== 0 && rawDays >= keptDays) {
+    messages.push(`⚠ Raw retention of ${rawDays} days should be shorter than kept-video retention of ${keptDays} days, otherwise the kept archive copy could be purged before a raw file is ever verified, permanently stranding it on the NAS — lower raw retention or raise kept retention.`);
+  }
+  if (messages.length) {
+    warning.textContent = messages.join('\n');
     warning.style.display = 'block';
   } else {
     warning.style.display = 'none';
