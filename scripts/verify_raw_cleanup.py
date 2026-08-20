@@ -29,11 +29,23 @@ namespace, and exercises both happy paths plus every skip reason against
 real temp filesystem fixtures — proving the shipped decision logic (not a
 re-typed copy of it) never deletes a file it shouldn't.
 
+Suite `preview` (CLEANUP-04) parses nas_sync.sh as text to prove the
+standalone `--dry-run` raw-cleanup preview branch sits between the NAS
+mount check and the NAS video scan, is gated on the absence of
+`--then-process` (never altering the combined `--dry-run --then-process`
+early exit), is provably read-only (no deletion, no purge-marking, no
+stats write, no processor invocation), derives its own archive roots
+before referencing them, never routes through `WM_RAW_CLEANUP_DRY_RUN`,
+keeps both the canonical and preview verify-fns sentinel pairs unique,
+and — via a drift guard — fails loudly if its duplicated copy of
+raw_path_for()/verify_raw_candidate() ever diverges from the canonical
+sentinel-delimited copy that suite `paths` exercises.
+
 Never touches the production database file. Every suite builds its own temp
 database/filesystem under tempfile.mkdtemp(), removed afterwards.
 
 Usage:
-    python scripts/verify_raw_cleanup.py --suite migration|invariant|source|paths|all
+    python scripts/verify_raw_cleanup.py --suite migration|invariant|source|paths|preview|all
 """
 
 import argparse
@@ -1159,11 +1171,236 @@ def suite_paths():
     return (passed, total)
 
 
+# ── preview suite ────────────────────────────────────────────────────────
+
+def _preview_branch_extent(lines):
+    """Return (start, end) indices (inclusive) of the standalone `--dry-run`
+    raw-cleanup preview branch (nas_sync.sh, CLEANUP-04), or (-1, -1) if
+    either boundary can't be found. Located by the first line whose
+    stripped form contains `THEN_PROCESS" == false` (the branch's own `if`
+    condition), walking forward to the first subsequent line whose
+    stripped form is exactly `exit 0` (the branch's own unconditional
+    exit)."""
+    start = _find_index(lines, lambda l: 'THEN_PROCESS" == false' in l.strip())
+    if start == -1:
+        return (-1, -1)
+    end = _find_index(lines, lambda l: l.strip() == "exit 0", start=start)
+    return (start, end) if end != -1 else (-1, -1)
+
+
+def _extract_preview_verify_fns_source():
+    """Return the dedented text sliced from nas_sync.sh between the two
+    `raw-cleanup-preview-verify-fns` sentinel comments, or None if not
+    found. Mirrors _extract_verify_fns_source()'s technique exactly so the
+    two extractions are directly comparable (PRV8's drift guard)."""
+    lines = _script_text()
+    start = _find_index(lines, lambda l: l.strip() == "# >>> raw-cleanup-preview-verify-fns")
+    end = _find_index(lines, lambda l: l.strip() == "# <<< raw-cleanup-preview-verify-fns")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    body = "\n".join(lines[start + 1:end])
+    return textwrap.dedent(body)
+
+
+def suite_preview():
+    """Nine cases pinning the standalone `--dry-run` raw-cleanup preview
+    branch (CLEANUP-04): its placement between the NAS mount check and the
+    NAS video scan (PRV1), its independence from `--then-process` (PRV2),
+    proof that the combined `--dry-run --then-process` early exit is
+    untouched (PRV3, D-03), proof the branch is read-only (PRV4, SC4),
+    proof it derives its own archive roots before referencing them (PRV5),
+    proof it never routes through `WM_RAW_CLEANUP_DRY_RUN` (PRV6, D-04),
+    proof the canonical and preview verify-fns sentinel pairs each stay
+    unique (PRV7), a drift guard proving the preview's duplicated
+    raw_path_for()/verify_raw_candidate() copy never diverges from the
+    canonical sentinel-delimited copy (PRV8), and proof the branch can
+    never fail the run (PRV9)."""
+    passed = 0
+    total = 9
+    lines = _script_text()
+
+    mount_guard_idx = _find_index(lines, lambda l: 'if [[ ! -d "$NAS_VIDEO_PATH" ]]' in l)
+    find_videos_idx = _find_index(lines, lambda l: "Find videos on NAS" in l)
+    branch_start, branch_end = _preview_branch_extent(lines)
+    branch_lines = (
+        lines[branch_start:branch_end + 1] if branch_start != -1 and branch_end != -1 else []
+    )
+    branch_noncomment = _noncomment_lines(branch_lines)
+
+    # PRV1 (placement): the branch sits strictly between the NAS mount
+    # check and the "Find videos on NAS" divider (D-01, SC1).
+    case_id = "preview/PRV1-placement"
+    ok = (
+        mount_guard_idx != -1
+        and find_videos_idx != -1
+        and branch_start != -1
+        and mount_guard_idx < branch_start < find_videos_idx
+    )
+    _check(
+        case_id, ok,
+        f"mount_guard_idx={mount_guard_idx}, branch_start={branch_start}, "
+        f"find_videos_idx={find_videos_idx}",
+    )
+    if ok:
+        passed += 1
+
+    # PRV2 (flag independence): the branch condition is gated on the
+    # absence of --then-process, not on --dry-run alone (D-01/D-03).
+    case_id = "preview/PRV2-flag-independence"
+    condition_line = lines[branch_start] if branch_start != -1 else ""
+    ok = 'DRY_RUN" == true' in condition_line and 'THEN_PROCESS" == false' in condition_line
+    _check(case_id, ok, f"condition_line={condition_line!r}")
+    if ok:
+        passed += 1
+
+    # PRV3 (combined-flag path untouched, D-03): the pre-existing early
+    # exit inside the --then-process block still exists in its original
+    # position.
+    case_id = "preview/PRV3-combined-flag-untouched"
+    then_process_idx = _find_index(lines, lambda l: 'if [[ "$THEN_PROCESS" == true ]]' in l)
+    dry_run_exit_idx = _find_index(
+        lines,
+        lambda l: "--dry-run mode. No files moved or deleted." in l,
+        start=then_process_idx if then_process_idx != -1 else 0,
+    )
+    reprocess_idx = _find_index(lines, lambda l: "SpeciesNet-only reprocess for flagged videos" in l)
+    ok = (
+        then_process_idx != -1
+        and dry_run_exit_idx != -1
+        and reprocess_idx != -1
+        and then_process_idx < dry_run_exit_idx < reprocess_idx
+    )
+    _check(
+        case_id, ok,
+        f"then_process_idx={then_process_idx}, dry_run_exit_idx={dry_run_exit_idx}, "
+        f"reprocess_idx={reprocess_idx}",
+    )
+    if ok:
+        passed += 1
+
+    # PRV4 (read-only, SC4): the branch extent never deletes, marks-purged,
+    # records stats, or invokes the processor.
+    case_id = "preview/PRV4-read-only"
+    forbidden = ["raw_path.unlink", "mark_raw_purged", "record_raw_cleanup_stats", "wildlife_processor.py"]
+    found_forbidden = [f for f in forbidden if any(f in l for l in branch_noncomment)]
+    ok = bool(branch_lines) and not found_forbidden
+    _check(case_id, ok, f"found_forbidden={found_forbidden}")
+    if ok:
+        passed += 1
+
+    # PRV5 (roots derived in scope): NAS_ARCHIVE_ROOT/NAS_BLANK_ROOT are
+    # assigned locally before the heredoc that references them (landmine 6
+    # regression guard against a `set -u` unbound-variable abort).
+    case_id = "preview/PRV5-roots-in-scope"
+    archive_assign_idx = _find_index(branch_lines, lambda l: "NAS_ARCHIVE_ROOT=" in l)
+    blank_assign_idx = _find_index(branch_lines, lambda l: "NAS_BLANK_ROOT=" in l)
+    pyeof_idx = _find_index(branch_lines, lambda l: l.strip().startswith("python3 - <<PYEOF"))
+    ok = (
+        archive_assign_idx != -1
+        and blank_assign_idx != -1
+        and pyeof_idx != -1
+        and archive_assign_idx < pyeof_idx
+        and blank_assign_idx < pyeof_idx
+    )
+    _check(
+        case_id, ok,
+        f"archive_assign_idx={archive_assign_idx}, blank_assign_idx={blank_assign_idx}, "
+        f"pyeof_idx={pyeof_idx}",
+    )
+    if ok:
+        passed += 1
+
+    # PRV6 (no env-var dependence, D-04): WM_RAW_CLEANUP_DRY_RUN still
+    # occurs exactly once in the whole file, and that occurrence sits
+    # outside the preview branch — proving the operator-facing path does
+    # not route through the env var.
+    case_id = "preview/PRV6-no-env-var-dependence"
+    env_var_idxs = [i for i, l in enumerate(lines) if "WM_RAW_CLEANUP_DRY_RUN" in l]
+    ok = (
+        len(env_var_idxs) == 1
+        and branch_start != -1
+        and branch_end != -1
+        and not (branch_start <= env_var_idxs[0] <= branch_end)
+    )
+    _check(
+        case_id, ok,
+        f"env_var_idxs={env_var_idxs}, branch_start={branch_start}, branch_end={branch_end}",
+    )
+    if ok:
+        passed += 1
+
+    # PRV7 (canonical sentinels still unique): both the canonical and the
+    # preview verify-fns sentinel pairs each occur exactly once, keeping
+    # suite_paths()'s extraction pointed at the canonical copy.
+    case_id = "preview/PRV7-sentinel-uniqueness"
+    canonical_open = [i for i, l in enumerate(lines) if l.strip() == "# >>> raw-cleanup-verify-fns"]
+    canonical_close = [i for i, l in enumerate(lines) if l.strip() == "# <<< raw-cleanup-verify-fns"]
+    preview_open = [i for i, l in enumerate(lines) if l.strip() == "# >>> raw-cleanup-preview-verify-fns"]
+    preview_close = [i for i, l in enumerate(lines) if l.strip() == "# <<< raw-cleanup-preview-verify-fns"]
+    ok = (
+        len(canonical_open) == 1 and len(canonical_close) == 1
+        and len(preview_open) == 1 and len(preview_close) == 1
+    )
+    _check(
+        case_id, ok,
+        f"canonical_open={canonical_open}, canonical_close={canonical_close}, "
+        f"preview_open={preview_open}, preview_close={preview_close}",
+    )
+    if ok:
+        passed += 1
+
+    # PRV8 (non-divergence / drift guard): the duplicated preview copy of
+    # raw_path_for()/verify_raw_candidate() must stay byte-for-byte
+    # identical (after dedent) to the canonical sentinel-delimited copy —
+    # if a future edit fixes a bug in one copy only, this fails loudly.
+    case_id = "preview/PRV8-no-drift"
+    canonical_src = _extract_verify_fns_source()
+    preview_src = _extract_preview_verify_fns_source()
+    if canonical_src is None or preview_src is None:
+        ok = False
+        detail = f"canonical_src is None={canonical_src is None}, preview_src is None={preview_src is None}"
+    else:
+        ok = canonical_src == preview_src
+        if ok:
+            detail = ""
+        else:
+            canonical_lines = canonical_src.splitlines()
+            preview_lines = preview_src.splitlines()
+            first_diff = next(
+                (
+                    i for i in range(max(len(canonical_lines), len(preview_lines)))
+                    if (canonical_lines[i] if i < len(canonical_lines) else None)
+                    != (preview_lines[i] if i < len(preview_lines) else None)
+                ),
+                None,
+            )
+            detail = f"first differing line index={first_diff}"
+    _check(case_id, ok, detail)
+    if ok:
+        passed += 1
+
+    # PRV9 (never fails the run): the branch extent contains no sys.exit(
+    # and no `exit 1` — a preview must never be able to fail a nightly
+    # unit, mirroring suite_source()'s SRC5 intent for the real block.
+    case_id = "preview/PRV9-never-fails-run"
+    ok = (
+        bool(branch_lines)
+        and not any("sys.exit(" in l for l in branch_lines)
+        and not any("exit 1" in l for l in branch_lines)
+    )
+    _check(case_id, ok, "branch extent contains sys.exit( or exit 1")
+    if ok:
+        passed += 1
+
+    return (passed, total)
+
+
 SUITES = {
     "migration": suite_migration,
     "invariant": suite_invariant,
     "source": suite_source,
     "paths": suite_paths,
+    "preview": suite_preview,
 }
 
 
