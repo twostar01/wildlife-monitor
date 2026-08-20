@@ -7,7 +7,7 @@ Suites:
     settings     — DEFAULT_PROCESSING_SETTINGS / ProcessingSettings / _load_settings
                    round-trip behavior for raw_recordings_retention_days (S1-S4).
     retention_ui — static/index.html text assertions for the Raw Recordings
-                   sub-column, the D-06 warning, and the load/collect wiring (R1-R7).
+                   sub-column, the D-06 warning, and the load/collect wiring (R1-R12).
     storage_ui   — static/index.html text assertions for the Storage Usage card's
                    raw cleanup tiles and last-run line (G1-G7).
 
@@ -108,10 +108,11 @@ def suite_settings():
 
 
 def suite_retention_ui():
-    """Seven cases parsing static/index.html for the Raw Recordings sub-column,
-    the D-06 warning, and the load/collect wiring (R1-R7)."""
+    """Twelve cases parsing static/index.html for the Raw Recordings sub-column,
+    the D-06 warning, the load/collect wiring, and the CLEANUP-05 raw-vs-kept
+    warning (R1-R12)."""
     passed = 0
-    total = 7
+    total = 12
     html = _index_html_text()
 
     # R1: exactly one setRawRecordingsDays input, type=number, min=0.
@@ -216,6 +217,84 @@ def suite_retention_ui():
     margin_count = html.count("margin-top:18px")
     ok = margin_count == 5
     _check(case_id, ok, f"found {margin_count} occurrence(s), expected 5")
+    if ok:
+        passed += 1
+
+    # R8: exactly one setKeptDays input, wired to the live-update handler (D-07).
+    case_id = "retention_ui/R8-kept-days-input"
+    kept_occurrences = html.count('id="setKeptDays"')
+    kept_snippet = ""
+    kept_idx = html.find('id="setKeptDays"')
+    if kept_idx != -1:
+        tag_start = html.rfind("<input", 0, kept_idx)
+        tag_end = html.find(">", kept_idx)
+        kept_snippet = html[tag_start:tag_end] if tag_start != -1 and tag_end != -1 else ""
+    ok = (
+        kept_occurrences == 1
+        and 'oninput="updateRawRetentionWarning()"' in kept_snippet
+        and 'type="number"' in kept_snippet
+        and 'min="0"' in kept_snippet
+    )
+    _check(case_id, ok, f"occurrences={kept_occurrences}, snippet={kept_snippet!r}")
+    if ok:
+        passed += 1
+
+    # R9: updateRawRetentionWarning's body reads setKeptDays and compares it
+    # with the same skip-when-zero shape as the existing raw-vs-blank check
+    # (SC2), without pinning the exact message wording (Claude's discretion).
+    case_id = "retention_ui/R9-kept-days-comparison"
+    fn_idx = html.find("function updateRawRetentionWarning")
+    fn_end = html.find("\n}", fn_idx) if fn_idx != -1 else -1
+    fn_body = html[fn_idx:fn_end] if fn_idx != -1 and fn_end != -1 else ""
+    ok = (
+        "setKeptDays" in fn_body
+        and "keptDays" in fn_body
+        and "keptDays !== 0" in fn_body
+        and "rawDays >= keptDays" in fn_body
+    )
+    _check(case_id, ok, f"fn_found={fn_idx != -1}, has_setKeptDays={'setKeptDays' in fn_body}")
+    if ok:
+        passed += 1
+
+    # R10: the raw-vs-blank trigger and message tail are byte-for-byte
+    # unregressed (SC3 / D-05). Separate case from R9 so a future "unification"
+    # of the two messages fails here loudly.
+    case_id = "retention_ui/R10-blank-check-unregressed"
+    ok = (
+        "rawDays !== 0 && blankDays !== 0 && rawDays >= blankDays" in fn_body
+        and "lower raw retention or raise blank retention" in fn_body
+    )
+    _check(case_id, ok, f"fn_found={fn_idx != -1}")
+    if ok:
+        passed += 1
+
+    # R11: fail-safe advisory character (SC4 / D-08) — no network call, no
+    # markup rendering, no save-gating signal anywhere in the function body.
+    case_id = "retention_ui/R11-fail-safe-advisory"
+    ok = (
+        "fetch(" not in fn_body
+        and "innerHTML" not in fn_body
+        and "return false" not in fn_body
+        and "preventDefault" not in fn_body
+        and "disabled" not in fn_body
+    )
+    _check(case_id, ok, f"fn_found={fn_idx != -1}")
+    if ok:
+        passed += 1
+
+    # R12: both warnings still share the single stacking container (D-05) —
+    # one #rawRetentionWarning element, now also carrying white-space:pre-line
+    # so two stacked messages render as separate lines.
+    case_id = "retention_ui/R12-single-stacking-container"
+    stack_occurrences = html.count('id="rawRetentionWarning"')
+    stack_idx = html.find('id="rawRetentionWarning"')
+    stack_tag = ""
+    if stack_idx != -1:
+        tag_start = html.rfind("<", 0, stack_idx)
+        tag_end = html.find(">", stack_idx)
+        stack_tag = html[tag_start:tag_end] if tag_start != -1 and tag_end != -1 else ""
+    ok = stack_occurrences == 1 and "white-space:pre-line" in stack_tag
+    _check(case_id, ok, f"occurrences={stack_occurrences}, tag={stack_tag!r}")
     if ok:
         passed += 1
 
