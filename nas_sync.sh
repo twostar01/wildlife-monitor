@@ -204,6 +204,7 @@ if [[ "$DRY_RUN" == true && "$THEN_PROCESS" == false ]]; then
     NAS_BLANK_ROOT="$NAS_ARCHIVE_ROOT/blanks"
     DB_PATH="$DATA_DIR/wildlife.db"
 
+    set +e
     python3 - <<PYEOF
 import os, sys, json
 from pathlib import Path
@@ -318,8 +319,9 @@ else:
         breakdown = "   ".join(f"{k}: {v}" for k, v in sorted(reason_counts.items()))
         print(f"  Skip reasons: {breakdown}")
 PYEOF
-
     PREVIEW_EXIT=$?
+    set -e
+
     if [[ "$PREVIEW_EXIT" -ne 0 ]]; then
         warn "Raw-cleanup preview encountered an unexpected error (see above)."
     fi
