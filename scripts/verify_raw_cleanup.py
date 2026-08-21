@@ -1203,7 +1203,7 @@ def _extract_preview_verify_fns_source():
 
 
 def suite_preview():
-    """Nine cases pinning the standalone `--dry-run` raw-cleanup preview
+    """Ten cases pinning the standalone `--dry-run` raw-cleanup preview
     branch (CLEANUP-04): its placement between the NAS mount check and the
     NAS video scan (PRV1), its independence from `--then-process` (PRV2),
     proof that the combined `--dry-run --then-process` early exit is
@@ -1213,10 +1213,17 @@ def suite_preview():
     proof the canonical and preview verify-fns sentinel pairs each stay
     unique (PRV7), a drift guard proving the preview's duplicated
     raw_path_for()/verify_raw_candidate() copy never diverges from the
-    canonical sentinel-delimited copy (PRV8), and proof the branch can
-    never fail the run (PRV9)."""
+    canonical sentinel-delimited copy (PRV8), proof the branch's source
+    text contains no `sys.exit(`/`exit 1` (PRV9), and — CR-01 regression
+    guard — proof that `PREVIEW_EXIT=$?` is actually *reachable*: the
+    heredoc invocation it captures the exit status of is guarded by
+    `set +e` beforehand and restored with `set -e` no earlier than the
+    capture itself (PRV10). PRV9 alone is a pure text scan and cannot
+    detect the case where an unguarded heredoc under `set -e` aborts the
+    script before its own exit-code capture line ever runs — PRV10 closes
+    that gap so this exact regression can never silently reappear."""
     passed = 0
-    total = 9
+    total = 10
     lines = _script_text()
 
     mount_guard_idx = _find_index(lines, lambda l: 'if [[ ! -d "$NAS_VIDEO_PATH" ]]' in l)
@@ -1389,6 +1396,64 @@ def suite_preview():
         and not any("exit 1" in l for l in branch_lines)
     )
     _check(case_id, ok, "branch extent contains sys.exit( or exit 1")
+    if ok:
+        passed += 1
+
+    # PRV10 (CR-01 regression guard — capture reachability): PRV9 is a pure
+    # text scan and cannot detect the bug fixed under CR-01, where
+    # `PREVIEW_EXIT=$?` sat on the line immediately after an *unguarded*
+    # heredoc invocation. Under `set -e`, an unguarded failing heredoc
+    # aborts the whole script before the next line ever runs, so that
+    # capture (and the `warn` + `exit 0` fallback depending on it) was
+    # dead code in exactly the failure scenario it exists to handle. This
+    # case asserts the capture is *reachable*: the heredoc is preceded by
+    # `set +e` (with no intervening `set -e` re-enabling strict mode
+    # before the capture line runs), and `set -e` is restored only at or
+    # after the capture.
+    case_id = "preview/PRV10-capture-reachable"
+    pyeof_start_idx = _find_index(
+        branch_lines, lambda l: l.strip().startswith("python3 - <<PYEOF")
+    )
+    pyeof_end_idx = _find_index(
+        branch_lines, lambda l: l.strip() == "PYEOF",
+        start=pyeof_start_idx if pyeof_start_idx != -1 else 0,
+    )
+    capture_idx = _find_index(
+        branch_lines, lambda l: l.strip() == "PREVIEW_EXIT=$?",
+        start=pyeof_end_idx if pyeof_end_idx != -1 else 0,
+    )
+    guard_idx = _find_index(
+        branch_lines, lambda l: l.strip() == "set +e",
+        start=0,
+    )
+    restore_idx = _find_index(
+        branch_lines, lambda l: l.strip() == "set -e",
+        start=capture_idx if capture_idx != -1 else 0,
+    )
+    no_premature_restore = (
+        guard_idx != -1
+        and capture_idx != -1
+        and guard_idx < capture_idx
+        and not any(
+            l.strip() == "set -e" for l in branch_lines[guard_idx + 1:capture_idx]
+        )
+    )
+    ok = (
+        pyeof_start_idx != -1
+        and pyeof_end_idx != -1
+        and capture_idx != -1
+        and guard_idx != -1
+        and guard_idx < pyeof_start_idx
+        and no_premature_restore
+        and restore_idx != -1
+        and restore_idx >= capture_idx
+    )
+    _check(
+        case_id, ok,
+        f"pyeof_start_idx={pyeof_start_idx}, pyeof_end_idx={pyeof_end_idx}, "
+        f"capture_idx={capture_idx}, guard_idx={guard_idx}, restore_idx={restore_idx}, "
+        f"no_premature_restore={no_premature_restore}",
+    )
     if ok:
         passed += 1
 
