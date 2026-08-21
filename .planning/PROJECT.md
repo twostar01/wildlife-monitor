@@ -10,25 +10,20 @@ Every animal that passes a camera gets detected, identified, and browsable — w
 
 ## Current State
 
-**Shipped:** v1.2 Cleanup & Verification (2026-08-11) — see `.planning/milestones/v1.2-ROADMAP.md`
+**Shipped:** v1.3 Bug Fixes & Data Integrity (2026-08-21) — see `.planning/milestones/v1.3-ROADMAP.md`
 
-v1.0, v1.1, and now v1.2 are all shipped. v1.2 closed out the last known rough edges from the first two milestones: mobile-usable dashboard fixes and journald logging (Phase 7), honest handling of service-interrupted pipeline runs plus armed zero-detection alerting (Phase 8), and the historical duplicate-video backfill — the highest-risk item in the whole roadmap, deliberately run last (Phase 9). 19,289 of 19,291 pre-existing duplicate `videos` rows were consolidated in a 41-second production write on 2026-08-10, with zero data loss and full operator verification. That closes a data-quality deferral that had been open since Phase 4.
+v1.3 closed out the last known bugs, data-quality gaps, and monitoring decisions left over from v1.0-v1.2, with no new user-facing features. Species correction from "unknown species" now saves correctly, including a previously-undiscovered dual-lens video-id misattribution bug found and fixed while closing that exact case out (Phase 10). ~14,354 stale `/home/nash/...` path references in `crops`/`videos` were migrated to `/home/twostar/...` in a single production write, reconciled byte-identical against a pre-write baseline (Phase 11). Gallery tiles for a human-corrected species now show a "corrected" pencil indicator instead of a stale confidence score, `web_app.py` gained five new operational logging call sites, and the NOTIFY-01 live-verification gap was formally closed as a permanent, documented limitation (Phase 12). The raw-cleanup preview is now reachable from `nas_sync.sh --dry-run` directly, and the retention-misconfiguration warning independently checks raw-vs-kept retention alongside the existing raw-vs-blank check — including a post-review fix for a `set -e` bug in the new preview branch, redeployed and reverified in production before the milestone closed (Phase 13).
 
-## Current Milestone: v1.3 Bug Fixes & Data Integrity
+<details>
+<summary>Previous state (v1.2, shipped 2026-08-11)</summary>
 
-**Goal:** Close out the last known bugs, data-quality gaps, and monitoring decisions left over from v1.0-v1.2. No new user-facing features.
+v1.2 closed out the last known rough edges from the first two milestones: mobile-usable dashboard fixes and journald logging (Phase 7), honest handling of service-interrupted pipeline runs plus armed zero-detection alerting (Phase 8), and the historical duplicate-video backfill — the highest-risk item in the whole roadmap, deliberately run last (Phase 9). 19,289 of 19,291 pre-existing duplicate `videos` rows were consolidated in a 41-second production write on 2026-08-10, with zero data loss and full operator verification. That closed a data-quality deferral that had been open since Phase 4.
 
-**Target features:**
-- Fix species correction not saving from "unknown species"
-- Migrate stale `/home/nash/...` file path references (~14,354 rows) to the current `/home/twostar/...` prefix
-- Fix cosmetic "would be deleted" wording bug in the backfill script's `--apply` mode report
-- Decide and implement additional `web_app.py` logging call sites at operational events
-- Decide and implement confidence-badge behavior for human-corrected species
-- Wire `WM_RAW_CLEANUP_DRY_RUN` into `nas_sync.sh`'s own `--dry-run` flag (WR-02)
-- Extend raw-retention misconfiguration warning to also check raw-vs-kept retention (WR-03)
-- Close NOTIFY-01 as an accepted limitation (documented, no code change — the failure path is unreachable with current video-corruption test tooling)
+</details>
 
-NOTIFY-02 remains a standing, no-deadline observation item — armed already, not scoped into this milestone.
+## Next Milestone Goals
+
+Not yet defined — run `/gsd-new-milestone` to scope the next milestone. One standing observation item remains open with no deadline (NOTIFY-02, see Live-Verification Follow-ups below), and three non-blocking documentation-hygiene items surfaced during the v1.3 milestone audit (see `.planning/milestones/v1.3-MILESTONE-AUDIT.md`): stale/missing `requirements-completed` frontmatter on a few SUMMARY files, and a stale CLAUDE.md claim that `.planning/` is entirely untracked in git (several files, including `PROJECT.md`/`REQUIREMENTS.md` as of Phase 12, are intentionally tracked).
 
 ## Requirements
 
@@ -69,15 +64,18 @@ NOTIFY-02 remains a standing, no-deadline observation item — armed already, no
 - ✓ Orphaned-run reconciliation: `reconcile_interrupted_runs()` sweeps NULL-status `runs` rows to an honest `interrupted` status on every `wildlife_processor.py` start, rendered as a gray "Interrupted" badge across all three run-display surfaces — Phase 8, confirmed firing on a real production restart 2026-08-08 (run id=13 reconciled row id=8)
 - ✓ MONITOR-02 (scheduled-trigger badge renders correctly on a real nightly automatic run) — Phase 8, confirmed 2026-08-08 via run id=13 (`trigger='scheduled'`, corroborated by `journalctl`/`systemctl list-timers`)
 - ✓ Historical dedup backfill: `scripts/backfill_dedup_videos.py`, dry-run-first with two flags required to write, rehearsed at full production scale before the real write — Phase 9, executed in production 2026-08-10: 19,289 of 19,291 duplicate-filename `videos` row groups consolidated (2 skipped intact and reported, no safe automatic answer existed), zero FK violations, zero broken pairings, 4 operator corrections preserved, operator dashboard-verified
+- ✓ CLEANUP-04: raw-cleanup preview mode reachable via `nas_sync.sh`'s own `--dry-run` flag (standalone branch, no longer requires hand-setting `WM_RAW_CLEANUP_DRY_RUN`) — Phase 13, validated 2026-08-21 on production (operator-witnessed live preview against the real NAS, file count proven unchanged, ordinary sync path confirmed unaffected)
+- ✓ CLEANUP-05: raw-retention misconfiguration warning extended to also fire on raw-vs-kept retention, independent of and stacking with the existing raw-vs-blank warning — Phase 13, validated 2026-08-21 on production (operator confirmed all five retention combinations plus save-never-blocks in the live dashboard)
+- ✓ FIX-01: species correction from "unknown species" to a specific species now saves and persists after reload, matching existing non-unknown correction behavior — Phase 10, validated 2026-08-15 on production (including a previously-undiscovered dual-lens video-id misattribution bug found and fixed while closing the exact reported case)
+- ✓ FIX-02: ~14,354 stale `/home/nash/...` path references in `crops.crop_path`/`videos.thumbnail_path` migrated to `/home/twostar/...` — Phase 11, executed in production 2026-08-16: zero nash-prefixed rows remain, row counts and all non-path columns byte-identical to the pre-write baseline
+- ✓ FIX-03: `scripts/backfill_dedup_videos.py`'s printed report says "deleted"/"removed" (not "would be deleted"/"would be removed") when run with `--apply`; dry-run wording unchanged — Phase 10, validated 2026-08-15
+- ✓ OBS-02: `web_app.py` gained five `log.info` call sites at decided operational events (correction save/delete, settings/schedule save) beyond the 18 `print()` sites converted in Phase 7 — Phase 12, validated 2026-08-20 on production (journald-confirmed)
+- ✓ UI-05: gallery confidence badge replaced with a "corrected" pencil indicator on tiles whose species was human-corrected via either the Gallery popover or the video player's per-crop editor, in both the Gallery grid and species-detail modal — Phase 12, validated 2026-08-20 on production (operator confirmed both correction paths, both grids)
+- ✓ NOTIFY-03: NOTIFY-01 (partial-run failure alert live-verification) recorded as a permanent, accepted limitation and removed from the open live-verification backlog — Phase 12, closed 2026-08-16 (alert code itself unchanged and remains live)
 
 ### Active
-- [ ] Should `web_app.py` gain new `logging` call sites at operational events beyond the 18 `print()` sites converted in Phase 7? — scoped into v1.3
-- [ ] Should the gallery confidence badge be suppressed or annotated on tiles whose species was human-corrected, since the displayed confidence no longer reflects the corrected label? — scoped into v1.3
-- [ ] Species correction from "unknown species" does not save (cat→raccoon correction worked, unknown→raccoon on the same video did not) — reported 2026-08-06, scoped into v1.3
-- [ ] `WM_RAW_CLEANUP_DRY_RUN` raw-cleanup preview switch is undocumented/unreachable via `nas_sync.sh`'s own `--dry-run` flag (internal-only by design, Phase 6 WR-02) — scoped into v1.3
-- [ ] Raw-retention misconfiguration warning only compares raw-vs-blank, not raw-vs-kept retention (fails safe — skip, never delete — but incomplete; Phase 6 WR-03) — scoped into v1.3
-- [ ] ~22% of `crops`/`videos.thumbnail_path` references (14,354 rows) point at stale `/home/nash/...` paths from a pre-existing, unrelated home-directory rename — discovered during Phase 9's rehearsal, confirmed unaffected by the backfill — scoped into v1.3
-- [ ] `scripts/backfill_dedup_videos.py`'s printed report says "would be deleted"/"would be removed" even in `--apply` mode — cosmetic wording bug, not a correctness issue — scoped into v1.3
+
+(None — planning next milestone)
 
 ### Live-Verification Follow-ups (deferred from Phase 2, code-verified but unobserved in production)
 
@@ -94,15 +92,16 @@ NOTIFY-02 remains a standing, no-deadline observation item — armed already, no
 ## Context
 
 - Multiple known tech debt items and bugs are documented in `.planning/codebase/CONCERNS.md` — these should be addressed as a foundation before adding new features
-- The codebase has zero automated test coverage of the pytest/unittest kind — pure/deterministic functions are covered instead by stdlib-only `scripts/verify_*.py` regression harnesses (8 as of Phase 9: dedup identity, archive collision, lens pairing, raw cleanup, raw cleanup UI, phase 7, run reconciliation, dedup backfill — the last one grew to 10 suites/53 cases across Phase 9's three plans, RED-first throughout), a pattern established in Phase 4 and reused through Phase 9
-- `web_app.py` now configures a stdlib `logging` handler (Phase 7) — INFO+ lines reach journald under `wildlife-monitor.service` with timestamps/levels, confirmed exactly-once-per-line in production journald output
+- The codebase has zero automated test coverage of the pytest/unittest kind — pure/deterministic functions are covered instead by stdlib-only `scripts/verify_*.py` regression harnesses (14+ as of v1.3, RED-first throughout: dedup identity, archive collision, lens pairing, raw cleanup + its `preview` suite (PRV1-PRV10), raw cleanup UI + `retention_ui` R8-R12, phase 7, run reconciliation, dedup backfill, `verify_phase10` (fix01/fix03/audit), `verify_stale_paths` (6 suites/37 cases), `verify_phase12`/`verify_phase12_ops` (badge/ui/propagation/logging/docs)), a pattern established in Phase 4 and reused through every subsequent milestone
+- `web_app.py`'s stdlib `logging` handler (Phase 7) gained five more `log.info` call sites in v1.3 (Phase 12, OBS-02) at correction and config-change endpoints — journald-confirmed on production
+- Production DB is on `ubuntulaptop` (`/home/twostar/wildlife_monitor/data/wildlife.db`); as of v1.3 it holds ~48,464 `videos` rows / 17,298 `crops` rows. `crops.crop_path`/`videos.thumbnail_path` now resolve exclusively to `/home/twostar/...` — the historical `/home/nash/...` stale-prefix issue (14,354 rows, from an old un-migrated home-directory rename) was fully resolved in Phase 11
+- Gallery/species-detail tiles show a "corrected" pencil indicator (not a stale confidence score) for any species with a Gallery-popover or video-player correction, via `database.py`'s `HAS_CORRECTION`/`HAS_VIDEO_CORRECTION` SQL constants (Phase 12, UI-05) — but grouping/filter-matching (`get_species_list()`, `get_stats()`, `get_timeline()`, species filters) still key off the original SpeciesNet label, not the corrected one; filed as a follow-up todo (`.planning/todos/pending/2026-08-16-effective-label-grouping-and-correction-unification.md`)
 - The systemd timer fires at 05:00 daily (`TimeoutStartSec` raised 4h→12h in v1.1 to tolerate backlog/catch-up runs); operator can change the time from dashboard Settings (Phase 3)
+- `nas_sync.sh --dry-run` reaches the raw-cleanup preview branch standalone (Phase 13, CLEANUP-04); the retention-misconfiguration warning checks both raw-vs-blank and raw-vs-kept retention (Phase 13, CLEANUP-05); both paths fail safe (report-only, never trigger deletion)
 - `search_taxonomy()` re-parses the full SpeciesNet classes JSON on every keypress — needs module-level caching
 - WordPress publish workflow exists in `PROJECT.md` (root) for the project blog page
-- v1.1 closed with the NAS `raw_recordings` backlog draining fast: 355GB/75,580-file baseline (2026-07-30) down to ~3.8GB freed per steady-state nightly run by 2026-08-05, confirming the recurring cleanup mechanism reached steady state within days of being armed
-- Production DB is on `ubuntulaptop` (`/home/twostar/wildlife_monitor/data/wildlife.db`); as of Phase 9 it holds ~48,200 `videos` rows (down from ~93,400 pre-backfill) after the 2026-08-10 dedup consolidation. `database.py`'s SCHEMA gained 3 new indexes during that phase (`idx_crops_detection_id`, `idx_species_detection_id`, `idx_videos_paired_video_id`) — a shared-schema change discovered necessary only at real production scale (fixture-scale testing never surfaced it)
+- CLAUDE.md's claim that all of `.planning/` is "local only, not tracked in git" is stale — `.planning/STATE.md`, `.planning/codebase/*.md`, and (as of Phase 12) `.planning/PROJECT.md`/`.planning/REQUIREMENTS.md` are intentionally force-tracked; the file should be corrected to match actual practice
 - Interrupted-run handling: `reconcile_interrupted_runs()` (Phase 8) sweeps NULL-status `runs` rows to `interrupted` on every `wildlife_processor.py` start — the original NULL-status gap from a 2026-08-05 mid-run service restart is now handled automatically, no manual intervention needed
-- A pre-existing, unrelated data-quality issue surfaced during Phase 9's rehearsal: ~22% of `crops`/`thumbnail_path` file references in production point at a stale `/home/nash/...` path prefix from an old, un-migrated home-directory rename. Confirmed unaffected by and unrelated to the dedup backfill; not yet triaged
 
 ## Constraints
 
@@ -137,6 +136,11 @@ NOTIFY-02 remains a standing, no-deadline observation item — armed already, no
 | A shared-file schema change (`database.py`) discovered mid-phase gets escalated to explicit operator sign-off rather than treated as a same-file auto-fix | `database.py` is used by `web_app.py` and `wildlife_processor.py` beyond the phase's own script — materially broader blast radius than a same-file fix | ✓ Good — authorized, landed as its own atomic commit with full regression check across all 8 project harnesses, no issues |
 | Quarantine (not permanent deletion) chosen for the one-way production write's orphaned-file handling | Converts the file half of an otherwise-irreversible operation into something reversible for as long as the quarantine directory is kept, at near-zero cost since almost no files were actually projected to be affected | ✓ Good — quarantine directory ended up empty (0 files) since 98.7% of groups shared their thumbnail with the surviving winner; the safety margin cost nothing in practice |
 | NOTIFY-01 (partial-run failure alert live-verification) closed as a permanent accepted limitation rather than pursued further — NOTIFY-03 / Phase 12 | no available video-corruption strategy reaches `wildlife_processor.py`'s error path — OpenCV/ffmpeg absorbs every decode failure as "0 frames extracted" | ✓ Accepted — the alert code itself is unchanged and remains live; only the ability to observe it firing in production is unverified, not the alert. Four failure-injection strategies (truncated header, truncated mid-stream, zeroed chunk, random bytes, no-read-permission file) were tried empirically in Phase 8 and every one was absorbed by OpenCV/ffmpeg as a benign "0 frames extracted", per `08-02-SUMMARY.md` |
+| Dual-lens video-id misattribution bug (found while closing FIX-01) treated as part of FIX-01's scope, not a separate follow-up item | `10-02-PLAN.md`'s must-have was outcome-framed ("the exact reported case is confirmed fixed"), and the misattribution was the actual root cause blocking that exact case — genuinely undiscovered at planning time but discovered, fixed, and confirmed within the same closure effort | ✓ Good — root-caused, fixed (`42dc17d`), deployed, and confirmed against the live production DB/API with no dangling remnant on the original video |
+| FIX-02's path rewrite computed in Python via a leading-prefix slice, not a SQL `REPLACE()` | Prevents corrupting any non-leading `/home/nash/...` occurrence that might appear mid-string | ✓ Good — zero collateral rewrites, confirmed by exhaustive existence checks pre/post-write |
+| FIX-02 followed the same layered de-risking sequence as Phase 9's dedup backfill: fixture harness → deploy + read-only production rehearsal → operator Go/No-Go → production `--apply` write | Irreversible production data surgery (14,354 rows) demanded proving the architecture cheaply before running it for real, mirroring the precedent that worked for Phase 9's higher-risk write | ✓ Good — rehearsal baseline (4,274/10,080/14,354, zero orphans/collisions) matched the real write exactly; reconciliation digests byte-identical pre/post |
+| Phase 12 scope expanded mid-milestone to fold the separate `video_corrections` propagation-gap todo into UI-05 | Operator explicitly confirmed folding it in in the 2026-08-16 discuss-phase session rather than leaving Gallery/Videos/Stats permanently blind to video-player corrections | ✓ Good — delivered in two halves (display propagation in 12-03; grouping/filter-matching explicitly deferred as a new follow-up todo, not silently dropped) |
+| Phase 13's CR-01 fix (preview branch's exit-code capture unreachable under `set -e`) treated as a blocking post-review fix, not deferred tech debt | The bug could crash the nightly systemd unit on an unhandled exception inside the preview heredoc instead of warning and exiting cleanly — a data-safety-adjacent failure mode, not cosmetic | ✓ Good — fixed, given its own regression guard (PRV10), redeployed to production, and reverified (preview suite 9/9 → 10/10) before the phase was marked complete |
 
 ## Evolution
 
@@ -156,4 +160,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-11 — v1.3 (Bug Fixes & Data Integrity) milestone started*
+*Last updated: 2026-08-21 after v1.3 (Bug Fixes & Data Integrity) milestone close*

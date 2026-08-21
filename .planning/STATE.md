@@ -2,44 +2,42 @@
 gsd_state_version: 1.0
 milestone: v1.3
 milestone_name: Bug Fixes & Data Integrity
-current_phase: 12
-status: completed
-stopped_at: "Completed 12-04-PLAN.md (Phase 12 closed: OBS-02, UI-05, NOTIFY-03 all Complete; production-verified on ubuntulaptop; operator-approved)"
-last_updated: "2026-08-20T16:29:26.213Z"
-last_activity: 2026-08-20
-last_activity_desc: Phase 12 marked complete
+status: Awaiting next milestone
+stopped_at: Completed 13-03-PLAN.md
+last_updated: "2026-08-21T18:20:08.026Z"
+last_activity: 2026-08-21
+last_activity_desc: Phase 13 complete — milestone v1.3 fully complete (4/4 phases)
 progress:
   total_phases: 4
-  completed_phases: 3
-  total_plans: 11
-  completed_plans: 11
-  percent: 75
-current_phase_name: stale-file-path-migration
+  completed_phases: 4
+  total_plans: 14
+  completed_plans: 14
+  percent: 100
+current_phase: 13
+current_phase_name: Raw Cleanup Hardening
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-08-11)
+See: .planning/PROJECT.md (updated 2026-08-21)
 
 **Core value:** Every animal that passes a camera gets detected, identified, and browsable — without the operator having to intervene to keep the system running.
-**Current focus:** Phase 11 — stale-file-path-migration
+**Current focus:** Planning next milestone — run `/gsd-new-milestone`
 
 ## Current Position
 
-Phase: 12 — COMPLETE
-Plan: 4 of 4
-Status: Phase 12 complete
-Last activity: 2026-08-20 — Phase 12 marked complete
-
-Progress: [██████████] 100%
+Phase: Milestone v1.3 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-08-21 — Milestone v1.3 completed and archived
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 31
+- Total plans completed: 41
 - Average duration: —
 - Total execution time: —
 
@@ -59,7 +57,7 @@ Progress: [██████████] 100%
 | 10 | TBD | - | - |
 | 11 | TBD | - | - |
 | 12 | TBD | - | - |
-| 13 | TBD | - | - |
+| 13 | 3 | - | - |
 
 **Recent Trend:**
 
@@ -80,6 +78,7 @@ Progress: [██████████] 100%
 | Phase 11 P03 | 25min | 2 tasks | 0 files |
 | Phase 11 P04 | 24min | 3 tasks | 2 files |
 | Phase 12 P04 | ~65min | 3 tasks | 3 files |
+| Phase 13 P03 | 40min | 3 tasks | 1 files |
 
 ## Accumulated Context
 
@@ -100,6 +99,7 @@ Recent decisions affecting current work:
 - [Phase ?]: Operator authorized GO on the 11-03 production rehearsal (exact match to 4,274/10,080/14,354 baseline, 0 orphans, 0 collisions, FA-1 confirmed dashboard never broken) — plan 11-04 authorized to run the production --apply write
 - [Phase ?]: 11-04: Production --apply write executed on ubuntulaptop -- 14,354 rows rewritten (4,274 crops.crop_path, 10,080 videos.thumbnail_path), reconciled byte-identical against 11-03 baseline (row counts, both non_path_digest values, zero FK violations, exhaustive existence check). Operator confirmed no dashboard regression (SC3). FIX-02 closed.
 - [Phase ?]: Phase 12 closed 2026-08-16: OBS-02, UI-05, NOTIFY-03 all Complete. Operator approved all 6 browser checkpoint items with no deviations, and requested a follow-up phase (7a) covering effective-label grouping/filter-matching plus whether to unify the two species-correction mechanisms (7b) -- filed as .planning/todos/pending/2026-08-16-effective-label-grouping-and-correction-unification.md. Video-player-correction-wins accepted as a stopgap precedence rule pending that follow-up.
+- [Phase ?]: Phase 13 (CLEANUP-04, CLEANUP-05) deployed to ubuntulaptop and fully operator-verified: SC1-SC4 all confirmed against the real NAS, real production DB, and a real browser; both remaining harness suites and the import smoke check passed on the real production Python 3.12 environment
 
 ### Pending Todos
 
@@ -108,13 +108,13 @@ Recent decisions affecting current work:
 - "Next scheduled run" text overflows its card on both sides when the timer is inactive (no line break between label and value). Now tracked as UI-02 / Phase 7. `.planning/todos/pending/2026-08-02-next-scheduled-run-text-overflows-card.md`
 - ~~Orphaned `runs` row (id=8, 2026-08-04)~~ — resolved 2026-08-08: reconciled automatically by the 2026-08-08 ~06:00 MDT scheduled run (run id=13). See Deferred Items below (RUN-01, confirmed).
 - ~~Species correction from "unknown species" does not save (cat→raccoon correction worked, unknown→raccoon on the same video did not)~~ — reported 2026-08-06 on `World Watch_00_20260806043634.mp4`. **Resolved 2026-08-15 as FIX-01 / Phase 10.** Root cause turned out to be two-fold: (1) the suppression filter didn't consider corrected/effective labels (fixed in `database.py`'s `NOT_EFFECTIVELY_UNKNOWN`), and (2) a second bug found during UAT — the reported video is one lens of a dual-lens pair, and the video player always attributed corrections to the primary video's ID regardless of which lens a crop actually came from, so the exact reported case still failed until this was also fixed (`static/index.html`, commit `42dc17d`). Both confirmed live on `ubuntulaptop` against production data.
-- ~22% of `crops`/`videos.thumbnail_path` references (14,354 rows) in production point at stale `/home/nash/...` paths that no longer exist — a pre-existing historical home-directory rename (`nash` → `twostar`) with no accompanying database path-rewrite migration. Discovered during Phase 9's 09-04 rehearsal; confirmed unrelated to and unaffected by the dedup backfill. Now tracked as FIX-02 / Phase 11.
+- ~~~22% of `crops`/`videos.thumbnail_path` references (14,354 rows) in production point at stale `/home/nash/...` paths that no longer exist~~ — a pre-existing historical home-directory rename (`nash` → `twostar`) with no accompanying database path-rewrite migration. Discovered during Phase 9's 09-04 rehearsal. **Resolved 2026-08-16 as FIX-02 / Phase 11**: 14,354 rows migrated in a single production `--apply` write, zero nash-prefixed rows remain, reconciled byte-identical against the pre-write baseline.
 - ~~`scripts/backfill_dedup_videos.py`'s printed summary report says "would be deleted"/"would be removed" even when run with `--apply`~~ — cosmetic wording bug in `render_plan_report()`'s shared dry-run/apply template. **Resolved 2026-08-15 as FIX-03 / Phase 10** (fix was written 2026-08-11 but stranded on an orphaned worktree branch until merged to `main`/deployed this session).
-- Video-player species corrections (the `video_corrections` table) are only ever displayed inside that video's own detail view — Gallery, the Videos tab/filename search, and every Stats/Species/Timeline chart still show the original AI label forever, since none of those readers know `video_corrections` exists (only the Gallery popover's `species.user_common_name` writes propagate everywhere). Discovered 2026-08-15 during Phase 10 UAT. Not yet scoped into a phase — needs its own plan, same scale as FIX-01's 9-call-site sweep. `.planning/todos/pending/2026-08-15-video-player-corrections-not-reflected-in-gallery-videos-stats.md`
+- Video-player species corrections (the `video_corrections` table) were only ever displayed inside that video's own detail view. **Display propagation resolved 2026-08-20 as UI-05 / Phase 12** (Gallery grid, species-detail modal, Videos tab, filename search, and video detail all now show the corrected label via `EFFECTIVE_COMMON`/`EFFECTIVE_SCIENTIFIC`). **Still open:** effective-label *grouping and filter-matching* (`get_species_list()`, `get_stats()`, `get_timeline()`, species filters) deliberately excluded from Phase 12's scope — still keys off the original SpeciesNet label. Not yet scoped into a phase. `.planning/todos/pending/2026-08-16-effective-label-grouping-and-correction-unification.md`
 
 ### Blockers/Concerns
 
-None open. v1.3 roadmap created (Phases 10-13); ready to plan Phase 10.
+None open. v1.3 shipped 2026-08-21; ready to scope the next milestone with `/gsd-new-milestone`.
 
 **Resolved at milestone close (2026-08-05, v1.1):**
 
@@ -144,13 +144,14 @@ None open. v1.3 roadmap created (Phases 10-13); ready to plan Phase 10.
 | Phase 4 root-cause deferral (source-side) | NAS raw_recordings source files never cleaned up — 355GB/48,690 files fully duplicating the 144GB/20,359-file wildlife_archive. See pending todo. | Resolved — Phase 6 (06-04, 2026-07-30): operator enabled 14-day retention cleanup, armed in production, first real sweep 2026-07-31 | 2026-07-29 |
 | v1.2 milestone close | ~~Species correction from "unknown species" does not save~~ (cat→raccoon worked, unknown→raccoon on the same video did not). `.planning/todos/pending/2026-08-06-species-correction-from-unknown-species-does-not-save.md` | **Resolved 2026-08-15** as FIX-01 / Phase 10 — see Pending Todos above for the two-part root cause (suppression filter + dual-lens video-id misattribution). | 2026-08-06 (opened) / 2026-08-11 (scoped into Phase 10) / 2026-08-15 (closed) |
 | v1.2 milestone close | Formal verification override — Phases 8 and 9 have no scripted `*-VERIFICATION.md` report (the automated verify step never ran in either phase's execution flow). Both are functionally complete: Phase 8's 3 plans executed and its own standing checkpoints (RUN-01/02 confirmed, RUN-03/04 tracked above) were worked through directly against production; Phase 9's 4 plans included an extensive manual production rehearsal, real production write, and full post-run verification (0 FK violations, 0 broken pairings, all deltas reconciled), all operator-witnessed and recorded in `09-04-SUMMARY.md`. | **Operator-authorized override at v1.2 close (2026-08-11)** — proceeding without the formal artifact; the underlying verification work was done, just not through the scripted tool path. | 2026-08-11 |
+| v1.3 milestone close | Formal verification override — Phase 10's readiness check flagged `verification_status: stale` (not phase_complete) at milestone close, because Phase 12's later commits (12-01 to 12-04) re-touched `static/index.html`/`database.py`/`web_app.py` after Phase 10's own `10-VERIFICATION.md` was written (2026-08-15). This is a mechanical file-touch heuristic, not a detected regression: the v1.3 milestone audit's `gsd-integration-checker` independently re-read the *current* `static/index.html` and confirmed Phase 10's dual-lens `data-video-id` fix is still present and undisturbed by Phase 12's badge changes. | **Operator-authorized override at v1.3 close (2026-08-21)** — proceeding without re-running `/gsd-verify-work 10`; see `.planning/milestones/v1.3-MILESTONE-AUDIT.md` for the integration checker's independent re-confirmation. | 2026-08-21 |
 
 ## Session Continuity
 
-Last session: 2026-08-20T16:24:19.293Z
-Stopped at: Completed 12-04-PLAN.md (Phase 12 closed: OBS-02, UI-05, NOTIFY-03 all Complete; production-verified on ubuntulaptop; operator-approved)
+Last session: 2026-08-21T15:57:47.188Z
+Stopped at: Completed 13-03-PLAN.md
 Resume file: None
 
 ## Operator Next Steps
 
-- Start Phase 11 with `/gsd-discuss-phase 11` (FIX-02: `/home/nash/...` → `/home/twostar/...` path migration, ~14,354 rows)
+- Start the next milestone with /gsd-new-milestone
