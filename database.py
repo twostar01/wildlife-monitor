@@ -478,6 +478,57 @@ EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({UNIFIED_CORRECTION_SCIENTIFIC},''), s.
 # plan records the boundary rather than acting on it. If case P10 ever
 # fails, that decision has not been made yet — it failing is a request for
 # one, not a bug.
+#
+# ── Phase 14 (Correction Unification) additions ─────────────────────────
+#
+# species_corrections is now the SOLE source read by EFFECTIVE_COMMON,
+# EFFECTIVE_SCIENTIFIC, HAS_CORRECTION and NOT_EFFECTIVELY_UNKNOWN above
+# (CORR-01, D-00). Precedence between the two correction entry points
+# (Gallery popover, video-player editor) is resolved at WRITE time by the
+# species_corrections UNIQUE(detection_id) UPSERT (D-03, plain recency —
+# whichever write is most recent wins), not at read time by the order of a
+# COALESCE chain. This is a real behaviour change from the previously-
+# shipped "video-player value always wins" ordering this comment block used
+# to document (see the old EFFECTIVE_COMMON comment, now superseded).
+#
+# species.user_common_name / species.user_scientific_name /
+# species.corrected_at, and the entire video_corrections table, are frozen
+# read-only from this phase forward (D-06): still readable, never written,
+# by any code path in this codebase. get_video_corrections() is the one
+# function that still reads the frozen video_corrections table on purpose —
+# RESEARCH.md's Open Question 2 is resolved here: GET /api/corrections has
+# no frontend caller (grep-verified — static/index.html's only reference to
+# '/api/corrections' is a POST, in applyCorrection()), so it is deliberately
+# left reading the frozen table rather than rewired to species_corrections.
+#
+# Interim staleness window (accepted, not a bug): get_species_list(),
+# get_stats()'s top_species and get_timeline() (see the bullets above) still
+# resolve their displayed NAME through DISPLAY_COMMON, which reads the
+# now-frozen species.user_common_name. Any correction made after this phase
+# deploys and before Phase 15 ships will therefore NOT change the name shown
+# in the Species tab, Stats top-species tile, or Timeline chart — even
+# though it correctly changes the Gallery grid, species-detail crop grid,
+# Videos tab and video player (all rewired to EFFECTIVE_COMMON/
+# EFFECTIVE_SCIENTIFIC above). The ✏ corrected badge in the Species tab
+# stays accurate throughout, because HAS_CORRECTION is rewired here and
+# those three readers already consume it. This is RESEARCH.md's Pitfall 1,
+# accepted deliberately: converting those three readers' displayed name
+# without also converting their GROUP BY key would reintroduce the exact
+# SQLite arbitrary-row-per-group hazard this comment block exists to
+# prevent (see the bullets above). Phase 15 (LABEL-01..05) closes this
+# window.
+#
+# The `suppressed` column on species_corrections — not a NULL
+# corrected_label — is the suppression signal. A NULL corrected_label on a
+# source='gallery' row is normal and means only "the Gallery popover never
+# collects a formal taxonomy label" (SpeciesCorrectionRequest has no
+# `label` field). Any future query that tests for suppression must test
+# `suppressed`, not `corrected_label IS NULL`.
+#
+# Reprocessing a video does NOT re-apply prior corrections (D-02): a
+# reprocessed video's new detections start uncorrected, exactly like
+# newly-processed footage. wildlife_processor.py's reprocess flow is
+# untouched by this phase.
 
 
 def init_db(db_path: Optional[str] = None):
