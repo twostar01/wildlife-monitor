@@ -1,20 +1,20 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.3
-milestone_name: Bug Fixes & Data Integrity
-status: Awaiting next milestone
-stopped_at: Completed 13-03-PLAN.md
-last_updated: "2026-08-21T18:20:08.026Z"
-last_activity: 2026-08-21
-last_activity_desc: Phase 13 complete — milestone v1.3 fully complete (4/4 phases)
+milestone: v1.4
+milestone_name: Effective Species Labeling
+current_phase: 14
+current_phase_name: correction-unification-schema-backfill-cutover
+status: executing
+stopped_at: Phase 14 context gathered
+last_updated: "2026-08-22T15:28:35.519Z"
+last_activity: 2026-08-22
+last_activity_desc: Phase 14 execution started
 progress:
-  total_phases: 4
-  completed_phases: 4
-  total_plans: 14
-  completed_plans: 14
-  percent: 100
-current_phase: 13
-current_phase_name: Raw Cleanup Hardening
+  total_phases: 2
+  completed_phases: 0
+  total_plans: 4
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -24,14 +24,16 @@ current_phase_name: Raw Cleanup Hardening
 See: .planning/PROJECT.md (updated 2026-08-21)
 
 **Core value:** Every animal that passes a camera gets detected, identified, and browsable — without the operator having to intervene to keep the system running.
-**Current focus:** Planning next milestone — run `/gsd-new-milestone`
+**Current focus:** Phase 14 — correction-unification-schema-backfill-cutover
 
 ## Current Position
 
-Phase: Milestone v1.3 complete
-Plan: —
-Status: Awaiting next milestone
-Last activity: 2026-08-21 — Milestone v1.3 completed and archived
+Phase: 14 (correction-unification-schema-backfill-cutover) — EXECUTING
+Plan: 1 of 4
+Status: Executing Phase 14
+Last activity: 2026-08-22 — Phase 14 execution started
+
+Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
@@ -58,6 +60,8 @@ Last activity: 2026-08-21 — Milestone v1.3 completed and archived
 | 11 | TBD | - | - |
 | 12 | TBD | - | - |
 | 13 | 3 | - | - |
+| 14 | TBD | - | - |
+| 15 | TBD | - | - |
 
 **Recent Trend:**
 
@@ -87,6 +91,11 @@ Last activity: 2026-08-21 — Milestone v1.3 completed and archived
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- v1.4 continues phase numbering from v1.3 (starts at Phase 14, not reset)
+- v1.4's schema-unification fork (STACK.md's materialize-and-reconcile `effective_label` column vs. ARCHITECTURE.md's full `species_corrections` table unification) was resolved by the operator in favor of full unification — a new `species_corrections` table keyed `UNIQUE(detection_id)`, most-recent-write-wins via UPSERT — before roadmap creation, per SUMMARY.md's Phase 0 gate framing
+- v1.4 roadmap groups the 9 requirements into 2 phases: Phase 14 (CORR-01..04 — schema creation, backfill, and read/write-path cutover, sequenced first as the highest-risk/least-reversible work, mirroring this project's own Phase 9/11 precedent) and Phase 15 (LABEL-01..05 — the five-reader query rewrite plus frontend filter-contract alignment, which cannot start until Phase 14's resolved effective key exists)
+- Coarse granularity (2-4 phases typical) plus the schema-before-query-rewrite dependency argued for exactly 2 phases rather than splitting frontend contract alignment (LABEL-03) into its own third phase — LABEL-03 already couples dropdown/backend contract symmetry into one requirement, so it stays inside Phase 15
+- BULK-01/BULK-02 (bulk-correct-all, un-correct UI) and AUDIT-01 (audit-trail UI) remain explicit v2 deferrals — not scoped into this roadmap, per REQUIREMENTS.md
 - v1.3 continues phase numbering from v1.2 (starts at Phase 10, not reset)
 - v1.3 roadmap groups the 8 requirements into 4 phases by risk/coherence, not by REQUIREMENTS.md category alone: Phase 10 bundles the two independent, low-risk code fixes (FIX-01, FIX-03) that touch different files; Phase 11 isolates FIX-02 (the ~14,354-row `/home/nash/...` → `/home/twostar/...` path migration) into its own phase despite being in the same "Bug Fixes" category, since it's a production DB write and gets the same verification-harness-first treatment as every prior production write in this project (Phase 6, Phase 9), even though it is a lower-risk string rewrite, not a row deletion; Phase 12 folds the single-requirement NOTIFY-03 (pure documentation, no code) in with the two decide-then-implement UX/observability items (OBS-02, UI-05) rather than giving it a standalone phase; Phase 13 keeps CLEANUP-04/CLEANUP-05 together since both touch `nas_sync.sh`'s raw-cleanup subsystem
 - v1.2 continues phase numbering from v1.1 (starts at Phase 7, not reset to Phase 1)
@@ -110,11 +119,11 @@ Recent decisions affecting current work:
 - ~~Species correction from "unknown species" does not save (cat→raccoon correction worked, unknown→raccoon on the same video did not)~~ — reported 2026-08-06 on `World Watch_00_20260806043634.mp4`. **Resolved 2026-08-15 as FIX-01 / Phase 10.** Root cause turned out to be two-fold: (1) the suppression filter didn't consider corrected/effective labels (fixed in `database.py`'s `NOT_EFFECTIVELY_UNKNOWN`), and (2) a second bug found during UAT — the reported video is one lens of a dual-lens pair, and the video player always attributed corrections to the primary video's ID regardless of which lens a crop actually came from, so the exact reported case still failed until this was also fixed (`static/index.html`, commit `42dc17d`). Both confirmed live on `ubuntulaptop` against production data.
 - ~~~22% of `crops`/`videos.thumbnail_path` references (14,354 rows) in production point at stale `/home/nash/...` paths that no longer exist~~ — a pre-existing historical home-directory rename (`nash` → `twostar`) with no accompanying database path-rewrite migration. Discovered during Phase 9's 09-04 rehearsal. **Resolved 2026-08-16 as FIX-02 / Phase 11**: 14,354 rows migrated in a single production `--apply` write, zero nash-prefixed rows remain, reconciled byte-identical against the pre-write baseline.
 - ~~`scripts/backfill_dedup_videos.py`'s printed summary report says "would be deleted"/"would be removed" even when run with `--apply`~~ — cosmetic wording bug in `render_plan_report()`'s shared dry-run/apply template. **Resolved 2026-08-15 as FIX-03 / Phase 10** (fix was written 2026-08-11 but stranded on an orphaned worktree branch until merged to `main`/deployed this session).
-- Video-player species corrections (the `video_corrections` table) were only ever displayed inside that video's own detail view. **Display propagation resolved 2026-08-20 as UI-05 / Phase 12** (Gallery grid, species-detail modal, Videos tab, filename search, and video detail all now show the corrected label via `EFFECTIVE_COMMON`/`EFFECTIVE_SCIENTIFIC`). **Still open:** effective-label *grouping and filter-matching* (`get_species_list()`, `get_stats()`, `get_timeline()`, species filters) deliberately excluded from Phase 12's scope — still keys off the original SpeciesNet label. Not yet scoped into a phase. `.planning/todos/pending/2026-08-16-effective-label-grouping-and-correction-unification.md`
+- ~~Video-player species corrections (the `video_corrections` table) were only ever displayed inside that video's own detail view.~~ **Display propagation resolved 2026-08-20 as UI-05 / Phase 12** (Gallery grid, species-detail modal, Videos tab, filename search, and video detail all now show the corrected label via `EFFECTIVE_COMMON`/`EFFECTIVE_SCIENTIFIC`). **Grouping/filter-matching and correction-mechanism unification now scoped into v1.4 as Phase 14 (CORR-01..04) and Phase 15 (LABEL-01..05).** `.planning/todos/pending/2026-08-16-effective-label-grouping-and-correction-unification.md` (source todo; can be moved to done/ once Phase 15 ships)
 
 ### Blockers/Concerns
 
-None open. v1.3 shipped 2026-08-21; ready to scope the next milestone with `/gsd-new-milestone`.
+None open. ROADMAP.md created for v1.4 (Phases 14-15); ready to discuss/plan Phase 14.
 
 **Resolved at milestone close (2026-08-05, v1.1):**
 
@@ -139,19 +148,21 @@ None open. v1.3 shipped 2026-08-21; ready to scope the next milestone with `/gsd
 | Phase 8 standing checkpoint (08-03) | ~~RUN-01 (D-06)~~ | **CONFIRMED 2026-08-08** — run id=13 (`trigger=scheduled`, 2026-08-08T06:05:38) logged `WARNING Reconciled 1 interrupted run(s) from a prior invocation`; row 8 now reads `status='interrupted'`, `end_time=2026-08-08T06:05:38`, exact D-03 error text. Pipeline mechanism confirmed, not a hand-edit. Zero NULL-status rows remain. | 2026-08-07 → closed 2026-08-08 |
 | Phase 8 standing checkpoint (08-03) | ~~RUN-02~~ | **CONFIRMED 2026-08-08** — run id=13 (above watermark 12), `trigger='scheduled'`, corroborated independently by `journalctl -u wildlife-analysis.service` (service started 06:00:09) and `systemctl list-timers` (LAST = Sat 2026-08-08 06:00:09 MDT). Not a manual run. | 2026-07-28 → closed 2026-08-08 |
 | Phase 8 standing checkpoint (08-03) | ~~RUN-03~~: confirm partial-run failure alert fires when a corrupt video is mixed with a good one. **Blocked on a real gap, not just timing**: the original Phase-2 corrupt test video no longer exists on `ubuntulaptop`, and empirical testing (08-02-SUMMARY.md) confirmed no video-corruption strategy (truncated header/mid-stream, zeroed chunk, random bytes, no-read-permission) reaches `wildlife_processor.py`'s error path — OpenCV/ffmpeg absorbs every decode failure as "0 frames extracted," which the code treats as a benign empty video, not a failure. **CLOSED 2026-08-16** as NOTIFY-03 / Phase 12: recorded as a permanent accepted limitation in `.planning/PROJECT.md`'s Key Decisions table (the authoritative record) rather than continuing to chase it — the alert code itself remains live and untouched. | v1.3 Phase 12 (NOTIFY-03) — closed 2026-08-16 | 2026-07-28 (opened) / 2026-08-07 (blocker confirmed) / 2026-08-11 (scoped into v1.3) / 2026-08-16 (closed) |
-| Phase 8 standing checkpoint (08-03) | ~~RUN-04a~~: confirm zero-detection alert fires on a genuinely quiet night (videos processed, 0 detections). **CONFIRMED 2026-08-13** — run id=20 (`trigger=scheduled`, 2026-08-13T06:01:52–06:05:14, `worldwatch`: 16 videos/0 detections, `backwall` offline) hit the exact firing shape for the first time in 20 runs. `data/run_20260813_060150.log` on `ubuntulaptop` logs `INFO Alert email sent (zero_detections) to nclemens.cp@gmail.com`. RUN-04b (no alert on a zero-*video* night) remains open — separate scenario, not yet observed. | RUN-04a closed 2026-08-13; RUN-04b standing, no deadline (D-10), NOT scoped into v1.3 | 2026-07-28 (opened) / 2026-08-07 (armed) / 2026-08-08 (checked, still open) / 2026-08-13 (RUN-04a confirmed) |
+| Phase 8 standing checkpoint (08-03) | ~~RUN-04a~~: confirm zero-detection alert fires on a genuinely quiet night (videos processed, 0 detections). **CONFIRMED 2026-08-13** — run id=20 (`trigger=scheduled`, 2026-08-13T06:01:52–06:05:14, `worldwatch`: 16 videos/0 detections, `backwall` offline) hit the exact firing shape for the first time in 20 runs. `data/run_20260813_060150.log` on `ubuntulaptop` logs `INFO Alert email sent (zero_detections) to nclemens.cp@gmail.com`. RUN-04b (no alert on a zero-*video* night) remains open — separate scenario, not yet observed. | RUN-04a closed 2026-08-13; RUN-04b standing, no deadline (D-10), NOT scoped into v1.3 or v1.4 (see NOTIFY-02 below) | 2026-07-28 (opened) / 2026-08-07 (armed) / 2026-08-08 (checked, still open) / 2026-08-13 (RUN-04a confirmed) |
 | Phase 4 root-cause deferral | insert_video dedup across archive moves: nas_sync.sh's archive-collision handling sets an older row's filepath to NULL without setting file_purged_at when the archive destination already exists, producing multiple videos rows for one physical file (19,291 filenames affected in production). See 04-DEFERRED.md. | **Fully resolved 2026-08-10** — Phase 5 stopped new duplicates; Phase 9 (BACKFILL-01) consolidated all 19,289 of 19,291 pre-existing duplicate groups in production (2 skipped intact, `winner-crops-migrated`, reported not silently dropped). See `09-04-SUMMARY.md`. | 2026-07-29 → closed 2026-08-10 |
 | Phase 4 root-cause deferral (source-side) | NAS raw_recordings source files never cleaned up — 355GB/48,690 files fully duplicating the 144GB/20,359-file wildlife_archive. See pending todo. | Resolved — Phase 6 (06-04, 2026-07-30): operator enabled 14-day retention cleanup, armed in production, first real sweep 2026-07-31 | 2026-07-29 |
 | v1.2 milestone close | ~~Species correction from "unknown species" does not save~~ (cat→raccoon worked, unknown→raccoon on the same video did not). `.planning/todos/pending/2026-08-06-species-correction-from-unknown-species-does-not-save.md` | **Resolved 2026-08-15** as FIX-01 / Phase 10 — see Pending Todos above for the two-part root cause (suppression filter + dual-lens video-id misattribution). | 2026-08-06 (opened) / 2026-08-11 (scoped into Phase 10) / 2026-08-15 (closed) |
 | v1.2 milestone close | Formal verification override — Phases 8 and 9 have no scripted `*-VERIFICATION.md` report (the automated verify step never ran in either phase's execution flow). Both are functionally complete: Phase 8's 3 plans executed and its own standing checkpoints (RUN-01/02 confirmed, RUN-03/04 tracked above) were worked through directly against production; Phase 9's 4 plans included an extensive manual production rehearsal, real production write, and full post-run verification (0 FK violations, 0 broken pairings, all deltas reconciled), all operator-witnessed and recorded in `09-04-SUMMARY.md`. | **Operator-authorized override at v1.2 close (2026-08-11)** — proceeding without the formal artifact; the underlying verification work was done, just not through the scripted tool path. | 2026-08-11 |
 | v1.3 milestone close | Formal verification override — Phase 10's readiness check flagged `verification_status: stale` (not phase_complete) at milestone close, because Phase 12's later commits (12-01 to 12-04) re-touched `static/index.html`/`database.py`/`web_app.py` after Phase 10's own `10-VERIFICATION.md` was written (2026-08-15). This is a mechanical file-touch heuristic, not a detected regression: the v1.3 milestone audit's `gsd-integration-checker` independently re-read the *current* `static/index.html` and confirmed Phase 10's dual-lens `data-video-id` fix is still present and undisturbed by Phase 12's badge changes. | **Operator-authorized override at v1.3 close (2026-08-21)** — proceeding without re-running `/gsd-verify-work 10`; see `.planning/milestones/v1.3-MILESTONE-AUDIT.md` for the integration checker's independent re-confirmation. | 2026-08-21 |
+| v1.4 milestone (open, no deadline) | NOTIFY-02: zero-detection alert fires on a real no-animal night but not on an empty directory — `alert_on_zero_detections` armed true in production 2026-08-07; the firing shape has never occurred in 13+ runs to date. | Standing observation item, not scoped into v1.4 (see PROJECT.md Live-Verification Follow-ups) | 2026-08-07 (armed) → carried forward |
 
 ## Session Continuity
 
-Last session: 2026-08-21T15:57:47.188Z
-Stopped at: Completed 13-03-PLAN.md
-Resume file: None
+Last session: 2026-08-21T22:44:01.218Z
+Stopped at: Phase 14 context gathered
+Resume file: C:/Users/nclem/Claude Code/wildlife-monitor/.planning/phases/14-correction-unification-schema-backfill-cutover/14-CONTEXT.md
 
 ## Operator Next Steps
 
-- Start the next milestone with /gsd-new-milestone
+- Review ROADMAP.md's Phase 14/15 structure and success criteria
+- `/gsd-discuss-phase 14` — gather context and clarify approach for Phase 14 (Correction Unification)

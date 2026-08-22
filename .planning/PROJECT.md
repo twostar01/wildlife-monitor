@@ -21,9 +21,15 @@ v1.2 closed out the last known rough edges from the first two milestones: mobile
 
 </details>
 
-## Next Milestone Goals
+## Current Milestone: v1.4 Effective Species Labeling
 
-Not yet defined — run `/gsd-new-milestone` to scope the next milestone. One standing observation item remains open with no deadline (NOTIFY-02, see Live-Verification Follow-ups below), and three non-blocking documentation-hygiene items surfaced during the v1.3 milestone audit (see `.planning/milestones/v1.3-MILESTONE-AUDIT.md`): stale/missing `requirements-completed` frontmatter on a few SUMMARY files, and a stale CLAUDE.md claim that `.planning/` is entirely untracked in git (several files, including `PROJECT.md`/`REQUIREMENTS.md` as of Phase 12, are intentionally tracked).
+**Goal:** A corrected detection's species stops appearing under its stale AI label everywhere in the app (Species tab, Stats, Timeline, filters), and the two correction mechanisms get a single authoritative resolution order.
+
+**Target features:**
+- Effective-label grouping/filtering across `get_species_list()`, `get_stats()`, `get_timeline()`, and the gallery/video species filters — a corrected detection fully leaves its original stale AI label's bucket everywhere, not just in display (which Phase 12 already fixed)
+- Research whether to unify the two correction mechanisms (`species.user_common_name` vs. `video_corrections`) into one schema or reconcile at read-time with a fixed precedence order, then implement the chosen approach
+
+One standing observation item remains open with no deadline (NOTIFY-02, see Live-Verification Follow-ups below), and three non-blocking documentation-hygiene items surfaced during the v1.3 milestone audit (see `.planning/milestones/v1.3-MILESTONE-AUDIT.md`) remain deferred, out of scope for v1.4: stale/missing `requirements-completed` frontmatter on a few SUMMARY files, and a stale CLAUDE.md claim that `.planning/` is entirely untracked in git (several files, including `PROJECT.md`/`REQUIREMENTS.md` as of Phase 12, are intentionally tracked).
 
 ## Requirements
 
@@ -160,4 +166,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-08-21 after v1.3 (Bug Fixes & Data Integrity) milestone close*
+*Last updated: 2026-08-21 — milestone v1.4 (Effective Species Labeling) started*
