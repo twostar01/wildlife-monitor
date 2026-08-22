@@ -124,6 +124,28 @@ CREATE TABLE IF NOT EXISTS video_corrections (
     note                 TEXT
 );
 
+-- Unified correction record (D-00, CORR-01): the single authoritative
+-- per-detection correction row, replacing species.user_common_name/
+-- user_scientific_name/corrected_at and video_corrections as the system of
+-- record. UNIQUE(detection_id) + an UPSERT write path (add_to_blacklist()'s
+-- proven ON CONFLICT ... DO UPDATE shape) gives deterministic most-recent-
+-- write-wins semantics (D-03) with no read-time precedence chain needed.
+-- `suppressed` (not a NULL corrected_label) is the suppression signal — see
+-- this plan's objective discretion note for why a dedicated column was
+-- chosen over RESEARCH.md's corrected_label-IS-NULL encoding. `source` is
+-- carried for observability only, never for precedence (D-03).
+CREATE TABLE IF NOT EXISTS species_corrections (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    detection_id         INTEGER NOT NULL UNIQUE REFERENCES detections(id),
+    corrected_label      TEXT,
+    corrected_common     TEXT,
+    corrected_scientific TEXT,
+    suppressed           INTEGER NOT NULL DEFAULT 0,
+    source               TEXT NOT NULL,  -- 'gallery' | 'video_player' -- observability only, never precedence (D-03)
+    corrected_at         TEXT NOT NULL,
+    note                 TEXT
+);
+
 CREATE TABLE IF NOT EXISTS runs (
     id                    INTEGER PRIMARY KEY AUTOINCREMENT,
     start_time            TEXT NOT NULL,
@@ -153,6 +175,9 @@ CREATE INDEX IF NOT EXISTS idx_crops_quality ON crops(quality_score DESC);
 CREATE INDEX IF NOT EXISTS idx_blacklist_label ON blacklist(label);
 CREATE INDEX IF NOT EXISTS idx_corrections_video ON video_corrections(video_id);
 CREATE INDEX IF NOT EXISTS idx_corrections_label ON video_corrections(original_label);
+-- No index on species_corrections(detection_id): the UNIQUE constraint above
+-- already creates one.
+CREATE INDEX IF NOT EXISTS idx_species_corrections_label ON species_corrections(corrected_label);
 CREATE INDEX IF NOT EXISTS idx_runs_start_time ON runs(start_time DESC);
 -- The three indexes below were added during Phase 9's dedup backfill
 -- (09-04 full-scale rehearsal, 2026-08-09): none of crops.detection_id,
@@ -214,28 +239,68 @@ ALTER TABLE runs ADD COLUMN raw_cleanup_skipped INTEGER;
 # SpeciesNet returns ';;;;;;blank' when it determines a crop has no animal.
 BLANK_LABEL_FILTER = "s.label NOT LIKE '%;;;;;;blank'"
 
+# ── Unified correction-resolution constants (D-00, CORR-01) ────────────────
+#
+# These four read from the single species_corrections table (SCHEMA above),
+# which is now the sole source read by NOT_EFFECTIVELY_UNKNOWN, HAS_CORRECTION
+# and EFFECTIVE_COMMON/EFFECTIVE_SCIENTIFIC below — precedence between the
+# Gallery popover and video-player write paths is resolved at WRITE time by
+# the UNIQUE(detection_id) UPSERT (D-03, plain recency), not at read time by
+# a COALESCE chain over two tables.
+#
+# Placed here (immediately above NOT_EFFECTIVELY_UNKNOWN), not immediately
+# above DISPLAY_COMMON where 14-01-PLAN.md's task 1 describes them, because
+# NOT_EFFECTIVELY_UNKNOWN's rewired body below now interpolates
+# HAS_UNIFIED_CORRECTION — a module-level f-string constant can only
+# reference a name already defined above it in the file, so this placement
+# is required for `import database` to succeed at all, not just a style
+# preference (14-01-SUMMARY.md documents this as a plan deviation).
+#
+# LIMIT 1 on the two scalar subqueries is defensive, not load-bearing:
+# species_corrections.detection_id carries a UNIQUE constraint, so at most
+# one row can ever match. Every interpolation site below needs a `d`
+# (detections) alias in scope (d.id) — the same alias-precondition
+# convention NOT_EFFECTIVELY_UNKNOWN and HAS_VIDEO_CORRECTION already
+# document for their own correlated subqueries.
+UNIFIED_CORRECTION_COMMON = """(
+    SELECT sc.corrected_common FROM species_corrections sc
+    WHERE sc.detection_id = d.id AND sc.suppressed = 0
+    LIMIT 1
+)"""
+
+UNIFIED_CORRECTION_SCIENTIFIC = """(
+    SELECT sc.corrected_scientific FROM species_corrections sc
+    WHERE sc.detection_id = d.id AND sc.suppressed = 0
+    LIMIT 1
+)"""
+
+HAS_UNIFIED_CORRECTION = """EXISTS (
+    SELECT 1 FROM species_corrections sc
+    WHERE sc.detection_id = d.id AND sc.suppressed = 0
+)"""
+
+# True when a detection carries a suppress row (species_corrections.suppressed
+# = 1) rather than a normal correction. Unused by any query in this plan —
+# 14-02-PLAN.md wires this into get_video_by_id() to replace the video-player
+# suppression signal. Defined here so both plans agree on one definition.
+IS_SUPPRESSED_DETECTION = """EXISTS (
+    SELECT 1 FROM species_corrections sc
+    WHERE sc.detection_id = d.id AND sc.suppressed = 1
+)"""
+
 # True when a species row's *effective* (post-correction) label is something
 # other than 'Unknown species' — i.e. the row was never Unknown, OR it was
-# corrected away from Unknown via one of the two correction paths:
-#   - gallery path: correct_species() sets s.user_common_name directly on
-#     this species row (it never mutates s.label itself).
-#   - video-player path: save_video_correction() writes a video_corrections
-#     row keyed by (video_id, original_label). A NULL corrected_label means
-#     "suppress this label" per the schema comment and apply_corrections_to_
-#     species()'s NULL-means-suppress semantics, so it must NOT count as a
-#     correction away from Unknown here.
+# corrected away from Unknown via a species_corrections row (either write
+# path — the unified table doesn't distinguish here). HAS_UNIFIED_CORRECTION
+# already excludes suppressed rows, so a suppress sentinel never counts as a
+# correction away from Unknown, matching the old third disjunct's intent.
 # Disjunct order matters for cost, not just correctness: SQL OR short-
 # circuits left to right, so for the overwhelming majority of rows (label is
-# not 'Unknown species') the EXISTS subquery below is never evaluated.
-NOT_EFFECTIVELY_UNKNOWN = """(
+# not 'Unknown species') the correlated EXISTS subquery below is never
+# evaluated.
+NOT_EFFECTIVELY_UNKNOWN = f"""(
     s.label != 'Unknown species'
-    OR NULLIF(s.user_common_name, '') IS NOT NULL
-    OR EXISTS (
-        SELECT 1 FROM video_corrections vc
-        WHERE vc.video_id = d.video_id
-          AND vc.original_label = s.label
-          AND vc.corrected_label IS NOT NULL
-    )
+    OR {HAS_UNIFIED_CORRECTION}
 )"""
 
 # Suppression filter — exclude Unknown species and blank labels for any video
@@ -278,6 +343,12 @@ KNOWN_SPECIES_FILTER = (
 DISPLAY_COMMON     = "COALESCE(NULLIF(s.user_common_name,''), s.common_name)"
 DISPLAY_SCIENTIFIC = "COALESCE(NULLIF(s.user_scientific_name,''), s.scientific_name)"
 
+# Retained but unreferenced pending D-07 (legacy-table removal follow-up
+# phase): no query in this codebase evaluates HAS_VIDEO_CORRECTION any more
+# after this plan's HAS_CORRECTION rewrite below — it stays defined, and
+# video_corrections stays readable, only because D-06 freezes the table
+# read-only rather than dropping it in this phase.
+#
 # True when a species row was corrected through the VIDEO PLAYER's per-crop
 # editor rather than the Gallery popover. The gallery path writes
 # species.user_common_name and stamps species.corrected_at directly via
@@ -301,13 +372,13 @@ HAS_VIDEO_CORRECTION = """EXISTS (
       AND vc.corrected_label IS NOT NULL
 )"""
 
-# True (1) when a row's species was corrected through EITHER write path
-# (Gallery popover OR video-player editor), else False (0). The cheap
-# `s.corrected_at IS NOT NULL` disjunct is placed FIRST so SQL's
-# left-to-right OR short-circuits the correlated HAS_VIDEO_CORRECTION
-# subquery for the overwhelming majority of rows — the same cost argument
-# NOT_EFFECTIVELY_UNKNOWN's own comment makes above (lines 227-229).
-HAS_CORRECTION = f"CASE WHEN s.corrected_at IS NOT NULL OR {HAS_VIDEO_CORRECTION} THEN 1 ELSE 0 END"
+# True (1) when a detection carries a non-suppressed species_corrections row
+# (CORR-01, D-00) — i.e. it was corrected through EITHER write path (Gallery
+# popover OR video-player editor), since both now write into the same
+# unified table. Its own s.corrected_at IS NOT NULL / HAS_VIDEO_CORRECTION
+# disjuncts are gone: precedence between the two write paths is resolved at
+# write time (D-03), not by testing both legacy sources at read time.
+HAS_CORRECTION = f"CASE WHEN {HAS_UNIFIED_CORRECTION} THEN 1 ELSE 0 END"
 
 # Scalar correlated subquery returning the VIDEO PLAYER's corrected common
 # name for a species row, or NULL when no matching, non-suppressed
@@ -348,27 +419,26 @@ VIDEO_CORRECTION_SCIENTIFIC = """(
     LIMIT 1
 )"""
 
-# The effective display name: the VIDEO PLAYER's correction when present
-# and non-blank, else the existing DISPLAY_COMMON/DISPLAY_SCIENTIFIC chain
-# (Gallery-popover correction, else the raw SpeciesNet value).
-# NULLIF(...,'') is what makes a correction saved with a blank name fall
-# through to the existing chain instead of blanking the display — the same
-# guard DISPLAY_COMMON already applies to s.user_common_name.
+# The effective display name: the unified species_corrections value when
+# present and non-blank, else the raw SpeciesNet value. NULLIF(...,'') is
+# what makes a correction saved with a blank name fall through to the raw
+# value instead of blanking the display — the same guard DISPLAY_COMMON used
+# to apply to s.user_common_name.
 #
-# Ordering the video-corrections value FIRST is a deliberate precedence
-# choice with no source decision behind it: get_video_by_id() already
-# resolves this exact collision the same way, because
-# apply_corrections_to_species() overwrites the DISPLAY_COMMON-derived
-# common_name with corrected_common regardless of what species.
-# user_common_name says. Ordering it the other way would silently change a
-# shipped behaviour while fixing a display gap. Case P8 (scripts/
-# verify_phase12.py) pins this choice — it asserts get_gallery() and
-# get_video_by_id() agree on the same crop.
+# The fallback is now the RAW s.common_name/s.scientific_name, not
+# DISPLAY_COMMON/DISPLAY_SCIENTIFIC — chaining through DISPLAY_COMMON would
+# resurrect the frozen legacy species.user_common_name column as a live read
+# source (violating D-06/CORR-01), since the Gallery correction that
+# DISPLAY_COMMON used to supply now arrives through UNIFIED_CORRECTION_COMMON
+# above instead. This collapses the previous two-source COALESCE chain
+# (video-corrections-then-Gallery) into one source, because precedence
+# between the two write paths is now resolved at WRITE time (D-03) via the
+# UNIQUE(detection_id) UPSERT, not at read time by chain ordering.
 #
-# Same alias precondition as VIDEO_CORRECTION_COMMON above: every
+# Same alias precondition as UNIFIED_CORRECTION_COMMON above: every
 # interpolation site needs both `s` and `d` in scope.
-EFFECTIVE_COMMON = f"COALESCE(NULLIF({VIDEO_CORRECTION_COMMON},''), {DISPLAY_COMMON})"
-EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({VIDEO_CORRECTION_SCIENTIFIC},''), {DISPLAY_SCIENTIFIC})"
+EFFECTIVE_COMMON = f"COALESCE(NULLIF({UNIFIED_CORRECTION_COMMON},''), s.common_name)"
+EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({UNIFIED_CORRECTION_SCIENTIFIC},''), s.scientific_name)"
 
 # ── Deliberately NOT converted to EFFECTIVE_COMMON/EFFECTIVE_SCIENTIFIC ──
 #
@@ -408,6 +478,57 @@ EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({VIDEO_CORRECTION_SCIENTIFIC},''), {DIS
 # plan records the boundary rather than acting on it. If case P10 ever
 # fails, that decision has not been made yet — it failing is a request for
 # one, not a bug.
+#
+# ── Phase 14 (Correction Unification) additions ─────────────────────────
+#
+# species_corrections is now the SOLE source read by EFFECTIVE_COMMON,
+# EFFECTIVE_SCIENTIFIC, HAS_CORRECTION and NOT_EFFECTIVELY_UNKNOWN above
+# (CORR-01, D-00). Precedence between the two correction entry points
+# (Gallery popover, video-player editor) is resolved at WRITE time by the
+# species_corrections UNIQUE(detection_id) UPSERT (D-03, plain recency —
+# whichever write is most recent wins), not at read time by the order of a
+# COALESCE chain. This is a real behaviour change from the previously-
+# shipped "video-player value always wins" ordering this comment block used
+# to document (see the old EFFECTIVE_COMMON comment, now superseded).
+#
+# species.user_common_name / species.user_scientific_name /
+# species.corrected_at, and the entire video_corrections table, are frozen
+# read-only from this phase forward (D-06): still readable, never written,
+# by any code path in this codebase. get_video_corrections() is the one
+# function that still reads the frozen video_corrections table on purpose —
+# RESEARCH.md's Open Question 2 is resolved here: GET /api/corrections has
+# no frontend caller (grep-verified — static/index.html's only reference to
+# '/api/corrections' is a POST, in applyCorrection()), so it is deliberately
+# left reading the frozen table rather than rewired to species_corrections.
+#
+# Interim staleness window (accepted, not a bug): get_species_list(),
+# get_stats()'s top_species and get_timeline() (see the bullets above) still
+# resolve their displayed NAME through DISPLAY_COMMON, which reads the
+# now-frozen species.user_common_name. Any correction made after this phase
+# deploys and before Phase 15 ships will therefore NOT change the name shown
+# in the Species tab, Stats top-species tile, or Timeline chart — even
+# though it correctly changes the Gallery grid, species-detail crop grid,
+# Videos tab and video player (all rewired to EFFECTIVE_COMMON/
+# EFFECTIVE_SCIENTIFIC above). The ✏ corrected badge in the Species tab
+# stays accurate throughout, because HAS_CORRECTION is rewired here and
+# those three readers already consume it. This is RESEARCH.md's Pitfall 1,
+# accepted deliberately: converting those three readers' displayed name
+# without also converting their GROUP BY key would reintroduce the exact
+# SQLite arbitrary-row-per-group hazard this comment block exists to
+# prevent (see the bullets above). Phase 15 (LABEL-01..05) closes this
+# window.
+#
+# The `suppressed` column on species_corrections — not a NULL
+# corrected_label — is the suppression signal. A NULL corrected_label on a
+# source='gallery' row is normal and means only "the Gallery popover never
+# collects a formal taxonomy label" (SpeciesCorrectionRequest has no
+# `label` field). Any future query that tests for suppression must test
+# `suppressed`, not `corrected_label IS NULL`.
+#
+# Reprocessing a video does NOT re-apply prior corrections (D-02): a
+# reprocessed video's new detections start uncorrected, exactly like
+# newly-processed footage. wildlife_processor.py's reprocess flow is
+# untouched by this phase.
 
 
 def init_db(db_path: Optional[str] = None):
@@ -985,30 +1106,103 @@ def update_video_filepath(video_id: int, new_filepath: str):
         )
 
 
+def _upsert_species_correction(
+    conn,
+    detection_id: int,
+    corrected_label: Optional[str] = None,
+    corrected_common: Optional[str] = None,
+    corrected_scientific: Optional[str] = None,
+    suppressed: int = 0,
+    source: str = "gallery",
+    note: Optional[str] = None,
+) -> None:
+    """
+    Insert or update the single species_corrections row for detection_id
+    (D-00: UNIQUE(detection_id) + UPSERT gives deterministic most-recent-
+    write-wins semantics per D-03 — same ON CONFLICT ... DO UPDATE shape as
+    add_to_blacklist(), the only other proven UPSERT in this codebase).
+
+    Caller must already be inside a `with get_conn() as conn:` block — this
+    helper does not open its own connection, so a fan-out caller (video-
+    player, plan 14-02) can write several detections' rows inside one shared
+    transaction.
+
+    Every bound value uses a `?` placeholder (T-14-02) — no f-string or
+    `%`-interpolation of caller-supplied data into SQL.
+    """
+    conn.execute(
+        """INSERT INTO species_corrections
+           (detection_id, corrected_label, corrected_common, corrected_scientific,
+            suppressed, source, corrected_at, note)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(detection_id) DO UPDATE SET
+             corrected_label=excluded.corrected_label,
+             corrected_common=excluded.corrected_common,
+             corrected_scientific=excluded.corrected_scientific,
+             suppressed=excluded.suppressed,
+             source=excluded.source,
+             corrected_at=excluded.corrected_at,
+             note=excluded.note""",
+        (
+            detection_id,
+            corrected_label,
+            corrected_common,
+            corrected_scientific,
+            suppressed,
+            source,
+            datetime.now().isoformat(),
+            note,
+        ),
+    )
+
+
 def correct_species(
     detection_id: int,
     user_common_name: str,
     user_scientific_name: str,
 ) -> int:
     """
-    Save a human correction for a species detection. Pass empty strings to
-    clear a correction. Returns the number of rows updated (0 for an unknown
-    detection_id) so the API layer can distinguish "nothing to update" from
-    success instead of always reporting {"ok": True} (IN-02).
+    Save a human correction for a species detection (Gallery popover write
+    path) via the unified species_corrections table (D-00, CORR-01). Pass
+    empty strings to clear a correction.
+
+    Returns 1 if detection_id exists in `detections` (whether a correction
+    was written or an existing one cleared), 0 for an unknown detection_id —
+    so the API layer can distinguish "nothing to update" from success instead
+    of always reporting {"ok": True} (IN-02). The existence check is now
+    load-bearing rather than incidental: an UPSERT against a nonexistent
+    detection_id would raise an IntegrityError (foreign keys are ON per
+    get_conn()) and surface as a 500 instead of a 404 without it. Clearing an
+    already-clear correction on an existing detection still returns 1 — that
+    is not a 404.
+
+    Does not read or write any column of the `species` table beyond the
+    existence-adjacent check above (D-06 freeze; CORR-04) — species.label and
+    the legacy user_common_name/user_scientific_name/corrected_at columns are
+    untouched by this function after cutover. corrected_label is always NULL
+    for source='gallery': the Gallery popover never collects a formal
+    taxonomy label (SpeciesCorrectionRequest has no `label` field).
     """
+    common = user_common_name.strip() or None
+    scientific = user_scientific_name.strip() or None
     with get_conn() as conn:
-        cur = conn.execute(
-            """UPDATE species
-               SET user_common_name=?, user_scientific_name=?, corrected_at=?
-               WHERE detection_id=?""",
-            (
-                user_common_name.strip() or None,
-                user_scientific_name.strip() or None,
-                datetime.now().isoformat() if (user_common_name or user_scientific_name) else None,
+        exists = conn.execute("SELECT 1 FROM detections WHERE id=?", (detection_id,)).fetchone()
+        if not exists:
+            return 0
+        if common is None and scientific is None:
+            conn.execute("DELETE FROM species_corrections WHERE detection_id=?", (detection_id,))
+        else:
+            _upsert_species_correction(
+                conn,
                 detection_id,
-            ),
-        )
-        return cur.rowcount
+                corrected_label=None,
+                corrected_common=common,
+                corrected_scientific=scientific,
+                suppressed=0,
+                source="gallery",
+                note=None,
+            )
+    return 1
 def get_kept_video_paths() -> list:
     """
     Return id and filepath for all kept videos that are currently stored locally
