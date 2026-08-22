@@ -348,6 +348,151 @@ def render_plan_report(plan, applied, digests=None, as_json=False):
     print(f"RUNVAR: report_generated_at={datetime.now().isoformat()}")
 
 
+def snapshot_db(src_path, dest_path):
+    """Take an online backup of the database at src_path into dest_path
+    using sqlite3.Connection.backup() -- a plain file copy is wrong here
+    because get_conn() sets PRAGMA journal_mode=WAL, and copying only the
+    main database file can miss data still sitting in the -wal file.
+    Callers must treat a raised exception here as a hard abort before any
+    write pass -- the snapshot is the only rollback path."""
+    dest_dir = os.path.dirname(dest_path)
+    if dest_dir:
+        os.makedirs(dest_dir, exist_ok=True)
+    src_conn = sqlite_connect(src_path)
+    try:
+        dest_conn = sqlite_connect(dest_path)
+        try:
+            src_conn.backup(dest_conn)
+        finally:
+            dest_conn.close()
+    finally:
+        src_conn.close()
+
+
+def open_audit_log(path):
+    """Open a JSON-lines file for append. Raises OSError (uncaught) if
+    the path can't be opened -- callers in apply mode must treat that as
+    a hard abort before any write: an unlogged irreversible operation
+    cannot be reconstructed from the snapshot."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    return open(path, "a", encoding="utf-8")
+
+
+def write_audit_line(handle, payload):
+    """Write one compact JSON object per line and flush immediately, so a
+    crash mid-run still leaves every completed row's line durable on
+    disk."""
+    handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    handle.flush()
+
+
+def apply_backfill(conn, plan):
+    """Write every planned row inside ONE transaction via
+    conn.executemany(), guarded by a trailing WHERE clause on the
+    UPSERT's DO UPDATE that makes a re-run a no-op and protects a live
+    correction written after cutover from ever being clobbered by an
+    older legacy value (T-14-12). Returns (skipped_not_newer,
+    audit_payloads): skipped_not_newer is the count of planned rows whose
+    corrected_at was NOT strictly newer than an already-present
+    species_corrections row for that detection_id, computed BEFORE the
+    write by reading current state; audit_payloads is collected in
+    memory and NOT written to the audit log yet -- an audit line must
+    never claim a row was written before the transaction that wrote it
+    has actually committed (T-11-11)."""
+    detection_ids = [row.detection_id for row in plan.rows]
+    existing = {}
+    chunk_size = 500
+    for start in range(0, len(detection_ids), chunk_size):
+        chunk = detection_ids[start:start + chunk_size]
+        if not chunk:
+            continue
+        placeholders = ",".join("?" for _ in chunk)
+        for det_id, corrected_at in conn.execute(
+            f"SELECT detection_id, corrected_at FROM species_corrections WHERE detection_id IN ({placeholders})",
+            tuple(chunk),
+        ).fetchall():
+            existing[det_id] = corrected_at
+
+    skipped_not_newer = 0
+    audit_payloads = []
+    params = []
+    for row in plan.rows:
+        prior_corrected_at = existing.get(row.detection_id)
+        will_skip = prior_corrected_at is not None and row.corrected_at <= prior_corrected_at
+        if will_skip:
+            skipped_not_newer += 1
+        params.append((
+            row.detection_id, row.corrected_label, row.corrected_common,
+            row.corrected_scientific, row.suppressed, row.source,
+            row.corrected_at, row.note,
+        ))
+        audit_payloads.append({
+            "detection_id": row.detection_id,
+            "corrected_label": row.corrected_label,
+            "corrected_common": row.corrected_common,
+            "corrected_scientific": row.corrected_scientific,
+            "suppressed": row.suppressed,
+            "source": row.source,
+            "corrected_at": row.corrected_at,
+            "skipped_not_newer": will_skip,
+        })
+
+    conn.executemany(
+        """INSERT INTO species_corrections
+           (detection_id, corrected_label, corrected_common, corrected_scientific,
+            suppressed, source, corrected_at, note)
+           VALUES (?,?,?,?,?,?,?,?)
+           ON CONFLICT(detection_id) DO UPDATE SET
+             corrected_label=excluded.corrected_label,
+             corrected_common=excluded.corrected_common,
+             corrected_scientific=excluded.corrected_scientific,
+             suppressed=excluded.suppressed,
+             source=excluded.source,
+             corrected_at=excluded.corrected_at,
+             note=excluded.note
+           WHERE excluded.corrected_at > species_corrections.corrected_at""",
+        params,
+    )
+    return skipped_not_newer, audit_payloads
+
+
+def verify_post_conditions(conn, plan):
+    """Return a dict of post-apply health checks: current
+    species_corrections row count, the plan's planned row count, their
+    difference, PRAGMA foreign_key_check violation count, orphaned-
+    detection_id count (a species_corrections row whose detection_id has
+    no matching detections row), rows-with-duplicate-detection_id count
+    (should always be 0 given the UNIQUE constraint -- an explicit belt-
+    and-braces check), and the unchanged row counts of both legacy
+    tables (species, video_corrections)."""
+    row_count = conn.execute("SELECT COUNT(*) FROM species_corrections").fetchone()[0]
+    planned_count = len(plan.rows)
+    fk_violations = len(conn.execute("PRAGMA foreign_key_check").fetchall())
+    orphaned_detection_id_count = conn.execute(
+        """SELECT COUNT(*) FROM species_corrections sc
+           WHERE NOT EXISTS (SELECT 1 FROM detections d WHERE d.id = sc.detection_id)"""
+    ).fetchone()[0]
+    duplicate_detection_id_count = conn.execute(
+        """SELECT COUNT(*) FROM (
+             SELECT detection_id FROM species_corrections GROUP BY detection_id HAVING COUNT(*) > 1
+           )"""
+    ).fetchone()[0]
+    species_rowcount = conn.execute("SELECT COUNT(*) FROM species").fetchone()[0]
+    video_corrections_rowcount = conn.execute("SELECT COUNT(*) FROM video_corrections").fetchone()[0]
+    return {
+        "row_count": row_count,
+        "planned_count": planned_count,
+        "row_count_delta": row_count - planned_count,
+        "fk_violations": fk_violations,
+        "orphaned_detection_id_count": orphaned_detection_id_count,
+        "duplicate_detection_id_count": duplicate_detection_id_count,
+        "species_rowcount": species_rowcount,
+        "video_corrections_rowcount": video_corrections_rowcount,
+    }
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="One-time migration of every existing species correction "
@@ -392,13 +537,123 @@ def main(argv=None):
 
     render_plan_report(plan, applied=False, digests=before_digests, as_json=args.json)
 
-    # Nothing in this task writes to species_corrections -- task 3 adds
-    # the apply half (four-flag gate, snapshot, audit log, reconciliation)
-    # below this exit.
     if not args.apply:
         sys.exit(0)
 
-    sys.exit(0)
+    if not args.confirm_irreversible:
+        print(
+            "ERROR: --apply requires --confirm-irreversible. This migration "
+            "writes species_corrections rows; both flags must be passed "
+            "deliberately so no single mistyped or shell-history-recalled "
+            "argument can start an irreversible pass over production.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    if not args.snapshot_dir:
+        print("ERROR: --apply requires --snapshot-dir; aborting before any write.", file=sys.stderr)
+        sys.exit(1)
+    if not args.audit_log:
+        print("ERROR: --apply requires --audit-log; aborting before any write.", file=sys.stderr)
+        sys.exit(1)
+
+    snapshot_path = os.path.join(
+        args.snapshot_dir, f"species-corrections-snapshot-{datetime.now():%Y%m%dT%H%M%S%f}.db"
+    )
+    try:
+        snapshot_db(args.db, snapshot_path)
+    except Exception as exc:
+        print(f"ERROR: pre-apply snapshot failed, aborting before any write: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        audit_handle = open_audit_log(args.audit_log)
+    except OSError as exc:
+        print(
+            f"ERROR: could not open audit log for writing, aborting before any write: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        # The nightly pipeline/web app may stay live during this run, so
+        # lock contention from a concurrent writer is a foreseeable,
+        # benign outcome -- it must fail clean (nothing written, nothing
+        # claimed in the audit log) rather than fail half-way.
+        try:
+            with database.get_conn() as conn:
+                skipped_not_newer, audit_payloads = apply_backfill(conn, plan)
+        except OperationalError as exc:
+            print(
+                f"ERROR: database is locked by a concurrent writer ({exc}); "
+                "aborting before any row was committed. No rows were "
+                "written -- this operation is idempotent, so it is safe to "
+                "retry once the lock clears.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except Exception as exc:
+            print(
+                f"ERROR: apply failed and the transaction was rolled back "
+                f"({exc}); no rows were written.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        # Commit succeeded -- only now is it true that these rows were
+        # written, so only now do we durably record it (T-11-11: an
+        # aborted run must leave no past-tense claim in the audit log).
+        for payload in audit_payloads:
+            write_audit_line(audit_handle, payload)
+
+        with database.get_conn() as conn:
+            after_digests = audit_trail_digest(conn)
+
+        mismatches = {
+            key: (before_digests[key], after_digests[key])
+            for key in before_digests
+            if before_digests[key] != after_digests[key]
+        }
+        if mismatches:
+            print(
+                "ERROR: audit_trail_digest mismatch after apply -- a "
+                "species.label or video_corrections.original_label value "
+                "changed unexpectedly. Aborting.",
+                file=sys.stderr,
+            )
+            for key, (before, after) in mismatches.items():
+                print(f"  {key}: before={before} after={after}", file=sys.stderr)
+            sys.exit(1)
+
+        with database.get_conn() as conn:
+            verification = verify_post_conditions(conn, plan)
+
+        write_audit_line(audit_handle, {
+            "event": "summary",
+            "rows_written": len(plan.rows) - skipped_not_newer,
+            "skipped_not_newer": skipped_not_newer,
+            "audit_trail_digest_species_label": after_digests["species_label"],
+            "audit_trail_digest_video_original_label": after_digests["video_original_label"],
+            "snapshot_path": snapshot_path,
+        })
+
+        plan.skipped_not_newer = skipped_not_newer
+        render_plan_report(plan, applied=True, digests=after_digests, as_json=args.json)
+        if not args.json:
+            print(f"RUNVAR: snapshot_path={snapshot_path}")
+            print(f"RUNVAR: audit_log_path={args.audit_log}")
+            print("Post-run verification:")
+            print(json.dumps(verification, sort_keys=True))
+
+        if (
+            verification["fk_violations"] != 0
+            or verification["orphaned_detection_id_count"] != 0
+            or verification["duplicate_detection_id_count"] != 0
+            or verification["row_count"] != verification["planned_count"]
+        ):
+            sys.exit(1)
+        sys.exit(0)
+    finally:
+        audit_handle.close()
 
 
 if __name__ == "__main__":
