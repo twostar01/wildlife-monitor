@@ -1652,6 +1652,12 @@ def apply_corrections_to_species(species_list: list, corrections: list) -> list:
     Post-processing: overlay video_corrections onto a species list.
     corrections is the result of get_video_corrections(video_id).
     Returns species_list with corrected entries modified in place.
+
+    Retained, unreferenced pending D-07 (legacy-table removal follow-up
+    phase): get_video_by_id() stopped calling this function in Phase 14
+    plan 14-02's read-path cutover (species_corrections is now read
+    directly via SQL) — kept defined only because the legacy table it
+    overlays stays readable (D-06) until a future removal phase.
     """
     corr_map = {c["original_label"]: c for c in corrections}
     result = []
@@ -2258,6 +2264,22 @@ def get_videos(
 
 
 def get_video_by_id(video_id: int) -> dict:
+    """
+    Every detection dict this returns (both the primary video's and, when
+    paired, the other lens's) reads species_corrections directly — no
+    Python-side correction overlay remains in this read path (retired,
+    pending D-07 removal). `label` is always the RAW SpeciesNet label;
+    `original_label` duplicates it under the name the re-correct action
+    posts back as `original_label`, so the write-time fan-out
+    (save_video_correction()) matches on the correct raw value.
+    `corrected` is HAS_CORRECTION — true for either write path (Gallery
+    popover OR video-player editor), a deliberate widening from the old
+    overlay's video-player-only signal (RESEARCH.md Pitfall 5).
+    Suppression (species_corrections.suppressed=1) is the only thing that
+    removes a row from the two SELECTs below; it does not affect any other
+    reader (get_gallery(), get_species_detail(), get_videos(),
+    get_species_list()).
+    """
     with get_conn() as conn:
         video = conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
         if not video:
@@ -2265,7 +2287,8 @@ def get_video_by_id(video_id: int) -> dict:
 
         detections = conn.execute(f"""
             SELECT d.id, d.frame_number, d.timestamp_secs, d.category, d.confidence,
-                   s.label, {EFFECTIVE_COMMON} as common_name, s.scientific_name,
+                   s.label, {EFFECTIVE_COMMON} as common_name, {EFFECTIVE_SCIENTIFIC} as scientific_name,
+                   {HAS_CORRECTION} as corrected, s.label as original_label,
                    s.top_candidates_json,
                    c.crop_path, c.quality_score
             FROM detections d
@@ -2273,14 +2296,16 @@ def get_video_by_id(video_id: int) -> dict:
             LEFT JOIN crops c ON c.detection_id = d.id
             WHERE d.video_id = ?
               AND ({KNOWN_SPECIES_FILTER} OR s.label IS NULL)
+              AND NOT {IS_SUPPRESSED_DETECTION}
             ORDER BY d.timestamp_secs
         """, (video_id,)).fetchall()
 
-        # Fetch video-level corrections and apply as post-processing layer
+        det_list = [dict(r) for r in detections]
+
+        # get_video_corrections() reads the frozen legacy correction table
+        # on purpose (RESEARCH.md Open Question 2, D-06) — kept only for
+        # this response's `corrections` key, whose shape is unchanged.
         corrections = get_video_corrections(video_id)
-        det_list    = apply_corrections_to_species(
-            [dict(r) for r in detections], corrections
-        )
 
         # Fetch paired lens video if this is a dual-lens camera
         paired = None
@@ -2290,9 +2315,10 @@ def get_video_by_id(video_id: int) -> dict:
             paired_row = conn.execute("SELECT * FROM videos WHERE id=?", (pair_id,)).fetchone()
             if paired_row:
                 paired = dict(paired_row)
-                raw_pair_dets = [dict(r) for r in conn.execute(f"""
+                pair_rows = conn.execute(f"""
                     SELECT d.id, d.frame_number, d.timestamp_secs, d.category, d.confidence,
-                           s.label, {EFFECTIVE_COMMON} as common_name, s.scientific_name,
+                           s.label, {EFFECTIVE_COMMON} as common_name, {EFFECTIVE_SCIENTIFIC} as scientific_name,
+                           {HAS_CORRECTION} as corrected, s.label as original_label,
                            s.top_candidates_json,
                            c.crop_path, c.quality_score
                     FROM detections d
@@ -2300,10 +2326,10 @@ def get_video_by_id(video_id: int) -> dict:
                     LEFT JOIN crops c ON c.detection_id = d.id
                     WHERE d.video_id = ?
                       AND ({KNOWN_SPECIES_FILTER} OR s.label IS NULL)
+                      AND NOT {IS_SUPPRESSED_DETECTION}
                     ORDER BY d.timestamp_secs
-                """, (pair_id,)).fetchall()]
-                pair_corrections = get_video_corrections(pair_id)
-                pair_detections  = apply_corrections_to_species(raw_pair_dets, pair_corrections)
+                """, (pair_id,)).fetchall()
+                pair_detections = [dict(r) for r in pair_rows]
 
         return {
             "video":           dict(video),
