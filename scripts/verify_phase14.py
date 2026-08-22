@@ -671,10 +671,203 @@ def suite_fanout():
     return (passed, total)
 
 
+# ── `suppress` suite fixture ─────────────────────────────────────────────
+
+
+def _seed_suppress_fixture(path):
+    """Build the `suppress` suite's fixture: two videos on camera "World
+    Watch".
+      - video1: det_dog (label "domestic dog") and det_cat (label
+        "domestic cat") — S1-S3 suppress det_dog via the video-player path
+        and confirm det_cat is unaffected and det_dog's ORIGINAL name still
+        shows outside the video player.
+      - video2: det_raccoon (label "raccoon", corrected via the GALLERY
+        popover — S4/S6) and det_unknown (label "Unknown species", S5)
+        sharing the same video, so KNOWN_SPECIES_FILTER's
+        suppress-unknown-if-identified disjunct genuinely fires for
+        det_unknown before any correction (a real sibling-detection case,
+        not an isolated one).
+    Returns a dict of the real autoincrement ids assigned to each row.
+    """
+    database.set_db_path(path)
+    database.init_db(path)
+    now = "2026-08-22T05:00:00"
+
+    with database.get_conn() as conn:
+
+        def _insert_video(filename):
+            conn.execute(
+                "INSERT INTO videos (filename, camera_name, kept, recorded_at, lens_index, processed_at) "
+                "VALUES (?, ?, 1, ?, 0, ?)",
+                (filename, "World Watch", now, now),
+            )
+            return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        def _add_detection(video_id, label, common_name, scientific_name, confidence=0.9):
+            conn.execute(
+                "INSERT INTO detections (video_id, category, confidence) VALUES (?, 'animal', ?)",
+                (video_id, confidence),
+            )
+            det_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                "INSERT INTO species (detection_id, label, common_name, scientific_name, confidence) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (det_id, label, common_name, scientific_name, confidence),
+            )
+            conn.execute(
+                "INSERT INTO crops (detection_id, crop_path, quality_score, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (det_id, f"fixture14s_crop_{det_id}.jpg", 80.0, now),
+            )
+            return det_id
+
+        video1 = _insert_video("WorldWatch_00_videos1.mp4")
+        video2 = _insert_video("WorldWatch_00_videos2.mp4")
+
+        det_dog = _add_detection(video1, "domestic dog", "Domestic Dog", "Canis familiaris")
+        det_cat = _add_detection(video1, "domestic cat", "Domestic Cat", "Felis catus")
+        det_raccoon = _add_detection(video2, "raccoon", "Raccoon", "Procyon lotor")
+        det_unknown = _add_detection(video2, "Unknown species", None, None, 0.3)
+
+    return {
+        "video1": video1,
+        "video2": video2,
+        "det_dog": det_dog,
+        "det_cat": det_cat,
+        "det_raccoon": det_raccoon,
+        "det_unknown": det_unknown,
+    }
+
+
+def suite_suppress():
+    """`suppress` suite cases S1-S6 (6 total). See module docstring."""
+    passed = 0
+    total = 6
+
+    original_db_path = database.get_db_path()
+    tmpdir_obj = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    try:
+        db_path = os.path.join(tmpdir_obj.name, "suppress.db")
+        ids = _seed_suppress_fixture(db_path)
+        video1, video2 = ids["video1"], ids["video2"]
+        det_dog, det_cat = ids["det_dog"], ids["det_cat"]
+        det_raccoon, det_unknown = ids["det_raccoon"], ids["det_unknown"]
+
+        def _gallery_item(det_id):
+            items = database.get_gallery(per_page=100)["items"]
+            return next((it for it in items if it.get("detection_id") == det_id), None)
+
+        def _species_detail_crop(label, det_id):
+            crops = database.get_species_detail(label)["crops"]
+            return next((c for c in crops if c.get("detection_id") == det_id), None)
+
+        def _video_detection(video_id, det_id):
+            dets = database.get_video_by_id(video_id)["detections"]
+            return next((d for d in dets if d.get("id") == det_id), None)
+
+        def _correction_row(det_id):
+            with database.get_conn() as conn:
+                row = conn.execute(
+                    "SELECT * FROM species_corrections WHERE detection_id=?", (det_id,)
+                ).fetchone()
+            return dict(row) if row else None
+
+        # S1 — save_video_correction(video, label, None, None, None) writes
+        # species_corrections rows with suppressed=1 for every matching
+        # detection.
+        case_id = "S1"
+        applied = database.save_video_correction(video1, "domestic dog", None, None, None)
+        row_dog = _correction_row(det_dog)
+        ok = applied == 1 and row_dog is not None and row_dog["suppressed"] == 1
+        _check(case_id, ok, f"applied={applied}, row_dog={row_dog}")
+        if ok:
+            passed += 1
+
+        # S2 — the suppressed detection is absent from
+        # get_video_by_id(video)["detections"].
+        case_id = "S2"
+        vdet_dog = _video_detection(video1, det_dog)
+        ok = vdet_dog is None
+        _check(case_id, ok, f"vdet_dog={vdet_dog}")
+        if ok:
+            passed += 1
+
+        # S3 — the same detection is still present in get_gallery() and
+        # get_species_detail(label)["crops"], displaying its ORIGINAL
+        # common name — suppression hides a species inside the video
+        # player only.
+        case_id = "S3"
+        item_dog = _gallery_item(det_dog)
+        detail_dog = _species_detail_crop("domestic dog", det_dog)
+        ok = (
+            item_dog is not None
+            and item_dog.get("common_name") == "Domestic Dog"
+            and detail_dog is not None
+            and detail_dog.get("common_name") == "Domestic Dog"
+        )
+        _check(case_id, ok, f"item_dog={item_dog}, detail_dog={detail_dog}")
+        if ok:
+            passed += 1
+
+        # S4 — a Gallery-sourced row (corrected_label NULL, suppressed=0)
+        # is NOT hidden by get_video_by_id() — the NULL label is not
+        # mistaken for a suppress sentinel.
+        case_id = "S4"
+        rc = database.correct_species(det_raccoon, "Northern Raccoon", "Procyon lotor")
+        vdet_raccoon = _video_detection(video2, det_raccoon)
+        ok = rc == 1 and vdet_raccoon is not None
+        _check(case_id, ok, f"rc={rc}, vdet_raccoon={vdet_raccoon}")
+        if ok:
+            passed += 1
+
+        # S5 — an "Unknown species" detection on a video that also has a
+        # known species is suppressed before correction, and is visible
+        # after a Gallery correction (NOT_EFFECTIVELY_UNKNOWN still
+        # resolves through the unified table — the FIX-01 behaviour must
+        # survive).
+        case_id = "S5"
+        vdet_unknown_before = _video_detection(video2, det_unknown)
+        rc_unknown = database.correct_species(det_unknown, "Bobcat", "Lynx rufus")
+        vdet_unknown_after = _video_detection(video2, det_unknown)
+        ok = (
+            vdet_unknown_before is None
+            and rc_unknown == 1
+            and vdet_unknown_after is not None
+        )
+        _check(case_id, ok, f"before={vdet_unknown_before}, after={vdet_unknown_after}")
+        if ok:
+            passed += 1
+
+        # S6 — get_video_by_id()'s detection dicts carry `corrected` truthy
+        # for a Gallery-only correction (RESEARCH.md Pitfall 5's
+        # intentional widening), carry the RAW s.label in `label`, carry
+        # the raw label in `original_label`, and carry the corrected
+        # values in both `common_name` and `scientific_name`.
+        case_id = "S6"
+        vdet_raccoon2 = _video_detection(video2, det_raccoon)
+        ok = (
+            vdet_raccoon2 is not None
+            and bool(vdet_raccoon2.get("corrected"))
+            and vdet_raccoon2.get("label") == "raccoon"
+            and vdet_raccoon2.get("original_label") == "raccoon"
+            and vdet_raccoon2.get("common_name") == "Northern Raccoon"
+            and vdet_raccoon2.get("scientific_name") == "Procyon lotor"
+        )
+        _check(case_id, ok, f"vdet_raccoon2={vdet_raccoon2}")
+        if ok:
+            passed += 1
+    finally:
+        database.set_db_path(original_db_path)
+        tmpdir_obj.cleanup()
+
+    return (passed, total)
+
+
 SUITES = {
     "unified": (suite_unified, 7),
     "audit": (suite_audit, 5),
     "fanout": (suite_fanout, 6),
+    "suppress": (suite_suppress, 6),
 }
 
 
