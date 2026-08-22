@@ -586,22 +586,35 @@ def suite_fanout():
             passed += 1
 
         # FO3 — re-saving the same video correction with different values
-        # updates the existing rows in place (UPSERT); the row count for
-        # this video's original two detections is unchanged.
+        # updates det_cat_1/det_cat_2's EXISTING rows in place (UPSERT, not
+        # a duplicate insert — each stays at exactly one row). This fresh
+        # save also now matches det_cat_3 (FO2's later-added detection) —
+        # that's correct, not a regression: FO2 pinned that det_cat_3 did
+        # NOT retroactively inherit FO1's already-executed correction, but
+        # a brand new save_video_correction() call is a fresh operator
+        # action and fans out over whatever currently matches, det_cat_3
+        # included.
         case_id = "FO3"
         applied2 = database.save_video_correction(
             video, "domestic cat", "Bobcat", "Bobcat", "Lynx rufus"
         )
         rows_1_after = _correction_rows(det_cat_1)
         rows_2_after = _correction_rows(det_cat_2)
+        rows_3_after = _correction_rows(det_cat_3)
         ok = (
-            applied2 == 2
+            applied2 == 3
             and len(rows_1_after) == 1
             and rows_1_after[0]["corrected_label"] == "Bobcat"
             and len(rows_2_after) == 1
             and rows_2_after[0]["corrected_label"] == "Bobcat"
+            and len(rows_3_after) == 1
+            and rows_3_after[0]["corrected_label"] == "Bobcat"
         )
-        _check(case_id, ok, f"applied2={applied2}, rows_1_after={rows_1_after}, rows_2_after={rows_2_after}")
+        _check(
+            case_id, ok,
+            f"applied2={applied2}, rows_1_after={rows_1_after}, "
+            f"rows_2_after={rows_2_after}, rows_3_after={rows_3_after}",
+        )
         if ok:
             passed += 1
 

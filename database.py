@@ -1534,6 +1534,26 @@ def clear_reprocess_flag(video_id: int):
         conn.execute("UPDATE videos SET needs_reprocess=0 WHERE id=?", (video_id,))
 
 
+def _fanout_detection_ids(conn, video_id: int, original_label: str) -> list:
+    """
+    Return the list of detection ids matching (video_id, original_label) at
+    this moment — the video-player write path's fan-out target set (D-01).
+
+    This predicate MUST stay character-for-character identical to
+    HAS_VIDEO_CORRECTION's correlated subquery match (d.video_id equality
+    plus raw s.label equality, database.py's HAS_VIDEO_CORRECTION comment
+    block) — plan 14-03's backfill script uses the identical predicate, and
+    the two drifting apart is the single highest-value invariant in this
+    phase.
+    """
+    rows = conn.execute(
+        "SELECT d.id FROM detections d JOIN species s ON s.detection_id = d.id "
+        "WHERE d.video_id = ? AND s.label = ?",
+        (video_id, original_label),
+    ).fetchall()
+    return [r[0] for r in rows]
+
+
 def save_video_correction(
     video_id: int,
     original_label: str,
@@ -1543,32 +1563,74 @@ def save_video_correction(
     note: str = "",
 ) -> Optional[int]:
     """
-    Save or update a video-level species correction. Returns the new
-    correction's row id, or None if video_id doesn't reference an existing
-    video — the INSERT itself would otherwise always "succeed" for any
-    video_id, giving the API layer no signal that nothing meaningful
-    happened for a nonexistent video (IN-02).
+    Fan out a video-level species correction (video-player per-crop editor
+    write path) into one species_corrections row per detection currently
+    matching (video_id, original_label) — a write-time SNAPSHOT (D-01): a
+    detection added to this video+label group later does NOT inherit this
+    correction; the operator must reapply it.
+
+    Returns the number of detections this correction was applied to (an
+    int; 0 when original_label matches no current detection on an existing
+    video), or None if video_id doesn't reference an existing video — the
+    caller's `is None` 404 guard (IN-02) is preserved unchanged; 0 is not
+    None, so a no-match save still returns cleanly rather than raising.
+
+    corrected_label=None fans out as suppressed=1 rows (the video player's
+    "Suppress this species" action, D-06's replacement for the legacy
+    correction table's NULL-corrected_label sentinel); any other
+    corrected_label fans out as suppressed=0. A single
+    datetime.now().isoformat() timestamp is stamped once, before the
+    fan-out loop, and shared by every row this save writes via
+    conn.executemany — an intra-fan-out timestamp skew would make D-03
+    precedence non-deterministic within a single save. This duplicates
+    _upsert_species_correction()'s UPSERT SQL literal rather than calling
+    that helper per detection id, precisely so one shared stamp (not one
+    freshly computed per call) is used across the whole fan-out.
+
+    Does not write to the legacy correction table at all (D-06 freeze) —
+    that table is frozen read-only from this phase forward.
     """
     with get_conn() as conn:
         exists = conn.execute("SELECT 1 FROM videos WHERE id=?", (video_id,)).fetchone()
         if not exists:
             return None
-        # Replace existing correction for same video+original_label
-        conn.execute("""
-            DELETE FROM video_corrections
-            WHERE video_id=? AND original_label=?
-        """, (video_id, original_label))
-        cur = conn.execute("""
-            INSERT INTO video_corrections
-            (video_id, original_label, corrected_label, corrected_common,
-             corrected_scientific, corrected_at, note)
-            VALUES (?,?,?,?,?,?,?)
-        """, (video_id, original_label, corrected_label, corrected_common,
-               corrected_scientific, datetime.now().isoformat(), note))
-    return cur.lastrowid
+        detection_ids = _fanout_detection_ids(conn, video_id, original_label)
+        suppressed = 1 if corrected_label is None else 0
+        stamp = datetime.now().isoformat()
+        conn.executemany(
+            """INSERT INTO species_corrections
+               (detection_id, corrected_label, corrected_common, corrected_scientific,
+                suppressed, source, corrected_at, note)
+               VALUES (?,?,?,?,?,?,?,?)
+               ON CONFLICT(detection_id) DO UPDATE SET
+                 corrected_label=excluded.corrected_label,
+                 corrected_common=excluded.corrected_common,
+                 corrected_scientific=excluded.corrected_scientific,
+                 suppressed=excluded.suppressed,
+                 source=excluded.source,
+                 corrected_at=excluded.corrected_at,
+                 note=excluded.note""",
+            [
+                (
+                    det_id, corrected_label, corrected_common, corrected_scientific,
+                    suppressed, "video_player", stamp, note,
+                )
+                for det_id in detection_ids
+            ],
+        )
+    return len(detection_ids)
 
 
 def get_video_corrections(video_id: int) -> list:
+    """
+    Read the frozen legacy video_corrections table for video_id (D-06: still
+    readable, never written, by any code path after Phase 14's cutover).
+    GET /api/corrections?video_id= has no frontend caller (grep-verified —
+    static/index.html's only reference to '/api/corrections' is the POST in
+    applyCorrection()), so this is deliberately left reading the frozen
+    table rather than rewired to species_corrections (RESEARCH.md Open
+    Question 2).
+    """
     with get_conn() as conn:
         rows = conn.execute(
             "SELECT * FROM video_corrections WHERE video_id=? ORDER BY corrected_at",
@@ -1577,9 +1639,12 @@ def get_video_corrections(video_id: int) -> list:
     return [dict(r) for r in rows]
 
 
-def delete_video_correction(correction_id: int):
+def delete_correction(correction_id: int):
+    """Delete a single species_corrections row by id (replaces
+    delete_video_correction() — D-00/CORR-01, the unified table is the only
+    one any write path targets after Phase 14's cutover)."""
     with get_conn() as conn:
-        conn.execute("DELETE FROM video_corrections WHERE id=?", (correction_id,))
+        conn.execute("DELETE FROM species_corrections WHERE id=?", (correction_id,))
 
 
 def apply_corrections_to_species(species_list: list, corrections: list) -> list:

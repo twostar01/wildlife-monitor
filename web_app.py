@@ -713,25 +713,26 @@ def api_get_corrections(video_id: int = Query(None)):
 
 @app.post("/api/corrections")
 def api_save_correction(req: CorrectionRequest):
-    correction_id = db.save_video_correction(
+    applied_count = db.save_video_correction(
         req.video_id, req.original_label, req.corrected_label,
         req.corrected_common, req.corrected_scientific, req.note or ""
     )
     # None means video_id didn't reference an existing video — previously
     # this still returned {"ok": True} with no signal that nothing
-    # meaningful happened (IN-02).
-    if correction_id is None:
+    # meaningful happened (IN-02). 0 (a matched-nothing fan-out) is not
+    # None, so it does not 404 here.
+    if applied_count is None:
         raise HTTPException(404, "Video not found")
     log.info(
-        "Video correction saved: id=%s video_id=%s original=%s corrected=%s",
-        correction_id, req.video_id, req.original_label, req.corrected_label,
+        "Video correction saved: detections=%s video_id=%s original=%s corrected=%s",
+        applied_count, req.video_id, req.original_label, req.corrected_label,
     )
-    return {"ok": True, "id": correction_id}
+    return {"ok": True, "detections": applied_count}
 
 
 @app.delete("/api/corrections/{correction_id}")
 def api_delete_correction(correction_id: int):
-    db.delete_video_correction(correction_id)
+    db.delete_correction(correction_id)
     log.info("Video correction delete requested: correction_id=%s", correction_id)
     return {"ok": True}
 
