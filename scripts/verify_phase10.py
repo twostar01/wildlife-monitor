@@ -210,7 +210,15 @@ def suite_fix01():
         if ok:
             passed += 1
 
-        # F4 — video-player write path. Expected RED now.
+        # F4 — video-player write path. Revised for Phase 14 plan 14-02's
+        # get_video_by_id() cutover: `label` is now the RAW SpeciesNet
+        # label ("Unknown species"), not the corrected label the old
+        # Python-side overlay used to substitute — a re-correction posts
+        # `label` back as `original_label`, and the write-time fan-out
+        # (save_video_correction()) matches on the raw label, so the raw
+        # value must survive in the response. `original_label` duplicates
+        # the same raw value under its own key. `common_name` and
+        # `corrected` are unaffected by this change.
         case_id = "F4"
         database.correct_species(d2, "", "")
         database.save_video_correction(
@@ -220,20 +228,28 @@ def suite_fix01():
         row = _det_by_id(dets, d2)
         ok = (
             row is not None
-            and row.get("label") == "raccoon_fixture"
+            and row.get("label") == "Unknown species"
             and row.get("common_name") == "Northern Raccoon"
+            and row.get("original_label") == "Unknown species"
             and bool(row.get("corrected"))
         )
         _check(case_id, ok, f"row={row}")
         if ok:
             passed += 1
 
-        # F5 — cleared correction re-suppresses. Must pass before and after.
+        # F5 — cleared correction re-suppresses. Must pass before and
+        # after. Revised for Phase 14: the video-player correction now
+        # lives in the unified species_corrections table (not the frozen
+        # legacy video_corrections table), so the delete targets that row
+        # directly by detection_id instead of the old raw DELETE against
+        # video_corrections — the case's intent ("the video-player
+        # correction is removed, then the Gallery correction is cleared,
+        # so the row re-suppresses") is unchanged.
         case_id = "F5"
         with database.get_conn() as conn:
             conn.execute(
-                "DELETE FROM video_corrections WHERE video_id=? AND original_label=?",
-                (video1, "Unknown species"),
+                "DELETE FROM species_corrections WHERE detection_id=?",
+                (d2,),
             )
         database.correct_species(d2, "", "")
         dets = database.get_video_by_id(video1)["detections"]

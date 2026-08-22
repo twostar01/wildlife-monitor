@@ -863,11 +863,171 @@ def suite_suppress():
     return (passed, total)
 
 
+# ── `precedence` suite fixture ───────────────────────────────────────────
+
+
+def _seed_precedence_fixture(path):
+    """Build the `precedence` suite's fixture: two videos, each with one
+    "domestic cat" detection, so the two write-order directions (PR1
+    Gallery-then-video, PR2 video-then-Gallery) cannot contaminate each
+    other. Returns a dict of the real autoincrement ids assigned to each
+    row."""
+    database.set_db_path(path)
+    database.init_db(path)
+    now = "2026-08-22T06:00:00"
+
+    with database.get_conn() as conn:
+
+        def _insert_video(filename):
+            conn.execute(
+                "INSERT INTO videos (filename, camera_name, kept, recorded_at, lens_index, processed_at) "
+                "VALUES (?, ?, 1, ?, 0, ?)",
+                (filename, "World Watch", now, now),
+            )
+            return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+        def _add_detection(video_id, label, common_name, scientific_name, confidence=0.9):
+            conn.execute(
+                "INSERT INTO detections (video_id, category, confidence) VALUES (?, 'animal', ?)",
+                (video_id, confidence),
+            )
+            det_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                "INSERT INTO species (detection_id, label, common_name, scientific_name, confidence) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (det_id, label, common_name, scientific_name, confidence),
+            )
+            conn.execute(
+                "INSERT INTO crops (detection_id, crop_path, quality_score, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (det_id, f"fixture14pr_crop_{det_id}.jpg", 80.0, now),
+            )
+            return det_id
+
+        video_x = _insert_video("WorldWatch_00_videopx.mp4")
+        video_y = _insert_video("WorldWatch_00_videopy.mp4")
+
+        det_x = _add_detection(video_x, "domestic cat", "Domestic Cat", "Felis catus")
+        det_y = _add_detection(video_y, "domestic cat", "Domestic Cat", "Felis catus")
+
+    return {"video_x": video_x, "video_y": video_y, "det_x": det_x, "det_y": det_y}
+
+
+def suite_precedence():
+    """`precedence` suite cases PR1-PR4 (4 total). See module docstring.
+    Drives every write through the real database.correct_species()/
+    database.save_video_correction() functions — never raw SQL — so this
+    suite tests the shipped write paths rather than a restatement of them.
+    """
+    passed = 0
+    total = 4
+
+    original_db_path = database.get_db_path()
+    tmpdir_obj = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    try:
+        db_path = os.path.join(tmpdir_obj.name, "precedence.db")
+        ids = _seed_precedence_fixture(db_path)
+        video_x, video_y = ids["video_x"], ids["video_y"]
+        det_x, det_y = ids["det_x"], ids["det_y"]
+
+        def _gallery_item(det_id):
+            items = database.get_gallery(per_page=100)["items"]
+            return next((it for it in items if it.get("detection_id") == det_id), None)
+
+        def _video_detection(video_id, det_id):
+            dets = database.get_video_by_id(video_id)["detections"]
+            return next((d for d in dets if d.get("id") == det_id), None)
+
+        def _correction_rows(det_id):
+            with database.get_conn() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM species_corrections WHERE detection_id=?", (det_id,)
+                ).fetchall()
+            return [dict(r) for r in rows]
+
+        # PR1 — Gallery first, video-player second on X. Under D-03 recency
+        # the LAST write wins: both readers report the video-player value;
+        # the single row for X has source='video_player'.
+        database.correct_species(det_x, "Bobcat", "Lynx rufus")
+        database.save_video_correction(
+            video_x, "domestic cat", "Northern raccoon", "Northern Raccoon", "Procyon lotor"
+        )
+        item_x = _gallery_item(det_x)
+        vdet_x = _video_detection(video_x, det_x)
+        rows_x = _correction_rows(det_x)
+        case_id = "PR1"
+        ok = (
+            item_x is not None
+            and item_x.get("common_name") == "Northern Raccoon"
+            and vdet_x is not None
+            and vdet_x.get("common_name") == "Northern Raccoon"
+            and len(rows_x) == 1
+            and rows_x[0]["source"] == "video_player"
+        )
+        _check(case_id, ok, f"item_x={item_x}, vdet_x={vdet_x}, rows_x={rows_x}")
+        if ok:
+            passed += 1
+
+        # PR2 — video-player first, Gallery second on Y (the reverse
+        # direction — the one a previously-shipped "video always wins"
+        # ordering got backwards). Both readers report the Gallery value;
+        # the single row for Y has source='gallery'.
+        database.save_video_correction(
+            video_y, "domestic cat", "Northern raccoon", "Northern Raccoon", "Procyon lotor"
+        )
+        database.correct_species(det_y, "Bobcat", "Lynx rufus")
+        item_y = _gallery_item(det_y)
+        vdet_y = _video_detection(video_y, det_y)
+        rows_y = _correction_rows(det_y)
+        case_id = "PR2"
+        ok = (
+            item_y is not None
+            and item_y.get("common_name") == "Bobcat"
+            and vdet_y is not None
+            and vdet_y.get("common_name") == "Bobcat"
+            and len(rows_y) == 1
+            and rows_y[0]["source"] == "gallery"
+        )
+        _check(case_id, ok, f"item_y={item_y}, vdet_y={vdet_y}, rows_y={rows_y}")
+        if ok:
+            passed += 1
+
+        # PR3 — get_gallery() and get_video_by_id() never disagree about
+        # either detection's displayed common name, asserted together so
+        # the two readers cannot drift apart.
+        case_id = "PR3"
+        ok = (
+            item_x is not None
+            and vdet_x is not None
+            and item_x.get("common_name") == vdet_x.get("common_name")
+            and item_y is not None
+            and vdet_y is not None
+            and item_y.get("common_name") == vdet_y.get("common_name")
+        )
+        _check(case_id, ok, f"item_x={item_x}, vdet_x={vdet_x}, item_y={item_y}, vdet_y={vdet_y}")
+        if ok:
+            passed += 1
+
+        # PR4 — each of X and Y has exactly one species_corrections row;
+        # neither has two.
+        case_id = "PR4"
+        ok = len(rows_x) == 1 and len(rows_y) == 1
+        _check(case_id, ok, f"rows_x={rows_x}, rows_y={rows_y}")
+        if ok:
+            passed += 1
+    finally:
+        database.set_db_path(original_db_path)
+        tmpdir_obj.cleanup()
+
+    return (passed, total)
+
+
 SUITES = {
     "unified": (suite_unified, 7),
     "audit": (suite_audit, 5),
     "fanout": (suite_fanout, 6),
     "suppress": (suite_suppress, 6),
+    "precedence": (suite_precedence, 4),
 }
 
 

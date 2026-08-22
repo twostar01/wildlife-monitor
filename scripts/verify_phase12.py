@@ -108,13 +108,16 @@ def _strip_comment_lines(text):
 def _seed_fixture_db(path):
     """Build the shared badge/propagation fixture: one camera "World Watch".
       - video A / detection dA, species label "domestic cat" — a
-        video_corrections row (video_id=A, original_label="domestic cat",
-        corrected_label="Northern raccoon") is seeded here, i.e. the
-        VIDEO PLAYER path. species.corrected_at stays NULL. Filename
-        "WorldWatch_00_videoA.mp4" is already distinguishable from every
-        other video in this fixture (substring search matches only this
-        row) — plan 12-03's case P6 relies on that, no further change
-        needed.
+        VIDEO-PLAYER-path correction (original_label="domestic cat",
+        corrected_label="Northern raccoon") is seeded here via the real
+        database.save_video_correction() write path (Phase 14 plan 14-02:
+        the unified species_corrections table is the only one any write
+        path targets — seeding through the frozen legacy table directly
+        would no longer be read by anything). species.corrected_at stays
+        NULL. Filename "WorldWatch_00_videoA.mp4" is already
+        distinguishable from every other video in this fixture (substring
+        search matches only this row) — plan 12-03's case P6 relies on
+        that, no further change needed.
       - video B / detection dB, species label "domestic cat" — left
         UNCORRECTED by this helper; suite_badge() and suite_propagation()
         each apply the GALLERY POPOVER correction (via the real
@@ -125,22 +128,35 @@ def _seed_fixture_db(path):
         correction of either kind. species.confidence is 0.0, anchoring
         the zero-confidence display case downstream (task 2/U4).
       - video C additionally carries detection dD, species label
-        "domestic cat", plus a video_corrections row with corrected_label
-        NULL — the suppress sentinel (video_corrections.corrected_label
-        schema comment: "NULL means suppress").
+        "domestic cat", plus a video-player SUPPRESS action
+        (database.save_video_correction() with corrected_label=None) —
+        the species_corrections.suppressed column is the sentinel now
+        (Phase 14 D-00's dedicated column, replacing the legacy table's
+        NULL-corrected_label convention).
       - video E / detection dE, species label "domestic cat" — carries
-        BOTH a species.user_common_name correction ("Bobcat", via the real
-        database.correct_species() write path, applied below the INSERT
-        block so it runs in its own committed transaction) AND a
-        video_corrections row (corrected_label="Northern raccoon",
-        corrected_common="Northern Raccoon") — plan 12-03's case P8, the
-        both-paths precedence collision.
+        BOTH a video-player correction (corrected_label="Northern
+        raccoon", corrected_common="Northern Raccoon", written FIRST via
+        database.save_video_correction()) AND a Gallery-popover correction
+        ("Bobcat", via database.correct_species(), applied SECOND, below
+        the INSERT block so it runs in its own committed transaction) —
+        plan 12-03's case P8, the both-paths precedence collision. Under
+        Phase 14's D-03 (plain recency wins, UNIQUE(detection_id) UPSERT),
+        the LAST write — the Gallery correction — now wins the slot; see
+        case P8's revised assertion below.
       - video F / detection dF, species label "domestic cat" — a
-        video_corrections row whose corrected_label is set (a real
+        video-player correction whose corrected_label is set (a real
         correction, not a suppress sentinel) but whose corrected_common is
         the empty string — plan 12-03's case P9, the blank-corrected-name
         guard.
     Returns a dict of the real autoincrement ids assigned to each row.
+
+    Every video-player-path correction above is written through the real
+    database.save_video_correction() write path, not a raw INSERT against
+    the frozen legacy correction table — each call opens its own
+    get_conn(), so (per Phase 14 plan 14-02's task 3) every one of these
+    calls runs AFTER the INSERT block below has committed, mirroring the
+    same hazard this function's comment already documented for the
+    Gallery-popover correct_species(d_e, ...) call.
 
     Adding video E/F to this shared fixture is a deliberate, plan-12-03-
     directed choice, not an oversight — see the corresponding <action> in
@@ -201,49 +217,41 @@ def _seed_fixture_db(path):
         d_e = _add_detection(video_e, "domestic cat", "Domestic Cat")
         d_f = _add_detection(video_f, "domestic cat", "Domestic Cat")
 
-        # Video-player-path correction on video A (dA).
-        conn.execute(
-            "INSERT INTO video_corrections "
-            "(video_id, original_label, corrected_label, corrected_common, "
-            " corrected_scientific, corrected_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (video_a, "domestic cat", "Northern raccoon", "Northern Raccoon", "Procyon lotor", now),
-        )
+    # Every video-player-path correction below is written through the real
+    # database.save_video_correction() write path, deliberately run in ITS
+    # OWN transaction, AFTER the INSERT block above has committed —
+    # save_video_correction() opens its own get_conn(), and calling it
+    # while the block above's connection is still open would be a second
+    # writer against an uncommitted transaction on the same file (the same
+    # hazard this function's docstring already documented for the
+    # correct_species(d_e, ...) call below).
 
-        # Suppression sentinel on video C for dD's label — corrected_label
-        # NULL means "suppress", not "corrected".
-        conn.execute(
-            "INSERT INTO video_corrections "
-            "(video_id, original_label, corrected_label, corrected_common, "
-            " corrected_scientific, corrected_at) VALUES (?, ?, NULL, NULL, NULL, ?)",
-            (video_c, "domestic cat", now),
-        )
+    # Video-player-path correction on video A (dA).
+    database.save_video_correction(
+        video_a, "domestic cat", "Northern raccoon", "Northern Raccoon", "Procyon lotor",
+    )
 
-        # Video-player-path correction on video E (dE) — the precedence
-        # half of case P8. The species.user_common_name half ("Bobcat") is
-        # applied via correct_species() below, after this INSERT block
-        # commits.
-        conn.execute(
-            "INSERT INTO video_corrections "
-            "(video_id, original_label, corrected_label, corrected_common, "
-            " corrected_scientific, corrected_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (video_e, "domestic cat", "Northern raccoon", "Northern Raccoon", "Procyon lotor", now),
-        )
+    # Suppression sentinel on video C for dD's label — corrected_label=None
+    # fans out as species_corrections.suppressed=1.
+    database.save_video_correction(video_c, "domestic cat", None, None, None)
 
-        # Blank-corrected-name case on video F (dF) — corrected_label is a
-        # real (non-NULL, non-suppress) correction, but corrected_common is
-        # the empty string. Case P9's second half.
-        conn.execute(
-            "INSERT INTO video_corrections "
-            "(video_id, original_label, corrected_label, corrected_common, "
-            " corrected_scientific, corrected_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (video_f, "domestic cat", "Northern raccoon", "", "", now),
-        )
+    # Video-player-path correction on video E (dE) — the precedence half
+    # of case P8, written FIRST. The Gallery-popover correction ("Bobcat")
+    # is applied via correct_species() below, SECOND — under Phase 14's
+    # D-03 (plain recency wins), the Gallery write now wins the
+    # UNIQUE(detection_id) slot.
+    database.save_video_correction(
+        video_e, "domestic cat", "Northern raccoon", "Northern Raccoon", "Procyon lotor",
+    )
 
-    # Gallery-popover correction on video E's species row. Deliberately run
-    # in its OWN transaction, after the INSERT block above has committed —
-    # correct_species() opens its own get_conn(), and calling it while the
-    # block above's connection is still open would be a second writer
-    # against an uncommitted transaction on the same file.
+    # Blank-corrected-name case on video F (dF) — corrected_label is a
+    # real (non-NULL, non-suppress) correction, but corrected_common is
+    # the empty string. Case P9's second half.
+    database.save_video_correction(video_f, "domestic cat", "Northern raccoon", "", "")
+
+    # Gallery-popover correction on video E's species row, written SECOND
+    # (after the video-player correction above) — the D-03 recency-wins
+    # write order case P8 pins.
     database.correct_species(d_e, "Bobcat", "Lynx rufus")
 
     return {
@@ -697,22 +705,27 @@ def suite_propagation():
         if ok:
             passed += 1
 
-        # P8 — precedence: get_gallery()'s row for dE returns "Northern
-        # Raccoon" (the video_corrections value), NOT "Bobcat" (the
-        # species.user_common_name value) — matching get_video_by_id(E)'s
-        # existing behaviour, which this same case asserts alongside so the
-        # two can never drift apart. The get_video_by_id() half is green
-        # from the start (same reason as P7); the get_gallery() half is RED
-        # until task 2, so the combined case only turns fully green then.
+        # P8 — precedence, revised for Phase 14's D-03 (plain recency
+        # wins, UNIQUE(detection_id) UPSERT): this case previously pinned
+        # the opposite ordering — the video-player value ("Northern
+        # Raccoon") beating the species.user_common_name value ("Bobcat")
+        # unconditionally, regardless of write order, which is what the
+        # pre-Phase-14 read-time "video always wins" COALESCE chain
+        # produced. Phase 14 replaced that with write-time recency: in
+        # this fixture the video-player correction is written FIRST and
+        # the Gallery correction SECOND (see _seed_fixture_db()'s comment),
+        # so under D-03 the LAST write — Gallery's "Bobcat" — now wins.
+        # get_gallery() and get_video_by_id() must agree; that guarantee is
+        # exactly what this combined case still exists to pin.
         case_id = "P8"
         item_e = _gallery_item(d_e)
         detail_e = database.get_video_by_id(video_e)
         det_e = next((d for d in detail_e["detections"] if d.get("id") == d_e), None)
         ok = (
             item_e is not None
-            and item_e.get("common_name") == "Northern Raccoon"
+            and item_e.get("common_name") == "Bobcat"
             and det_e is not None
-            and det_e.get("common_name") == "Northern Raccoon"
+            and det_e.get("common_name") == "Bobcat"
         )
         _check(case_id, ok, f"item_e={item_e}, det_e={det_e}")
         if ok:
