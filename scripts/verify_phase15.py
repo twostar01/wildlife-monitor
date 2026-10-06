@@ -28,6 +28,8 @@ Suites:
                          checks on static/index.html: the stale-key guard in
                          openSpecies, sorted dropdowns that keep the active
                          filter, and the display-name gallery chip (FE1-FE9).
+    live               — plan 15-03: HTTP GET proof against a running service
+                         (LV1-LV5); explicit `--suite live` only, never in all.
     audit              — read-only run of the same invariants plus per-reader
                          timing against a real database (AU1-AU4). SKIPs when
                          the database file is absent; GR6 self-tests it on
@@ -48,8 +50,9 @@ Never call a database.* function ad hoc without database.set_db_path(<temp
 file>) first: sqlite3.connect would otherwise create data/wildlife.db.
 
 Usage:
-    python scripts/verify_phase15.py --suite lockstep|grouping|audit|blacklist_suppress|edges|frontend_src|all
+    python scripts/verify_phase15.py --suite lockstep|grouping|audit|blacklist_suppress|edges|frontend_src|live|all
     python scripts/verify_phase15.py --suite audit --db data/wildlife.db
+    python scripts/verify_phase15.py --suite live --base-url http://localhost:8080
     python scripts/verify_phase15.py --list
 """
 
@@ -1445,6 +1448,110 @@ def suite_frontend_src():
     return (passed, total)
 
 
+# ── live suite (plan 15-03) ──────────────────────────────────────────────
+
+LIVE_TIMEOUT_SECS = 30
+
+
+def _live_get(base_url, path):
+    """HTTP GET returning (status, body_text). Raises nothing: any transport
+    failure is returned as (None, one-line reason)."""
+    import urllib.error
+    import urllib.request
+    url = base_url.rstrip("/") + path
+    try:
+        with urllib.request.urlopen(url, timeout=LIVE_TIMEOUT_SECS) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, ""
+    except Exception as exc:  # URLError, timeout, connection refused, ...
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _live_json(base_url, path):
+    """Return (status, parsed_json_or_None, detail)."""
+    import json
+    status, body = _live_get(base_url, path)
+    if status != 200:
+        return status, None, body if status is None else f"HTTP {status}"
+    try:
+        return status, json.loads(body), ""
+    except ValueError as exc:
+        return status, None, f"invalid JSON: {exc}"
+
+
+def suite_live(base_url="http://localhost:8080"):
+    """LV1-LV5: HTTP GET only, against a running service. Registered for
+    `--suite live` only; never part of `--suite all`."""
+    import urllib.parse
+    passed = 0
+    total = 5
+
+    # LV1
+    st, species, detail = _live_json(base_url, "/api/species")
+    ok = (st == 200 and isinstance(species, list)
+          and all("ai_common_name" not in r for r in species)
+          and len({r.get("label") for r in species}) == len(species))
+    _check("LV1", ok, detail or "/api/species not a list, has ai_common_name, or labels not unique")
+    if ok:
+        passed += 1
+    if not isinstance(species, list):
+        species = []
+
+    # LV2
+    st, stats, detail = _live_json(base_url, "/api/stats")
+    ok = (st == 200 and isinstance(stats, dict)
+          and stats.get("unique_species") == len(species) and bool(species))
+    _check("LV2", ok, detail or
+           f"unique_species={stats.get('unique_species') if isinstance(stats, dict) else None} "
+           f"!= len(species list)={len(species)}")
+    if ok:
+        passed += 1
+
+    # LV3
+    st, _body = _live_get(base_url, "/api/species/" + urllib.parse.quote(NO_SUCH_KEY, safe=""))
+    ok = st == 404
+    _check("LV3", ok, f"expected 404 for an unknown key, got {st if st is not None else _body}")
+    if ok:
+        passed += 1
+
+    # LV4
+    ok = False
+    detail = "no species rows to check"
+    if species:
+        row = species[0]
+        key = urllib.parse.quote(row["label"], safe="")
+        st, det, detail = _live_json(base_url, "/api/species/" + key)
+        if st == 200 and isinstance(det, dict):
+            got = (det.get("info") or {}).get("total_detections")
+            if got != row.get("detection_count"):
+                detail = f"info.total_detections={got} != detection_count={row.get('detection_count')}"
+            else:
+                st2, vids, detail2 = _live_json(
+                    base_url, "/api/videos?species=" + key + "&per_page=1")
+                if st2 == 200 and isinstance(vids, dict):
+                    if vids.get("total") == row.get("video_count"):
+                        ok = True
+                    else:
+                        detail = (f"videos total={vids.get('total')} != "
+                                  f"video_count={row.get('video_count')}")
+                else:
+                    detail = detail2
+    _check("LV4", ok, detail)
+    if ok:
+        passed += 1
+
+    # LV5
+    st, body = _live_get(base_url, "/")
+    ok = st == 200 and "Species not found" in body and "localeCompare" in body
+    _check("LV5", ok, "index page missing 'Species not found' / 'localeCompare'"
+           if st == 200 else f"GET / -> {st if st is not None else body}")
+    if ok:
+        passed += 1
+
+    return (passed, total)
+
+
 # ── registry / CLI ───────────────────────────────────────────────────────
 
 SUITES = {
@@ -1454,7 +1561,11 @@ SUITES = {
     "blacklist_suppress": (suite_blacklist_suppress, 7),
     "edges": (suite_edges, 6),
     "frontend_src": (suite_frontend_src, 9),
+    "live": (suite_live, 5),
 }
+
+# Suites that only run when explicitly requested (never part of --suite all).
+EXPLICIT_ONLY = {"live"}
 
 
 def main():
@@ -1468,6 +1579,10 @@ def main():
         "--db", default="data/wildlife.db",
         help="database for the read-only audit suite (default: data/wildlife.db)",
     )
+    parser.add_argument(
+        "--base-url", default="http://localhost:8080",
+        help="running service for the live suite (default: http://localhost:8080)",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -1475,11 +1590,17 @@ def main():
             print(f"{name}: {total} cases")
         return 0
 
-    names = list(SUITES.keys()) if args.suite == "all" else [args.suite]
+    names = ([n for n in SUITES if n not in EXPLICIT_ONLY]
+             if args.suite == "all" else [args.suite])
     all_passed = True
     for name in names:
         fn, _total = SUITES[name]
-        passed, total = fn(args.db) if name == "audit" else fn()
+        if name == "audit":
+            passed, total = fn(args.db)
+        elif name == "live":
+            passed, total = fn(args.base_url)
+        else:
+            passed, total = fn()
         if passed == total:
             print(f"PASS: {name} ({passed}/{total})")
         else:
