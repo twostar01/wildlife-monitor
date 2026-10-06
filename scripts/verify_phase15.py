@@ -44,7 +44,7 @@ Never call a database.* function ad hoc without database.set_db_path(<temp
 file>) first: sqlite3.connect would otherwise create data/wildlife.db.
 
 Usage:
-    python scripts/verify_phase15.py --suite lockstep|grouping|audit|blacklist_suppress|edges|all
+    python scripts/verify_phase15.py --suite lockstep|grouping|audit|blacklist_suppress|edges|frontend_src|all
     python scripts/verify_phase15.py --suite audit --db data/wildlife.db
     python scripts/verify_phase15.py --list
 """
@@ -1303,6 +1303,72 @@ def suite_audit(db_path="data/wildlife.db"):
     return (passed, total)
 
 
+# ── frontend_src (plan 15-02) ────────────────────────────────────────────
+
+def _frontend_slices():
+    """Comment-stripped slices of static/index.html used by the FE cases."""
+    text = _read_text("static/index.html")
+    return {
+        "api": _strip_slash_comment_lines(
+            _slice(text, "async function api(", "\nfunction cropUrl")),
+        "open_species": _strip_slash_comment_lines(
+            _slice(text, "async function openSpecies(", "\n// ── Gallery")),
+    }
+
+
+def suite_frontend_src():
+    """FE1-FE3 (Task 1): a stale species key lands on a recoverable
+    'Species not found' modal. The frontend is a single static file with no
+    build step, so these are source-contract assertions over comment-stripped
+    slices; behaviour in a browser is covered by the 15-03 operator checks."""
+    passed = 0
+    total = 3
+    s = _frontend_slices()
+    os_src = s["open_species"]
+
+    # FE1 — guard shape: try < api call on /species/ < catch < first d.info,
+    # and the catch block renders the not-found state and disarms both buttons.
+    case_id = "FE1"
+    i_try = os_src.find("try")
+    i_api = os_src.find("/species/")
+    i_catch = os_src.find("catch")
+    i_info = os_src.find("d.info")
+    ordered = -1 < i_try < i_api < i_catch < i_info
+    block = os_src[i_catch:i_info] if ordered else ""
+    needed = ["Species not found", "modalViewGalleryBtn", "modalViewVideosBtn",
+              "= null", "return"]
+    missing = [n for n in needed if n not in block]
+    ok = ordered and not missing
+    _check(case_id, ok,
+           f"order try/api/catch/d.info = {(i_try, i_api, i_catch, i_info)}, "
+           f"catch block missing {missing}")
+    if ok:
+        passed += 1
+
+    # FE2 — the precondition the guard relies on: api() throws on non-2xx.
+    case_id = "FE2"
+    ok = "if (!r.ok) throw" in s["api"]
+    _check(case_id, ok, "api() no longer throws on a non-2xx response")
+    if ok:
+        passed += 1
+
+    # FE3 — the success path is intact.
+    case_id = "FE3"
+    needed = [
+        "d.info.common_name || label",
+        "modalViewGalleryBtn').onclick = () =>",
+        "modalViewVideosBtn').onclick = () =>",
+        "navigateToVideos({ species: label })",
+    ]
+    missing = [n for n in needed if n not in os_src]
+    ok = not missing
+    _check(case_id, ok, f"openSpecies success path missing {missing}")
+    if ok:
+        passed += 1
+
+    return (passed, total)
+
+
 # ── registry / CLI ───────────────────────────────────────────────────────
 
 SUITES = {
@@ -1311,6 +1377,7 @@ SUITES = {
     "audit": (suite_audit, 4),
     "blacklist_suppress": (suite_blacklist_suppress, 7),
     "edges": (suite_edges, 6),
+    "frontend_src": (suite_frontend_src, 3),
 }
 
 

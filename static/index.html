@@ -1580,7 +1580,24 @@ async function openSpecies(label) {
   document.getElementById('modalVideoList').innerHTML = '';
   document.getElementById('modalTitle').textContent = '…';
 
-  const d = await api(`/species/${encodeURIComponent(label)}`);
+  let d;
+  try {
+    d = await api(`/species/${encodeURIComponent(label)}`);
+  } catch (e) {
+    // The bucket has no detections left (stale bookmark, or every detection was
+    // corrected away): the API answers 404 and api() throws. Show a recoverable
+    // state instead of leaving the spinner up, and disarm the View-all buttons
+    // so a handler wired by a previously opened species cannot navigate. Static
+    // text only: neither the key nor the error body is put into HTML.
+    document.getElementById('modalTitle').textContent = 'Species not found';
+    document.getElementById('modalSubtitle').textContent = 'No detections remain under this species. It may have been corrected to another species.';
+    document.getElementById('modalGallery').innerHTML = '<div style="color:var(--muted);font-size:13px">No images available.</div>';
+    document.getElementById('modalVideoList').innerHTML = '';
+    document.getElementById('modalViewGalleryBtn').onclick = null;
+    document.getElementById('modalViewVideosBtn').onclick = null;
+    if (speciesTrendChartInst) { speciesTrendChartInst.destroy(); speciesTrendChartInst = null; }
+    return;
+  }
   document.getElementById('modalTitle').textContent = d.info.common_name || label;
   document.getElementById('modalSubtitle').textContent = d.info.scientific_name || label;
 
