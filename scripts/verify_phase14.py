@@ -48,7 +48,7 @@ the unified-table correction cases and unrelated to verify_phase12's
 badge/propagation fixture. The `audit` suite reuses `_seed_unified_fixture()`.
 
 Usage:
-    python scripts/verify_phase14.py --suite unified|audit|fanout|suppress|precedence|all
+    python scripts/verify_phase14.py --suite unified|audit|fanout|suppress|precedence|gaps|all
     python scripts/verify_phase14.py --list
 """
 
@@ -1022,12 +1022,109 @@ def suite_precedence():
     return (passed, total)
 
 
+def suite_gaps():
+    """`gaps` suite cases G1-G5 (5 total): the 14-REVIEW.md gap-closure fixes.
+    G1 pins CR-01 (a --reprocess-flagged pass clears the detection's unified
+    correction), G2-G4 pin CR-02 (DELETE /api/corrections/{id} and GET
+    /api/corrections share one id space; a miss is a 404, not a silent ok),
+    G5 pins WR-02 (the backfill refuses a --db path that does not exist
+    instead of creating an empty database)."""
+    import subprocess
+
+    passed = 0
+    total = 5
+
+    original_db_path = database.get_db_path()
+    tmpdir_obj = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    try:
+        db_path = os.path.join(tmpdir_obj.name, "gaps.db")
+        ids = _seed_unified_fixture(db_path)
+        det_cat_a = ids["det_cat_a"]
+        det_cat_b = ids["det_cat_b"]
+        video2 = ids["video2"]
+
+        # G1 — CR-01: the reprocess loop deletes the detection's unified row.
+        processor_text = (_repo_root() / "wildlife_processor.py").read_text(encoding="utf-8")
+        reprocess_block = _strip_comment_lines(
+            _slice(processor_text, "if args.reprocess_flagged:", "Reprocessing complete")
+        )
+        ok = (
+            "UPDATE species SET label=?" in reprocess_block
+            and "DELETE FROM species_corrections WHERE detection_id=?" in reprocess_block
+            and reprocess_block.index("DELETE FROM species_corrections")
+            > reprocess_block.index("UPDATE species SET label=?")
+        )
+        _check("G1", ok, "wildlife_processor.py's --reprocess-flagged loop must DELETE the detection's species_corrections row after rewriting its label")
+        if ok:
+            passed += 1
+
+        database.correct_species(det_cat_a, "Bobcat", "Lynx rufus")
+        database.correct_species(det_cat_b, "Bobcat", "Lynx rufus")
+        listed = database.get_corrections(video2)
+        listed_ids = {r["id"] for r in listed}
+        with database.get_conn() as conn:
+            table_ids = {
+                r[0] for r in conn.execute(
+                    "SELECT sc.id FROM species_corrections sc JOIN detections d ON d.id=sc.detection_id WHERE d.video_id=?",
+                    (video2,),
+                ).fetchall()
+            }
+
+        # G2 — GET and DELETE share one id space.
+        ok = len(listed) == 2 and listed_ids == table_ids and all(r.get("original_label") for r in listed)
+        _check("G2", ok, f"get_corrections must list species_corrections ids; listed={listed_ids} table={table_ids}")
+        if ok:
+            passed += 1
+
+        # G3 — delete_correction reports what it deleted.
+        victim = sorted(listed_ids)[0]
+        first = database.delete_correction(victim)
+        second = database.delete_correction(victim)
+        with database.get_conn() as conn:
+            remaining = conn.execute("SELECT COUNT(*) FROM species_corrections WHERE id=?", (victim,)).fetchone()[0]
+        ok = first == 1 and second == 0 and remaining == 0
+        _check("G3", ok, f"delete_correction must return 1 then 0; got {first!r}, {second!r}, remaining={remaining}")
+        if ok:
+            passed += 1
+
+        # G4 — the endpoint turns a miss into a 404.
+        web_text = (_repo_root() / "web_app.py").read_text(encoding="utf-8")
+        endpoint = _strip_comment_lines(_slice(web_text, '@app.delete("/api/corrections/{correction_id}")', "\n@app."))
+        get_endpoint = _strip_comment_lines(_slice(web_text, '@app.get("/api/corrections")', "\n@app."))
+        ok = (
+            "if not db.delete_correction(correction_id)" in endpoint
+            and "HTTPException(404" in endpoint
+            and "db.get_corrections(" in get_endpoint
+            and "video_corrections" not in get_endpoint
+        )
+        _check("G4", ok, "DELETE must 404 on a miss and GET /api/corrections must list species_corrections")
+        if ok:
+            passed += 1
+
+        # G5 — the backfill never creates a database.
+        missing = os.path.join(tmpdir_obj.name, "typo", "wildlife.db")
+        proc = subprocess.run(
+            [sys.executable, str(_repo_root() / "scripts" / "backfill_species_corrections.py"), "--db", missing],
+            capture_output=True, text=True,
+        )
+        ok = proc.returncode != 0 and not os.path.exists(missing) and not os.path.exists(os.path.dirname(missing))
+        _check("G5", ok, f"exit={proc.returncode} exists={os.path.exists(missing)} stderr={proc.stderr[-200:]}")
+        if ok:
+            passed += 1
+    finally:
+        database.set_db_path(original_db_path)
+        tmpdir_obj.cleanup()
+
+    return (passed, total)
+
+
 SUITES = {
     "unified": (suite_unified, 7),
     "audit": (suite_audit, 5),
     "fanout": (suite_fanout, 6),
     "suppress": (suite_suppress, 6),
     "precedence": (suite_precedence, 4),
+    "gaps": (suite_gaps, 5),
 }
 
 

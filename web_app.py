@@ -698,17 +698,10 @@ def api_requeue_species(label: str):
 
 @app.get("/api/corrections")
 def api_get_corrections(video_id: int = Query(None)):
-    if video_id is not None:
-        return db.get_video_corrections(video_id)
-    # All corrections — for admin view
-    with db.get_conn() as conn:
-        rows = conn.execute("""
-            SELECT vc.*, v.filename, v.camera_name
-            FROM video_corrections vc
-            JOIN videos v ON vc.video_id = v.id
-            ORDER BY vc.corrected_at DESC
-        """).fetchall()
-    return [dict(r) for r in rows]
+    # Lists species_corrections so the ids returned here are the ids
+    # DELETE /api/corrections/{id} accepts. The frozen legacy video_corrections
+    # table (D-06) is no longer served by this endpoint.
+    return db.get_corrections(video_id)
 
 
 @app.post("/api/corrections")
@@ -732,8 +725,9 @@ def api_save_correction(req: CorrectionRequest):
 
 @app.delete("/api/corrections/{correction_id}")
 def api_delete_correction(correction_id: int):
-    db.delete_correction(correction_id)
-    log.info("Video correction delete requested: correction_id=%s", correction_id)
+    if not db.delete_correction(correction_id):
+        raise HTTPException(404, "Correction not found")
+    log.info("Correction deleted: correction_id=%s", correction_id)
     return {"ok": True}
 
 

@@ -525,10 +525,13 @@ EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({UNIFIED_CORRECTION_SCIENTIFIC},''), s.
 # `label` field). Any future query that tests for suppression must test
 # `suppressed`, not `corrected_label IS NULL`.
 #
-# Reprocessing a video does NOT re-apply prior corrections (D-02): a
-# reprocessed video's new detections start uncorrected, exactly like
-# newly-processed footage. wildlife_processor.py's reprocess flow is
-# untouched by this phase.
+# Reprocessing a video does NOT re-apply prior corrections (D-02): newly
+# processed footage starts uncorrected, and so does a reprocessed video.
+# wildlife_processor.py's --reprocess-flagged flow reuses each detection's id,
+# so it deletes that detection's species_corrections row in the same loop that
+# rewrites its label (otherwise the stale correction would keep overriding the
+# fresh classification). This restores the pre-Phase-14 behaviour, where the
+# reprocess cleared species.user_common_name.
 
 
 def init_db(db_path: Optional[str] = None):
@@ -1644,7 +1647,29 @@ def delete_correction(correction_id: int):
     delete_video_correction() — D-00/CORR-01, the unified table is the only
     one any write path targets after Phase 14's cutover)."""
     with get_conn() as conn:
-        conn.execute("DELETE FROM species_corrections WHERE id=?", (correction_id,))
+        cur = conn.execute("DELETE FROM species_corrections WHERE id=?", (correction_id,))
+        return cur.rowcount
+
+
+def get_corrections(video_id: Optional[int] = None) -> list:
+    """List species_corrections rows (the ids DELETE /api/corrections/{id}
+    accepts), optionally limited to one video's detections. Newest first."""
+    sql = """
+        SELECT sc.id, sc.detection_id, d.video_id, v.filename, v.camera_name,
+               s.label AS original_label, sc.corrected_label, sc.corrected_common,
+               sc.corrected_scientific, sc.suppressed, sc.source, sc.corrected_at, sc.note
+        FROM species_corrections sc
+        JOIN detections d ON d.id = sc.detection_id
+        JOIN videos v ON v.id = d.video_id
+        JOIN species s ON s.detection_id = sc.detection_id
+    """
+    params: tuple = ()
+    if video_id is not None:
+        sql += " WHERE d.video_id = ?"
+        params = (video_id,)
+    sql += " ORDER BY sc.corrected_at DESC, sc.id DESC"
+    with get_conn() as conn:
+        return [dict(r) for r in conn.execute(sql, params).fetchall()]
 
 
 def apply_corrections_to_species(species_list: list, corrections: list) -> list:

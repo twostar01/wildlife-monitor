@@ -528,6 +528,10 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    if not os.path.isfile(args.db):
+        print(f"ERROR: --db {args.db} does not exist; refusing to create a new database.", file=sys.stderr)
+        sys.exit(1)
+
     database.set_db_path(args.db)
     database.init_db(args.db)
 
