@@ -54,11 +54,34 @@ Written retroactively. The migration itself was executed on 2026-08-22; the Go/N
 4. **Backfill script re-run on a migrated DB is misleading**: it exits 1 because `verify_post_conditions` requires `row_count == planned_count` (17 != 15 once post-cutover corrections exist), and its report prints "rows written this run: 15" when 0 were written. The script is a one-shot migration and is not meant to be re-run, but both are worth fixing if it is ever reused.
 5. The plan's task order (rehearsal -> explicit Go/No-Go -> apply) was **not documented** for the 2026-08-22 run. A full-scale rehearsal on a byte-copy was run on 2026-10-06 and is a no-op for the reason in item 4.
 
-## Not recorded
+## Browser verification (2026-10-06, operator in a real browser at http://192.168.86.6:8080)
 
-- The verbatim Go/No-Go (task 2).
-- The operator's answers to browser checks 5(a)-(i) on 2026-08-22, including acknowledgement of the two intentional visible changes and the Phase 15 Species-tab staleness window. Open item: **repeat the browser checks** and record the answers here, or explicitly waive them.
+The 2026-08-22 browser answers were never recorded, so the checks were repeated against production on 2026-10-06, one at a time, with Claude confirming each backend state.
+
+| Check | Result | Operator observation |
+|-------|--------|----------------------|
+| a Gallery grid | PASS | Detections 110788, 120579 (AI: domestic cat) and 120502 (AI: Unknown species) show Northern Raccoon / Northern Raccoon / Western Gray Squirrel with the edit badge. |
+| b Species detail modal | PASS | 120579 shows Northern Raccoon with edit badge; the rest of that group still reads "Domestic Cat" (the old grouping quirk, see below). |
+| c Videos tab | PASS | `20260925030610` pair lists Northern Raccoon; `20260815025411` pair lists Mule Deer. |
+| d Video player | PASS | Corrected chips show corrected names with the edit marker, including the Gallery-only correction on `20260806043634`. |
+| e Suppression | PASS | Player on `World Watch_00_20260405171526.mp4` shows only Mule Deer, no edit badge; backend confirms the suppressed Wild Boar crop (23412) is still returned by the Gallery under its original name. |
+| f New Gallery correction | PASS | `World Watch_00_20260630013837.mp4`: row #33, `source=gallery`, Wild Boar -> Northern Raccoon; shown immediately. |
+| g New video-player correction | PASS | `World Watch_00_20260925034640.mp4`: rows #34/#35, `source=video_player`, Wild Boar -> Northern Raccoon (fan-out over 2 matching detections); chip and Gallery both updated with the edit badge. |
+| h Intentional changes | ACCEPTED | Operator: fine, no duplicate chips seen. |
+| i Accepted staleness | ACCEPTED | Operator: fine. |
+
+Audit-trail spot check (CORR-04): after the two new corrections `species_corrections` holds 20 rows, 0 with an empty original AI label; "AI: Domestic Cat" is visible on the corrected 120579 tile. Legacy tables unchanged (`video_corrections` 11, `species.user_common_name` 4) after both new writes.
+
+The operator's 2026-08-22 Go/No-Go wording is still not recoverable; the 2026-10-06 statement that the run was done jointly is the only record.
+
+## Observations for later (none block this phase)
+
+- **Phase 15 input -- group display name:** the `domestic cat` label group (23 detections) displays under the name "Northern Raccoon" because one member was corrected; its other 22 crops still read "Domestic Cat" (all AI misidentifications). Species list therefore has two "Northern Raccoon" entries. Pre-existing: the pre-Phase-14 code does the same against the pre-migration snapshot.
+- **Phase 15 input -- casing:** video-player corrections are stored lowercase (`northern raccoon`, `mule deer`) while Gallery-popover corrections and SpeciesNet names are title-case. Grouping on `corrected_common` would split buckets by case; decide normalise-on-write, normalise-on-read, or case-insensitive grouping.
+- **Phase 15 / UX -- species dropdowns are unsorted** (database order), making species hard to find; sort alphabetically when `populateSpeciesFilters()` is reworked.
+- **Videos tab list** still shows suppressed species (Mule Deer, Wild Boar on `20260405171526`); identical under the pre-Phase-14 code.
+- **Stale Videos-tab state:** a search returned 0 results until a hard refresh, although the API returned the video; likely leftover filter state from an earlier click-through. Not reproduced, not investigated.
 
 ## Requirements
 
-CORR-01..04 are satisfied in code (14-01..14-03) and in production data (this plan). ROADMAP SC3 (no visible display regression) rests on the unrecorded browser checks above.
+CORR-01..04 are satisfied in code (14-01..14-03) and in production data, and ROADMAP SC3 (no visible display regression) is confirmed by the operator's browser checks above.

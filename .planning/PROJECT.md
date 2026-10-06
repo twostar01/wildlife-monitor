@@ -86,7 +86,7 @@ One standing observation item remains open with no deadline (NOTIFY-02, see Live
 ### Live-Verification Follow-ups (deferred from Phase 2, code-verified but unobserved in production)
 
 - [ ] NOTIFY-02: zero-detection alert fires on a real no-animal night but not on an empty directory — `alert_on_zero_detections` armed true in production 2026-08-07; the firing shape has never occurred in 13+ runs to date; remains a standing, no-deadline observation item, not scoped into v1.3
-- [ ] Phase 14: browser checks 5(a)-(i) from 14-04-PLAN were not recorded on 2026-08-22; repeat and record, or waive
+- [x] Phase 14: browser checks 5(a)-(i) repeated and recorded 2026-10-06 (all pass; see 14-04-SUMMARY.md)
 - [ ] Phase 14 (D-02): observe on the next real reprocess that a reprocessed video's detections start uncorrected (accepted consequence of snapshot fan-out)
 - [ ] Phase 14: legacy `video_corrections` row for video 31680 (spotted hyaena, 2026-06-15) matched 0 detections and is not in `species_corrections`; decide whether to re-apply by hand or drop
 
