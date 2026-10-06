@@ -773,7 +773,9 @@ def suite_propagation():
         stats_cat_row = next(
             (r for r in stats["top_species"] if r.get("label") == "domestic cat"), None
         )
-        timeline = database.get_timeline()
+        # Explicit window around the fixture's fixed 2026-08-16 dates: the
+        # default 30-day lookback ages the fixture out of range as real time passes.
+        timeline = database.get_timeline(date_from="2026-08-01", date_to="2026-08-31")
         timeline_cat_rows = [r for r in timeline["rows"] if r.get("label") == "domestic cat"]
         ok = (
             cat_row is not None
