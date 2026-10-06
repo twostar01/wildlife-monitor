@@ -24,6 +24,10 @@ Suites:
     edges              — normalisation merge, deterministic display name, the
                          scientific-name rule, D-03 separation, the equal-key
                          merge and an empty/populated smoke run (ED1-ED6).
+    frontend_src       — LABEL-03/LABEL-04/LABEL-05 (plan 15-02), source-contract
+                         checks on static/index.html: the stale-key guard in
+                         openSpecies, sorted dropdowns that keep the active
+                         filter, and the display-name gallery chip (FE1-FE9).
     audit              — read-only run of the same invariants plus per-reader
                          timing against a real database (AU1-AU4). SKIPs when
                          the database file is absent; GR6 self-tests it on
@@ -1313,16 +1317,26 @@ def _frontend_slices():
             _slice(text, "async function api(", "\nfunction cropUrl")),
         "open_species": _strip_slash_comment_lines(
             _slice(text, "async function openSpecies(", "\n// ── Gallery")),
+        "populate": _strip_slash_comment_lines(
+            _slice(text, "function populateSpeciesFilters(", "\n// ── Util")),
+        "chips": _strip_slash_comment_lines(
+            _slice(text, "function renderGalleryChips(", "\nfunction clearGalleryFilter(")),
+        "load_species": _strip_slash_comment_lines(
+            _slice(text, "async function loadSpecies(", "async function openSpecies(")),
+        "search": _strip_slash_comment_lines(text),
     }
 
 
 def suite_frontend_src():
-    """FE1-FE3 (Task 1): a stale species key lands on a recoverable
-    'Species not found' modal. The frontend is a single static file with no
-    build step, so these are source-contract assertions over comment-stripped
-    slices; behaviour in a browser is covered by the 15-03 operator checks."""
+    """FE1-FE3: a stale species key lands on a recoverable 'Species not
+    found' modal. FE4-FE9: sorted dropdowns keep the active filter, the
+    gallery chip names the species, and the key contract holds.
+
+    The frontend is a single static file with no build step, so these are
+    source-contract assertions over comment-stripped slices; behaviour in a
+    browser is covered by the 15-03 operator checks."""
     passed = 0
-    total = 3
+    total = 9
     s = _frontend_slices()
     os_src = s["open_species"]
 
@@ -1366,6 +1380,68 @@ def suite_frontend_src():
     if ok:
         passed += 1
 
+    pop = s["populate"]
+
+    # FE4 — the key contract: option value and text expressions unchanged.
+    case_id = "FE4"
+    needed = ['value="${escHtml(s.label)}"', "${escHtml(s.common_name||s.label)}"]
+    missing = [n for n in needed if n not in pop]
+    ok = bool(pop) and not missing
+    _check(case_id, ok, f"populateSpeciesFilters missing {missing}")
+    if ok:
+        passed += 1
+
+    # FE5 — options are built from a sorted shallow copy.
+    case_id = "FE5"
+    needed = ["localeCompare", "sensitivity", "[...speciesList]"]
+    missing = [n for n in needed if n not in pop]
+    ok = not missing
+    _check(case_id, ok, f"populateSpeciesFilters missing {missing}")
+    if ok:
+        passed += 1
+
+    # FE6 — the caller's array is never sorted in place.
+    case_id = "FE6"
+    ok = bool(pop) and "speciesList.sort(" not in pop
+    _check(case_id, ok, "populateSpeciesFilters sorts its speciesList parameter in place")
+    if ok:
+        passed += 1
+
+    # FE7 — the active filters are re-applied after the options are rebuilt.
+    case_id = "FE7"
+    needed = ["state.gallerySpecies", "state.videoSpecies", ".value ="]
+    missing = [n for n in needed if n not in pop]
+    ok = not missing
+    _check(case_id, ok, f"populateSpeciesFilters missing {missing}")
+    if ok:
+        passed += 1
+
+    # FE8 — the gallery chip resolves a display name and no longer prints the
+    # raw key directly.
+    case_id = "FE8"
+    chips = s["chips"]
+    needed = ["state.speciesList", "chip("]
+    missing = [n for n in needed if n not in chips]
+    raw_key_template = "Species: ${state.gallerySpecies}"
+    ok = bool(chips) and not missing and raw_key_template not in chips
+    _check(case_id, ok,
+           f"renderGalleryChips missing {missing}, raw-key template present: "
+           f"{raw_key_template in chips}")
+    if ok:
+        passed += 1
+
+    # FE9 — no species-card renderer reads ai_common_name (D-12), and a global
+    # search hit still passes the key to openSpecies.
+    case_id = "FE9"
+    ok = (bool(s["load_species"])
+          and "ai_common_name" not in s["load_species"]
+          and 'data-search-species="${escHtml(s.label)}"' in s["search"])
+    _check(case_id, ok,
+           "loadSpecies reads ai_common_name, or the search hit lost its "
+           "data-search-species key attribute")
+    if ok:
+        passed += 1
+
     return (passed, total)
 
 
@@ -1377,7 +1453,7 @@ SUITES = {
     "audit": (suite_audit, 4),
     "blacklist_suppress": (suite_blacklist_suppress, 7),
     "edges": (suite_edges, 6),
-    "frontend_src": (suite_frontend_src, 3),
+    "frontend_src": (suite_frontend_src, 9),
 }
 
 

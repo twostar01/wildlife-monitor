@@ -1741,7 +1741,12 @@ function renderGalleryChips() {
     </span>`;
 
   const chips = [];
-  if (state.gallerySpecies) chips.push(chip(`Species: ${state.gallerySpecies}`, 'species'));
+  if (state.gallerySpecies) {
+    // Show the display name; fall back to the raw key for a stale key or a
+    // list that has not loaded yet. chip() escapes both title and text.
+    const sp = (state.speciesList || []).find(s => s.label === state.gallerySpecies);
+    chips.push(chip(`Species: ${sp ? (sp.common_name || sp.label) : state.gallerySpecies}`, 'species'));
+  }
   if (state.galleryCamera) chips.push(chip(`Camera: ${state.galleryCamera}`, 'camera'));
   if (state.galleryDateFrom || state.galleryDateTo) {
     const from = state.galleryDateFrom || '…';
@@ -2492,10 +2497,19 @@ function renderPagination(containerId, page, pages, onPage) {
 
 // ── Species filter population ─────────────────────────────────────────────────
 function populateSpeciesFilters(speciesList) {
+  // Options come from a sorted COPY: state.speciesList order (detection count)
+  // drives the Species grid and must not change. Ties on display text fall
+  // back to the key so two same-named buckets always keep the same order.
+  const sorted = [...speciesList].sort((a, b) =>
+    (a.common_name || a.label).localeCompare(b.common_name || b.label, undefined, { sensitivity: 'base' })
+    || a.label.localeCompare(b.label));
   const opts = '<option value="">All Species</option>' +
-    speciesList.map(s => `<option value="${escHtml(s.label)}">${escHtml(s.common_name||s.label)}</option>`).join('');
+    sorted.map(s => `<option value="${escHtml(s.label)}">${escHtml(s.common_name||s.label)}</option>`).join('');
   document.getElementById('gallerySpeciesFilter').innerHTML = opts;
   document.getElementById('videoSpeciesFilter').innerHTML = opts;
+  // Rebuilding the options drops the selection; re-apply the active filters.
+  document.getElementById('gallerySpeciesFilter').value = state.gallerySpecies || '';
+  document.getElementById('videoSpeciesFilter').value = state.videoSpecies || '';
 }
 
 // ── Util ──────────────────────────────────────────────────────────────────────
