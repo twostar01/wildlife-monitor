@@ -342,15 +342,25 @@ def suite_badge():
             passed += 1
 
         # B6 — get_species_list() returns has_correction==1 for the
-        # "domestic cat" row, driven solely by dA's video-player correction
-        # at this point (dB is still uncorrected, dD is suppressed). RED
-        # before the fix — see the ordering note in this function's
-        # docstring.
+        # "northern raccoon" row, driven solely by dA's video-player
+        # correction at this point (dB is still uncorrected). Revised for
+        # Phase 15 (D-13): the list now groups on the EFFECTIVE key, so dA
+        # has left the "domestic cat" bucket and sits in the corrected
+        # "northern raccoon" bucket. Asserting on "domestic cat" would now
+        # pass only through dF's blank-name correction (has_correction=1,
+        # key unchanged) — the wrong reason. See the ordering note in this
+        # function's docstring.
         case_id = "B6"
         species_rows = database.get_species_list()
-        cat_row = next((r for r in species_rows if r.get("label") == "domestic cat"), None)
-        ok = cat_row is not None and cat_row.get("has_correction") == 1
-        _check(case_id, ok, f"cat_row={cat_row}")
+        raccoon_row = next(
+            (r for r in species_rows if r.get("label") == "northern raccoon"), None
+        )
+        ok = (
+            raccoon_row is not None
+            and raccoon_row.get("has_correction") == 1
+            and raccoon_row.get("detection_count") == 1
+        )
+        _check(case_id, ok, f"raccoon_row={raccoon_row}")
         if ok:
             passed += 1
 
@@ -368,14 +378,15 @@ def suite_badge():
         if ok:
             passed += 1
 
-        # B5 — get_species_detail("domestic cat") returns has_correction==1
-        # for BOTH dA's crop and dB's crop. The dA half is RED before the
-        # fix (no has_correction key at all, per B4); the dB half is green
-        # throughout.
+        # B5 — get_species_detail("northern raccoon") returns
+        # has_correction==1 for BOTH dA's crop and dB's crop. Revised for
+        # Phase 15 (D-13): both detections were corrected to Northern
+        # Raccoon, so the drilldown key is now the corrected bucket
+        # "northern raccoon", not their raw "domestic cat" label.
         case_id = "B5"
-        crops_cat = _species_detail_crops("domestic cat")
-        crop_a = _crop_by_detection(crops_cat, d_a)
-        crop_b = _crop_by_detection(crops_cat, d_b)
+        crops_raccoon = _species_detail_crops("northern raccoon")
+        crop_a = _crop_by_detection(crops_raccoon, d_a)
+        crop_b = _crop_by_detection(crops_raccoon, d_b)
         ok = (
             crop_a is not None
             and crop_a.get("has_correction") == 1
@@ -662,11 +673,13 @@ def suite_propagation():
         if ok:
             passed += 1
 
-        # P5 — get_species_detail("domestic cat")'s crops row for dA
-        # returns common_name "Northern Raccoon". RED before task 2.
+        # P5 — get_species_detail("northern raccoon")'s crops row for dA
+        # returns common_name "Northern Raccoon". Revised for Phase 15
+        # (D-13): dA's effective bucket is its corrected name, no longer
+        # its raw "domestic cat" label.
         case_id = "P5"
-        crops_cat = _species_detail_crops("domestic cat")
-        crop_a = _crop_by_detection(crops_cat, d_a)
+        crops_raccoon = _species_detail_crops("northern raccoon")
+        crop_a = _crop_by_detection(crops_raccoon, d_a)
         ok = crop_a is not None and crop_a.get("common_name") == "Northern Raccoon"
         _check(case_id, ok, f"crop_a={crop_a}")
         if ok:
@@ -769,6 +782,9 @@ def suite_propagation():
         case_id = "P10"
         species_rows = database.get_species_list()
         cat_row = next((r for r in species_rows if r.get("label") == "domestic cat"), None)
+        raccoon_row = next(
+            (r for r in species_rows if r.get("label") == "northern raccoon"), None
+        )
         stats = database.get_stats()
         stats_cat_row = next(
             (r for r in stats["top_species"] if r.get("label") == "domestic cat"), None
@@ -779,7 +795,9 @@ def suite_propagation():
         timeline_cat_rows = [r for r in timeline["rows"] if r.get("label") == "domestic cat"]
         ok = (
             cat_row is not None
-            and cat_row.get("ai_common_name") == "Domestic Cat"
+            and all("ai_common_name" not in r for r in species_rows)
+            and raccoon_row is not None
+            and raccoon_row.get("detection_count") == 2
             and stats_cat_row is not None
             and bool(timeline_cat_rows)
         )

@@ -234,9 +234,12 @@ def suite_unified():
             passed += 1
 
         # U3 — get_species_detail()'s crops list agrees with get_gallery()
-        # for the same detection (the two readers never disagree).
+        # for the same detection (the two readers never disagree). Revised
+        # for Phase 15 (D-13): the drilldown key for a detection corrected
+        # to "Northern Raccoon" is the corrected bucket "northern raccoon",
+        # not its raw "domestic cat" label.
         case_id = "U3"
-        detail_crop = _species_detail_crop("domestic cat", det_cat_a)
+        detail_crop = _species_detail_crop("northern raccoon", det_cat_a)
         ok = (
             detail_crop is not None
             and detail_crop.get("common_name") == "Northern Raccoon"

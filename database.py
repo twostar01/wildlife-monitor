@@ -288,6 +288,88 @@ IS_SUPPRESSED_DETECTION = """EXISTS (
     WHERE sc.detection_id = d.id AND sc.suppressed = 1
 )"""
 
+# ── Effective grouping key (Phase 15, LABEL-01..05) ─────────────────────────
+#
+# Every species reader that groups or filters by "which species is this?"
+# keys on ONE expression, EFFECTIVE_KEY, defined here and nowhere else
+# (D-04: no view, no materialised column, no Python-side bucket merging).
+#
+#   - A detection with a usable correction (a non-suppressed species_corrections
+#     row whose corrected_common is non-blank) is keyed on the NORMALISED
+#     corrected common name: trimmed, lower-cased (D-01). Gallery corrections
+#     carry corrected_label = NULL (free-text name only), so a taxonomy label
+#     cannot be the key; a normalised name lets "Raccoon" from the Gallery
+#     popover and "raccoon " from the video player land in one bucket.
+#   - Every other detection keeps its raw s.label (D-02). A scientific-only or
+#     blank-name correction therefore leaves the key unchanged (RESEARCH
+#     Pitfall 3).
+#   - A corrected bucket and a native SpeciesNet bucket are NOT force-merged
+#     (D-03): they stay separate unless their keys happen to be equal.
+#
+# Alias precondition: like every constant above, each interpolation site needs
+# `s` (species) and `d` (detections) in scope.
+#
+# GROUP BY trap: never GROUP BY or ORDER BY a bare result alias called `label`
+# or `common_name`. SQLite resolves a bare identifier against the FROM-clause
+# columns before result aliases, so it would silently regroup on the raw
+# s.label. Group by the interpolated EFFECTIVE_KEY, or by a qualified CTE
+# column, and rename to `label` only in the outermost SELECT list.
+#
+# KEY_DISPLAY_CTE resolves the DISPLAY name of a corrected bucket once per key
+# (D-10): the most recent non-suppressed correction for that key, with the
+# row id breaking ties (a video-player save fans out many rows under one
+# shared corrected_at stamp). Window-ranked rather than MAX-of-a-concatenated-
+# string with bare columns, because the bare-column-with-max rule is not a
+# contract worth building on and a '|' separator sorts after '.', which
+# mis-orders a whole-second stamp against a fractional one. Window functions
+# need SQLite >= 3.25; production runs 3.45.1.
+#
+# Display rule used by every aggregate reader: if the group's key has a
+# key_display row, the common name is display_common and the scientific name
+# is display_scientific (even when that is NULL, never the raw AI scientific
+# name of an arbitrary member); otherwise MAX(raw common) / MAX(raw
+# scientific). Join `key_display kd ON kd.k = <group key>` once per group; never
+# resolve the display name per output row (measured 7.7 s vs 0.26 s).
+#
+# The trim set covers space, tab, LF and CR because the API accepts those in
+# names and one-argument TRIM strips only spaces. SQLite LOWER folds ASCII
+# only, so "Épervier" and "épervier" remain two keys; negligible here.
+_KEY_TRIM_CHARS_SQL = "' ' || char(9) || char(10) || char(13)"
+
+
+def _trim_name_sql(expr: str) -> str:
+    """SQL that trims space/tab/LF/CR from both ends of the name `expr`."""
+    return f"TRIM({expr}, {_KEY_TRIM_CHARS_SQL})"
+
+
+def _normalize_key_sql(expr: str) -> str:
+    """SQL for the normalised grouping key of the name `expr`: trimmed,
+    ASCII-lower-cased, and NULL when nothing is left."""
+    return f"NULLIF(LOWER({_trim_name_sql(expr)}), '')"
+
+
+CORRECTED_KEY = _normalize_key_sql(UNIFIED_CORRECTION_COMMON)
+EFFECTIVE_KEY = f"COALESCE({CORRECTED_KEY}, s.label)"
+
+KEY_DISPLAY_CTE = f"""key_display AS (
+    SELECT r.k AS k,
+           r.display_common AS display_common,
+           r.display_scientific AS display_scientific
+    FROM (
+        SELECT {_normalize_key_sql('sc.corrected_common')} AS k,
+               {_trim_name_sql('sc.corrected_common')} AS display_common,
+               NULLIF({_trim_name_sql('sc.corrected_scientific')}, '') AS display_scientific,
+               ROW_NUMBER() OVER (
+                   PARTITION BY {_normalize_key_sql('sc.corrected_common')}
+                   ORDER BY sc.corrected_at DESC, sc.id DESC
+               ) AS rn
+        FROM species_corrections sc
+        WHERE sc.suppressed = 0
+          AND {_normalize_key_sql('sc.corrected_common')} IS NOT NULL
+    ) r
+    WHERE r.rn = 1
+)"""
+
 # True when a species row's *effective* (post-correction) label is something
 # other than 'Unknown species' — i.e. the row was never Unknown, OR it was
 # corrected away from Unknown via a species_corrections row (either write
@@ -1934,46 +2016,87 @@ def get_stats() -> dict:
 
 
 def get_species_list() -> list:
+    """
+    One row per EFFECTIVE bucket (EFFECTIVE_KEY, Phase 15): `label` carries the
+    key, which is what the dropdowns, the ?species= filters and the
+    /api/species/{label} drilldown all accept (D-05). No kept=1 predicate,
+    on purpose: get_gallery(), get_species_detail() and top_species have none
+    either, and every cross-reader count invariant (gallery total ==
+    detection_count) depends on the list matching them; get_timeline() and the
+    7-day activity chart do apply kept=1 (production detections exist only on
+    kept videos, which the audit suite checks).
+    """
     with get_conn() as conn:
         rows = conn.execute(f"""
-            SELECT
-                s.label,
-                {DISPLAY_COMMON}     AS common_name,
-                {DISPLAY_SCIENTIFIC} AS scientific_name,
-                s.common_name        AS ai_common_name,
-                COUNT(DISTINCT d.video_id) AS video_count,
-                COUNT(*) AS detection_count,
-                MAX(v.recorded_at) AS last_seen,
-                MIN(v.recorded_at) AS first_seen,
-                MAX({HAS_CORRECTION}) AS has_correction,
-                (SELECT c.crop_path FROM crops c
-                 JOIN detections d2 ON c.detection_id = d2.id
-                 JOIN species s2 ON s2.detection_id = d2.id
-                 WHERE s2.label = s.label
-                 ORDER BY c.quality_score DESC LIMIT 1) AS best_crop
-            FROM species s
-            JOIN detections d ON s.detection_id = d.id
-            JOIN videos v ON d.video_id = v.id
-            WHERE {KNOWN_SPECIES_FILTER}
-            GROUP BY s.label
-            ORDER BY detection_count DESC
+            WITH {KEY_DISPLAY_CTE},
+            base AS (
+                SELECT {EFFECTIVE_KEY} AS ekey,
+                       s.common_name AS raw_common,
+                       s.scientific_name AS raw_sci,
+                       d.id AS did, d.video_id AS vid,
+                       v.recorded_at AS rec,
+                       {HAS_CORRECTION} AS has_corr
+                FROM species s
+                JOIN detections d ON s.detection_id = d.id
+                JOIN videos v ON d.video_id = v.id
+                WHERE {KNOWN_SPECIES_FILTER}
+            ),
+            best AS (
+                SELECT b.ekey AS ekey, c.crop_path AS crop_path,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY b.ekey
+                           ORDER BY c.quality_score DESC, c.id DESC
+                       ) AS rn
+                FROM base b
+                JOIN crops c ON c.detection_id = b.did
+            )
+            SELECT b.ekey AS label,
+                   CASE WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_common)
+                        ELSE MAX(b.raw_common) END AS common_name,
+                   CASE WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_scientific)
+                        ELSE MAX(b.raw_sci) END AS scientific_name,
+                   COUNT(DISTINCT b.vid) AS video_count,
+                   COUNT(*) AS detection_count,
+                   MAX(b.rec) AS last_seen,
+                   MIN(b.rec) AS first_seen,
+                   MAX(b.has_corr) AS has_correction,
+                   MAX(bb.crop_path) AS best_crop
+            FROM base b
+            LEFT JOIN key_display kd ON kd.k = b.ekey
+            LEFT JOIN best bb ON bb.ekey = b.ekey AND bb.rn = 1
+            GROUP BY b.ekey
+            ORDER BY detection_count DESC, b.ekey
         """).fetchall()
         return [dict(r) for r in rows]
 
 
 def get_species_detail(label: str) -> dict:
+    """
+    Drilldown for one EFFECTIVE bucket. `label` is the key get_species_list()
+    emits (EFFECTIVE_KEY); it is only ever bound as a parameter. Returns
+    "info": {} when the key has no visible member, so web_app's falsy-info
+    404 fires for a bucket that has been corrected away (LABEL-05).
+    """
     with get_conn() as conn:
-        info = conn.execute("""
-            SELECT common_name, scientific_name, COUNT(*) as total_detections
-            FROM species WHERE label = ?
+        info = conn.execute(f"""
+            WITH {KEY_DISPLAY_CTE}
+            SELECT CASE WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_common)
+                        ELSE MAX(s.common_name) END AS common_name,
+                   CASE WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_scientific)
+                        ELSE MAX(s.scientific_name) END AS scientific_name,
+                   COUNT(*) AS total_detections
+            FROM species s
+            JOIN detections d ON s.detection_id = d.id
+            LEFT JOIN key_display kd ON kd.k = {EFFECTIVE_KEY}
+            WHERE {KNOWN_SPECIES_FILTER} AND {EFFECTIVE_KEY} = ?
         """, (label,)).fetchone()
 
-        trend = conn.execute("""
+        trend = conn.execute(f"""
             SELECT DATE(v.recorded_at) as day, COUNT(*) as count
             FROM species s
             JOIN detections d ON s.detection_id = d.id
             JOIN videos v ON d.video_id = v.id
-            WHERE s.label = ?
+            WHERE {KNOWN_SPECIES_FILTER} AND {EFFECTIVE_KEY} = ?
             GROUP BY day ORDER BY day
         """, (label,)).fetchall()
 
@@ -1981,7 +2104,8 @@ def get_species_detail(label: str) -> dict:
         # detection_id, top_candidates_json, corrected common/scientific name,
         # confidence) so the frontend can route this grid through the same
         # openDetectionCorrection entry point the main Gallery tab uses, instead
-        # of a plain video-open click — see WR-07.
+        # of a plain video-open click — see WR-07. `label` here is the RAW
+        # SpeciesNet label (the correction popover needs it), not the key.
         crops = conn.execute(f"""
             SELECT c.crop_path, c.quality_score, v.id as video_id,
                    v.filename, v.recorded_at,
@@ -1994,21 +2118,22 @@ def get_species_detail(label: str) -> dict:
             JOIN detections d ON c.detection_id = d.id
             JOIN species s ON s.detection_id = d.id
             JOIN videos v ON d.video_id = v.id
-            WHERE s.label = ?
+            WHERE {KNOWN_SPECIES_FILTER} AND {EFFECTIVE_KEY} = ?
             ORDER BY c.quality_score DESC LIMIT 50
         """, (label,)).fetchall()
 
-        videos = conn.execute("""
+        videos = conn.execute(f"""
             SELECT DISTINCT v.id, v.filename, v.recorded_at, v.thumbnail_path, v.duration_secs
             FROM videos v
             JOIN detections d ON v.id = d.video_id
             JOIN species s ON s.detection_id = d.id
-            WHERE s.label = ?
+            WHERE {KNOWN_SPECIES_FILTER} AND {EFFECTIVE_KEY} = ?
             ORDER BY v.recorded_at DESC LIMIT 20
         """, (label,)).fetchall()
 
+        has_members = bool(info) and bool(info["total_detections"])
         return {
-            "info":   dict(info) if info else {},
+            "info":   dict(info) if has_members else {},
             "label":  label,
             "trend":  [dict(r) for r in trend],
             "crops":  [dict(r) for r in crops],
@@ -2032,7 +2157,7 @@ def get_gallery(
     conditions = [KNOWN_SPECIES_FILTER]
     params = []
     if species_label:
-        conditions.append("s.label = ?")
+        conditions.append(f"{EFFECTIVE_KEY} = ?")
         params.append(species_label)
     if camera_name:
         conditions.append("v.camera_name = ?")
@@ -2221,9 +2346,10 @@ def get_videos(
     params = []
 
     if species_label:
-        conditions.append("""
+        conditions.append(f"""
             v.id IN (SELECT d.video_id FROM detections d
-                     JOIN species s ON s.detection_id=d.id WHERE s.label=?)
+                     JOIN species s ON s.detection_id=d.id
+                     WHERE {KNOWN_SPECIES_FILTER} AND {EFFECTIVE_KEY} = ?)
         """)
         params.append(species_label)
     if has_person is not None:
