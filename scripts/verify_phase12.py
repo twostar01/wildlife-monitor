@@ -273,8 +273,10 @@ def _seed_fixture_db(path):
 def suite_badge():
     """Badge-suite cases B1-B8 (8 total), proving has_correction is
     accurate for BOTH correction write paths across get_gallery(),
-    get_species_detail() and get_species_list(), that a suppress row does
-    not count as a correction, and that label matching is exact/BINARY.
+    get_species_detail() and get_species_list(), that a suppressed detection
+    is excluded from every reader (Phase 15 D-08; B8 — a suppress row was
+    never a correction, and now it is not a visible species either), and
+    that label matching is exact/BINARY.
 
     Cases run in a specific, deliberate order: B6 (the get_species_list()
     aggregate for the "domestic cat" group) is checked BEFORE dB's
@@ -447,12 +449,18 @@ def suite_badge():
         if ok:
             passed += 1
 
-        # B8 — suppression sentinel: dD's crop (video_corrections row with
-        # corrected_label NULL) returns has_correction==0 — a suppress row
-        # is not a correction. Must pass before and after.
+        # B8 — suppression sentinel: dD's detection carries a suppress row
+        # (corrected_label NULL, suppressed=1), which is not a correction.
+        # Revised for Phase 15 (D-08, D-13): a suppressed detection is now
+        # excluded from every reader, so its crop is ABSENT from the
+        # Gallery and from the "domestic cat" drilldown rather than shown
+        # with has_correction==0. The suppress-is-not-a-correction
+        # distinction itself (no has_correction flip, no name change) stays
+        # pinned by verify_phase14's suppress suite.
         case_id = "B8"
         item_d = _gallery_item(d_d)
-        ok = item_d is not None and item_d.get("has_correction") == 0
+        cat_crops_b8 = _species_detail_crops("domestic cat")
+        ok = item_d is None and _crop_by_detection(cat_crops_b8, d_d) is None
         _check(case_id, ok, f"item_d={item_d}, video_c={video_c}")
         if ok:
             passed += 1
@@ -745,18 +753,19 @@ def suite_propagation():
         if ok:
             passed += 1
 
-        # P9 — suppression and blank handling: dD's crop (corrected_label
-        # NULL) returns its ORIGINAL common name, not NULL and not empty;
-        # and dF's crop (corrected_label set, corrected_common empty
-        # string) also returns its original common name rather than a
-        # blank. Green before AND after.
+        # P9 — suppression and blank handling. Revised for Phase 15 (D-08,
+        # D-13): dD (suppressed) is now ABSENT from the "domestic cat"
+        # drilldown and from the Gallery — a suppressed detection has no
+        # effective species — while dF (corrected_label set, corrected_common
+        # empty string: the blank-name guard) is still present under its raw
+        # bucket, returning its original common name rather than a blank.
         case_id = "P9"
         crops_cat = _species_detail_crops("domestic cat")
         crop_d = _crop_by_detection(crops_cat, d_d)
         crop_f = _crop_by_detection(crops_cat, d_f)
         ok = (
-            crop_d is not None
-            and crop_d.get("common_name") == "Domestic Cat"
+            crop_d is None
+            and _gallery_item(d_d) is None
             and crop_f is not None
             and crop_f.get("common_name") == "Domestic Cat"
         )

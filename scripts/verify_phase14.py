@@ -29,7 +29,9 @@ Suites:
     suppress    — CORR-02/D-01 (plan 14-02), the video-player suppress
                   action and get_video_by_id()'s read path, both keyed on
                   the dedicated `suppressed` column rather than a NULL
-                  corrected_label sentinel (S1-S6).
+                  corrected_label sentinel (S1-S6). Since Phase 15 (D-08) a
+                  suppressed detection is excluded from EVERY reader, not
+                  only the video player (S3 pins the Gallery and drilldown).
     precedence  — CORR-02/D-03 (plan 14-02), most-recent-write-wins pinned
                   in BOTH write-order directions (Gallery-then-video and
                   video-then-Gallery), with get_gallery() and
@@ -795,20 +797,27 @@ def suite_suppress():
         if ok:
             passed += 1
 
-        # S3 — the same detection is still present in get_gallery() and
-        # get_species_detail(label)["crops"], displaying its ORIGINAL
-        # common name — suppression hides a species inside the video
-        # player only.
+        # S3 — the same detection is excluded from every other reader too.
+        # Revised for Phase 15 (D-08, D-13): this case used to pin
+        # "suppression hides a species inside the video player only" (the
+        # Gallery and the drilldown still returned the crop under its
+        # ORIGINAL name). Since Phase 15 a suppressed detection has no
+        # effective species, so it is absent from get_gallery(), and because
+        # it was the only detection in its bucket the "domestic dog" bucket
+        # vanishes (LABEL-05): get_species_detail("domestic dog")["info"] is
+        # {} (the 404 path). det_cat, on the same video and NOT suppressed,
+        # is unaffected and still shows its original name.
         case_id = "S3"
         item_dog = _gallery_item(det_dog)
-        detail_dog = _species_detail_crop("domestic dog", det_dog)
+        detail_dog = database.get_species_detail("domestic dog")
+        item_cat = _gallery_item(det_cat)
         ok = (
-            item_dog is not None
-            and item_dog.get("common_name") == "Domestic Dog"
-            and detail_dog is not None
-            and detail_dog.get("common_name") == "Domestic Dog"
+            item_dog is None
+            and detail_dog["info"] == {}
+            and item_cat is not None
+            and item_cat.get("common_name") == "Domestic Cat"
         )
-        _check(case_id, ok, f"item_dog={item_dog}, detail_dog={detail_dog}")
+        _check(case_id, ok, f"item_dog={item_dog}, detail_dog={detail_dog}, item_cat={item_cat}")
         if ok:
             passed += 1
 

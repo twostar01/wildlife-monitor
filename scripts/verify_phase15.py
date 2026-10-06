@@ -16,6 +16,14 @@ Suites:
                          leaves its raw-label bucket in every reader, the
                          readers agree with each other, and a bucket corrected
                          away vanishes everywhere (GR1-GR6).
+    blacklist_suppress — D-07/D-08/D-09 and operator decision 1: a correction
+                         overrides the blacklist (only a usable-name
+                         correction does), a suppressed detection is excluded
+                         from every reader, and the Unknown-sibling rule is
+                         unchanged (BS1-BS7).
+    edges              — normalisation merge, deterministic display name, the
+                         scientific-name rule, D-03 separation, the equal-key
+                         merge and an empty/populated smoke run (ED1-ED6).
     audit              — read-only run of the same invariants plus per-reader
                          timing against a real database (AU1-AU4). SKIPs when
                          the database file is absent; GR6 self-tests it on
@@ -36,7 +44,7 @@ Never call a database.* function ad hoc without database.set_db_path(<temp
 file>) first: sqlite3.connect would otherwise create data/wildlife.db.
 
 Usage:
-    python scripts/verify_phase15.py --suite lockstep|grouping|audit|all
+    python scripts/verify_phase15.py --suite lockstep|grouping|audit|blacklist_suppress|edges|all
     python scripts/verify_phase15.py --suite audit --db data/wildlife.db
     python scripts/verify_phase15.py --list
 """
@@ -737,6 +745,416 @@ def suite_grouping():
     return (passed, total)
 
 
+# ── `blacklist_suppress` suite ───────────────────────────────────────────
+
+
+def _video_det_ids(video_id):
+    return {d["id"] for d in database.get_video_by_id(video_id)["detections"]}
+
+
+def _list_labels():
+    return {r["label"] for r in database.get_species_list()}
+
+
+def _top_labels():
+    return {t["label"] for t in database.get_stats()["top_species"]}
+
+
+def _list_row(key):
+    return next((r for r in database.get_species_list() if r["label"] == key), None)
+
+
+def suite_blacklist_suppress():
+    """`blacklist_suppress` suite cases BS1-BS7 (7 total). Each case seeds its
+    own fresh fixture unless stated otherwise."""
+    passed = 0
+    total = 7
+
+    original_db_path = database.get_db_path()
+    tmpdir_obj = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    try:
+        # BS1 (D-07) — a correction overrides the blacklist.
+        case_id = "BS1"
+        ids = _seed_phase15_fixture(os.path.join(tmpdir_obj.name, "bs1.db"))
+        database.add_to_blacklist(LBL_BOAR, "Wild Boar", "Sus scrofa", "")
+        rc = database.correct_species(ids["b1"], "Northern Raccoon", "Procyon lotor")
+        ok = (
+            rc == 1
+            and ids["b1"] in _detail_crop_ids("northern raccoon")
+            and ids["b1"] in _gallery_ids(species_label="northern raccoon")
+            and ids["b1"] in _video_det_ids(ids["vid6"])
+            and LBL_BOAR not in _list_labels()
+            and ids["b2"] not in _gallery_ids()
+            and ids["b2"] not in _video_det_ids(ids["vid6"])
+        )
+        _check(case_id, ok, f"rc={rc}, vid6_dets={_video_det_ids(ids['vid6'])}")
+        if ok:
+            passed += 1
+
+        # BS2 (Pitfall 3a, on BS1's DB) — a scientific-only correction does
+        # not un-blacklist a detection.
+        case_id = "BS2"
+        rc = database.correct_species(ids["b3"], "", "Sus scrofa")
+        hard, soft = _cross_reader_violations()
+        ok = (
+            rc == 1
+            and ids["b3"] not in _gallery_ids()
+            and ids["b3"] not in _video_det_ids(ids["vid6"])
+            and LBL_BOAR not in _list_labels()
+            and not hard
+            and not soft
+        )
+        _check(case_id, ok, f"rc={rc}, hard={hard}, soft={soft}")
+        if ok:
+            passed += 1
+
+        # BS3 (D-08 on a partial bucket) — suppressing one CAT detection
+        # removes it from every reader and nowhere else.
+        case_id = "BS3"
+        ids = _seed_phase15_fixture(os.path.join(tmpdir_obj.name, "bs3.db"))
+        cat_before = _list_row(LBL_CAT)
+        top_before = next(
+            t["cnt"] for t in database.get_stats()["top_species"] if t["label"] == LBL_CAT
+        )
+        tl_before = _timeline_sums()[LBL_CAT]
+        act_before = _activity_sums()[LBL_CAT]
+        vids_before = database.get_videos(species_label=LBL_CAT)["total"]
+        unique_before = database.get_stats()["unique_species"]
+        applied = database.save_video_correction(ids["vid11"], LBL_CAT, None, None, None)
+        vid11_item = next(
+            (v for v in database.get_videos(per_page=100)["items"] if v["id"] == ids["vid11"]),
+            None,
+        )
+        species_list = (vid11_item or {}).get("species_list") or ""
+        cat_after = _list_row(LBL_CAT)
+        top_after = next(
+            t["cnt"] for t in database.get_stats()["top_species"] if t["label"] == LBL_CAT
+        )
+        hard, soft = _cross_reader_violations()
+        ok = (
+            applied == 1
+            and (cat_before["detection_count"], cat_before["video_count"]) == (7, 5)
+            and top_before == 7
+            and (tl_before, act_before, vids_before) == (5, 5, 5)
+            and ids["s1"] not in _gallery_ids()
+            and ids["s1"] not in _gallery_ids(species_label=LBL_CAT)
+            and ids["s1"] not in _detail_crop_ids(LBL_CAT)
+            and ids["s1"] not in _video_det_ids(ids["vid11"])
+            and cat_after["detection_count"] == 6
+            and cat_after["video_count"] == 4
+            and top_after == 6
+            and _timeline_sums()[LBL_CAT] == 4
+            and _activity_sums()[LBL_CAT] == 4
+            and database.get_videos(species_label=LBL_CAT)["total"] == 4
+            and vid11_item is not None
+            and "Domestic Cat" not in species_list
+            and "Northern Raccoon" in species_list
+            and database.get_stats()["unique_species"] == unique_before
+            and not hard
+            and not soft
+        )
+        _check(
+            case_id, ok,
+            f"applied={applied}, cat_before={cat_before}, cat_after={cat_after}, "
+            f"species_list={species_list!r}, hard={hard}, soft={soft}",
+        )
+        if ok:
+            passed += 1
+
+        # BS4 (D-08) — a suppressed-only bucket vanishes everywhere.
+        case_id = "BS4"
+        ids = _seed_phase15_fixture(os.path.join(tmpdir_obj.name, "bs4.db"))
+        unique_before = database.get_stats()["unique_species"]
+        a4 = database.save_video_correction(ids["vid4"], LBL_DOG, None, None, None)
+        a5 = database.save_video_correction(ids["vid5"], LBL_DOG, None, None, None)
+        ok = (
+            (a4, a5) == (1, 1)
+            and LBL_DOG not in _list_labels()
+            and LBL_DOG not in _top_labels()
+            and LBL_DOG not in _timeline_sums()
+            and LBL_DOG not in _activity_sums()
+            and database.get_stats()["unique_species"] == unique_before - 1
+            and database.get_species_detail(LBL_DOG)["info"] == {}
+            and database.get_gallery(species_label=LBL_DOG)["total"] == 0
+            and database.get_videos(species_label=LBL_DOG)["total"] == 0
+        )
+        _check(case_id, ok, f"a4={a4}, a5={a5}, unique_before={unique_before}")
+        if ok:
+            passed += 1
+
+        # BS5 (D-09 unchanged) — the Unknown-sibling rule still tests the raw
+        # label.
+        case_id = "BS5"
+        ids = _seed_phase15_fixture(os.path.join(tmpdir_obj.name, "bs5.db"))
+        unknown_before = _list_row(LBL_UNKNOWN)
+        before_ok = (
+            ids["u1"] not in _gallery_ids()
+            and ids["u1"] not in _video_det_ids(ids["vid7"])
+            and unknown_before is not None
+            and unknown_before["detection_count"] == 2
+        )
+        database.correct_species(ids["u1"], "Western Gray Squirrel", "Sciurus griseus")
+        squirrel = _list_row("western gray squirrel")
+        after_u1_ok = (
+            ids["u1"] in _gallery_ids()
+            and ids["u1"] in _video_det_ids(ids["vid7"])
+            and squirrel is not None
+            and squirrel["detection_count"] == 1
+        )
+        database.correct_species(ids["u2"], "Some Animal", "Aliquid animalus")
+        unknown_after = _list_row(LBL_UNKNOWN)
+        after_u2_ok = (
+            ids["u3"] in _video_det_ids(ids["vid8"])
+            and ids["u3"] in _gallery_ids()
+            and unknown_after is not None
+            and unknown_after["detection_count"] == 1
+        )
+        ok = before_ok and after_u1_ok and after_u2_ok
+        _check(
+            case_id, ok,
+            f"before_ok={before_ok}, after_u1_ok={after_u1_ok}, after_u2_ok={after_u2_ok}, "
+            f"unknown_after={unknown_after}",
+        )
+        if ok:
+            passed += 1
+
+        # BS6 (Pitfall 6) — corrected-away-from-Unknown detections count under
+        # their corrected key in stats; Unknown never appears in top/activity.
+        case_id = "BS6"
+        ids = _seed_phase15_fixture(os.path.join(tmpdir_obj.name, "bs6.db"))
+        for name in ("u1", "u2", "u3"):
+            database.correct_species(ids[name], "Western Gray Squirrel", "Sciurus griseus")
+        stats = database.get_stats()
+        top = {t["label"]: t for t in stats["top_species"]}
+        act_labels = {r["label"] for r in _activity_rows()}
+        ok = (
+            "western gray squirrel" in top
+            and top["western gray squirrel"]["cnt"] == 3
+            and LBL_UNKNOWN not in top
+            and LBL_UNKNOWN not in act_labels
+            and _activity_sums().get("western gray squirrel") == 2
+        )
+        _check(case_id, ok, f"top={top}, activity_sums={_activity_sums()}")
+        if ok:
+            passed += 1
+
+        # BS7 (source; comment-stripped) — the filter's three ingredients.
+        case_id = "BS7"
+        db_text = _strip_hash_comment_lines(_read_text("database.py"))
+        filter_src = _slice(db_text, "KNOWN_SPECIES_FILTER = (", "\n)")
+        ok = (
+            bool(filter_src)
+            and "CORRECTED_KEY" in filter_src
+            and "IS NOT NULL" in filter_src
+            and "IS_SUPPRESSED_DETECTION" in filter_src
+            and "HAS_UNIFIED_CORRECTION" not in filter_src
+        )
+        _check(case_id, ok, f"filter_src={filter_src!r}")
+        if ok:
+            passed += 1
+    finally:
+        database.set_db_path(original_db_path)
+        tmpdir_obj.cleanup()
+
+    return (passed, total)
+
+
+# ── `edges` suite ────────────────────────────────────────────────────────
+
+
+def _set_corrected_at(det_id, stamp):
+    with database.get_conn() as conn:
+        conn.execute(
+            "UPDATE species_corrections SET corrected_at = ? WHERE detection_id = ?",
+            (stamp, det_id),
+        )
+
+
+def _display_names_for(key):
+    """Every display name every reader shows for `key` (a set; one element
+    means the readers agree)."""
+    names = set()
+    row = _list_row(key)
+    if row is not None:
+        names.add(row["common_name"])
+    for t in database.get_stats()["top_species"]:
+        if t["label"] == key:
+            names.add(t["common_name"])
+    info = database.get_species_detail(key).get("info") or {}
+    if info:
+        names.add(info["common_name"])
+    for r in database.search(key)["species"]:
+        if r["label"] == key:
+            names.add(r["common_name"])
+    for r in database.get_timeline(date_from=TIMELINE_ALL[0], date_to=TIMELINE_ALL[1])["rows"]:
+        if r["label"] == key:
+            names.add(r["common_name"])
+    for r in _activity_rows():
+        if r["label"] == key:
+            names.add(r["species"])
+    return names
+
+
+def suite_edges():
+    """`edges` suite cases ED1-ED6 (6 total)."""
+    passed = 0
+    total = 6
+
+    original_db_path = database.get_db_path()
+    tmpdir_obj = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    try:
+        # ED1 (normalisation merge) — Gallery "Raccoon", a video-player
+        # "raccoon<TAB>" and " RACCOON<CR><LF>" land in one bucket.
+        case_id = "ED1"
+        ids = _seed_phase15_fixture(os.path.join(tmpdir_obj.name, "ed1.db"))
+        database.correct_species(ids["c2"], "Raccoon", "Procyon lotor")
+        database.save_video_correction(ids["vid2"], LBL_CAT, "raccoon_label", "raccoon\t", "Procyon lotor")
+        database.save_video_correction(ids["vid7"], LBL_CAT, "raccoon_label", " RACCOON\r\n", "Procyon lotor")
+        rows = database.get_species_list()
+        raccoon_rows = [r for r in rows if r["label"] == "raccoon"]
+        others = [
+            r["label"] for r in rows
+            if r["label"] != "raccoon" and r["label"].strip().lower() == "raccoon"
+        ]
+        ok = (
+            len(raccoon_rows) == 1
+            and raccoon_rows[0]["detection_count"] == 3
+            and not others
+        )
+        _check(case_id, ok, f"raccoon_rows={raccoon_rows}, others={others}")
+        if ok:
+            passed += 1
+
+        # ED2 (D-10 determinism, on ED1's DB) — the display name is the most
+        # recent correction's trimmed name, identical across every reader.
+        case_id = "ED2"
+        _set_corrected_at(ids["c2"], "2000-01-01T00:00:00")
+        _set_corrected_at(ids["c4"], "2000-01-03T00:00:00")
+        _set_corrected_at(ids["k1"], "2000-01-02T00:00:00")
+        names_c4 = _display_names_for("raccoon")
+        _set_corrected_at(ids["k1"], "2000-01-04T00:00:00")
+        names_k1 = _display_names_for("raccoon")
+        for name in ("c2", "c4", "k1"):
+            _set_corrected_at(ids[name], "2000-01-05T00:00:00")
+        with database.get_conn() as conn:
+            winner = conn.execute(
+                "SELECT corrected_common FROM species_corrections WHERE detection_id IN (?, ?, ?) "
+                "ORDER BY id DESC LIMIT 1",
+                (ids["c2"], ids["c4"], ids["k1"]),
+            ).fetchone()[0]
+        names_tie = _display_names_for("raccoon")
+        lists = [[r["common_name"] for r in database.get_species_list()] for _ in range(3)]
+        ok = (
+            names_c4 == {"raccoon"}
+            and names_k1 == {"RACCOON"}
+            and names_tie == {winner.strip()}
+            and lists[0] == lists[1] == lists[2]
+        )
+        _check(
+            case_id, ok,
+            f"names_c4={names_c4}, names_k1={names_k1}, names_tie={names_tie}, winner={winner!r}",
+        )
+        if ok:
+            passed += 1
+
+        # ED3 (RESEARCH A5, on ED2's DB) — the latest correction has no
+        # scientific name, so the bucket shows none rather than a raw one.
+        case_id = "ED3"
+        database.correct_species(ids["c2"], "Raccoon", "")
+        row = _list_row("raccoon")
+        info = database.get_species_detail("raccoon")["info"]
+        ok = (
+            row is not None
+            and row["scientific_name"] is None
+            and info.get("scientific_name") is None
+            and row["common_name"] == "Raccoon"
+        )
+        _check(case_id, ok, f"row={row}, info={info}")
+        if ok:
+            passed += 1
+
+        # ED4 (D-03) — a corrected bucket and a native SpeciesNet bucket with
+        # the same display name stay separate.
+        case_id = "ED4"
+        ids = _seed_phase15_fixture(os.path.join(tmpdir_obj.name, "ed4.db"))
+        database.correct_species(ids["c1"], "Northern Raccoon", "Procyon lotor")
+        same_name = {
+            r["label"]: r for r in database.get_species_list()
+            if r["common_name"] == "Northern Raccoon"
+        }
+        ok = (
+            set(same_name) == {"northern raccoon", LBL_RACCOON}
+            and same_name["northern raccoon"]["detection_count"] == 1
+            and same_name[LBL_RACCOON]["detection_count"] == 2
+            and _detail_crop_ids("northern raccoon") == {ids["c1"]}
+            and _detail_crop_ids(LBL_RACCOON) == {ids["r1"], ids["s2"]}
+        )
+        _check(case_id, ok, f"same_name={sorted(same_name)}")
+        if ok:
+            passed += 1
+
+        # ED5 (equal-key merge) — a raw label equal to the corrected key
+        # merges into one bucket.
+        case_id = "ED5"
+        ids = _seed_phase15_fixture(os.path.join(tmpdir_obj.name, "ed5.db"))
+        database.correct_species(ids["p2"], "Bobcat", "Lynx rufus")
+        bobcat_rows = [r for r in database.get_species_list() if r["label"] == "bobcat"]
+        ok = (
+            len(bobcat_rows) == 1
+            and bobcat_rows[0]["detection_count"] == 2
+            and bobcat_rows[0]["common_name"] == "Bobcat"
+            and database.get_gallery(species_label="bobcat")["total"] == 2
+            and _detail_crop_ids("bobcat") == {ids["p1"], ids["p2"]}
+        )
+        _check(case_id, ok, f"bobcat_rows={bobcat_rows}")
+        if ok:
+            passed += 1
+
+        # ED6 (smoke) — empty DB returns empty shapes; a populated DB runs
+        # every reader without an OperationalError.
+        case_id = "ED6"
+        empty_path = os.path.join(tmpdir_obj.name, "ed6_empty.db")
+        database.set_db_path(empty_path)
+        database.init_db(empty_path)
+        stats = database.get_stats()
+        empty_ok = (
+            len(stats["activity_7d_by_species"]) == 7
+            and all(r["label"] is None and r["count"] == 0 for r in stats["activity_7d_by_species"])
+            and stats["top_species"] == []
+            and stats["unique_species"] == 0
+            and database.get_species_list() == []
+            and database.get_timeline(date_from=TIMELINE_ALL[0], date_to=TIMELINE_ALL[1])["rows"] == []
+            and database.get_species_detail(NO_SUCH_KEY)["info"] == {}
+            and database.search("a")["species"] == []
+            and database.get_gallery(species_label=NO_SUCH_KEY)["total"] == 0
+            and database.get_videos(species_label=NO_SUCH_KEY)["total"] == 0
+        )
+        smoke_error = None
+        try:
+            ids = _seed_phase15_fixture(os.path.join(tmpdir_obj.name, "ed6_full.db"))
+            database.get_stats()
+            database.get_species_list()
+            database.get_timeline()
+            database.get_timeline(date_from=TIMELINE_ALL[0], date_to=TIMELINE_ALL[1])
+            database.get_species_detail(NO_SUCH_KEY)
+            database.get_species_detail(LBL_CAT)
+            database.search("a")
+            database.get_gallery(species_label=NO_SUCH_KEY)
+            database.get_videos(species_label=NO_SUCH_KEY)
+            database.get_video_by_id(ids["vid1"])
+        except sqlite3.OperationalError as exc:
+            smoke_error = str(exc)
+        ok = empty_ok and smoke_error is None
+        _check(case_id, ok, f"empty_ok={empty_ok}, smoke_error={smoke_error}")
+        if ok:
+            passed += 1
+    finally:
+        database.set_db_path(original_db_path)
+        tmpdir_obj.cleanup()
+
+    return (passed, total)
+
+
 # ── `audit` suite (read-only; SKIPs without a database) ──────────────────
 
 _AUDIT_TABLES = ("videos", "detections", "species", "crops", "species_corrections", "blacklist")
@@ -891,6 +1309,8 @@ SUITES = {
     "lockstep": (suite_lockstep, 8),
     "grouping": (suite_grouping, 6),
     "audit": (suite_audit, 4),
+    "blacklist_suppress": (suite_blacklist_suppress, 7),
+    "edges": (suite_edges, 6),
 }
 
 

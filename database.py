@@ -280,9 +280,8 @@ HAS_UNIFIED_CORRECTION = """EXISTS (
 )"""
 
 # True when a detection carries a suppress row (species_corrections.suppressed
-# = 1) rather than a normal correction. Unused by any query in this plan —
-# 14-02-PLAN.md wires this into get_video_by_id() to replace the video-player
-# suppression signal. Defined here so both plans agree on one definition.
+# = 1) rather than a normal correction. get_video_by_id() uses it directly, and
+# since Phase 15 (D-08) KNOWN_SPECIES_FILTER excludes it in every reader.
 IS_SUPPRESSED_DETECTION = """EXISTS (
     SELECT 1 FROM species_corrections sc
     WHERE sc.detection_id = d.id AND sc.suppressed = 1
@@ -415,10 +414,35 @@ SUPPRESS_UNKNOWN_IF_IDENTIFIED = f"""(
 )"""
 
 # Combined filter — always exclude blank, suppress Unknown when a real species
-# is present, and exclude any species on the blacklist.
+# is present, exclude blacklisted species unless the detection was corrected
+# to a usable name, and exclude suppressed detections.
+#
+# D-07: a correction overrides the blacklist. Blacklist entries are SpeciesNet
+# taxonomy labels chosen through /api/species/search, so a lower-cased
+# corrected key cannot collide with one in production; a corrected detection
+# whose RAW label is blacklisted is therefore visible under its corrected key,
+# while an uncorrected detection with that raw label stays hidden. The
+# override tests CORRECTED_KEY IS NOT NULL, not HAS_UNIFIED_CORRECTION, so a
+# scientific-only or blank-name correction (key unchanged, RESEARCH Pitfall
+# 3a) does NOT un-blacklist a detection.
+#
+# D-08 (operator decision 1): suppression is excluded in EVERY reader. This
+# deliberately reverses Phase 14's accepted "the Gallery still shows
+# suppressed crops" behaviour (14-04-SUMMARY check e) and fixes the 14-04
+# observation that the Videos tab listed suppressed species.
+#
+# Scope: this filter is shared by every species reader AND by the Videos-tab
+# species chips and the video player (RESEARCH Pitfall 2). It must stay a
+# pure top-level AND chain with its single OR inside parentheses, because it
+# is embedded as `CASE WHEN {K} THEN` (get_videos), as `({K} OR s.label IS
+# NULL)` (get_video_by_id) and in `conditions` lists.
+#
+# D-09: the Unknown-species sibling rule (the inner NOT EXISTS on raw
+# s2.label inside SUPPRESS_UNKNOWN_IF_IDENTIFIED) is unchanged.
 KNOWN_SPECIES_FILTER = (
     f"{BLANK_LABEL_FILTER} AND {SUPPRESS_UNKNOWN_IF_IDENTIFIED} "
-    f"AND s.label NOT IN (SELECT label FROM blacklist)"
+    f"AND (s.label NOT IN (SELECT label FROM blacklist) OR {CORRECTED_KEY} IS NOT NULL) "
+    f"AND NOT {IS_SUPPRESSED_DETECTION}"
 )
 
 # SQL expression that returns the display name — user correction when set, else SpeciesNet common_name
@@ -2447,10 +2471,12 @@ def get_video_by_id(video_id: int) -> dict:
     `corrected` is HAS_CORRECTION — true for either write path (Gallery
     popover OR video-player editor), a deliberate widening from the old
     overlay's video-player-only signal (RESEARCH.md Pitfall 5).
-    Suppression (species_corrections.suppressed=1) is the only thing that
-    removes a row from the two SELECTs below; it does not affect any other
-    reader (get_gallery(), get_species_detail(), get_videos(),
-    get_species_list()).
+    Suppression (species_corrections.suppressed=1) removes a detection from
+    the two SELECTs below through their explicit NOT IS_SUPPRESSED_DETECTION
+    line, and, since Phase 15 (D-08), from every other species reader too,
+    through KNOWN_SPECIES_FILTER (the explicit lines are now redundant for
+    species rows but stay: they keep the `OR s.label IS NULL` branch honest
+    for detections that have no species row).
     """
     with get_conn() as conn:
         video = conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)).fetchone()
