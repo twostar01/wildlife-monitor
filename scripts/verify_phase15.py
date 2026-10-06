@@ -12,6 +12,14 @@ Suites:
                          and video filter predicates and the drilldown all
                          resolve the same key for every get_species_list() row
                          (LS1-LS8).
+    grouping           — LABEL-01/LABEL-02/LABEL-05, a corrected detection
+                         leaves its raw-label bucket in every reader, the
+                         readers agree with each other, and a bucket corrected
+                         away vanishes everywhere (GR1-GR6).
+    audit              — read-only run of the same invariants plus per-reader
+                         timing against a real database (AU1-AU4). SKIPs when
+                         the database file is absent; GR6 self-tests it on
+                         fixture data.
 
 Fixture data uses SpeciesNet-shaped raw labels (uuid;class;order;family;genus;
 species;common) for native rows so D-03 (a corrected bucket and a native
@@ -28,14 +36,19 @@ Never call a database.* function ad hoc without database.set_db_path(<temp
 file>) first: sqlite3.connect would otherwise create data/wildlife.db.
 
 Usage:
-    python scripts/verify_phase15.py --suite lockstep|all
+    python scripts/verify_phase15.py --suite lockstep|grouping|audit|all
+    python scripts/verify_phase15.py --suite audit --db data/wildlife.db
     python scripts/verify_phase15.py --list
 """
 
 import argparse
+import contextlib
+import io
 import os
+import sqlite3
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -283,6 +296,112 @@ def _lockstep_violations(strict_gallery=True):
     return out
 
 
+def _timeline_sums():
+    """{key: summed count} over the all-time timeline."""
+    rows = database.get_timeline(date_from=TIMELINE_ALL[0], date_to=TIMELINE_ALL[1])["rows"]
+    out = {}
+    for r in rows:
+        out[r["label"]] = out.get(r["label"], 0) + r["count"]
+    return out
+
+
+def _activity_rows():
+    """Activity rows that carry a label (empty days emit a NULL-label row)."""
+    return [r for r in database.get_stats()["activity_7d_by_species"] if r.get("label")]
+
+
+def _activity_sums():
+    out = {}
+    for r in _activity_rows():
+        out[r["label"]] = out.get(r["label"], 0) + r["count"]
+    return out
+
+
+def _cross_reader_violations(strict_gallery=True, activity_complete=True):
+    """Return (hard, soft): two lists of readable strings.
+
+    Hard checks (a violation is a real disagreement between readers):
+      - everything _lockstep_violations(strict_gallery) reports;
+      - stats unique_species == len(get_species_list());
+      - top_species labels == the first five list labels other than
+        "Unknown species", in list order, and each cnt == the list
+        detection_count;
+      - all-time timeline: every label is a list key and each key's summed
+        count == its list video_count (Unknown included on both sides);
+      - activity rows with a label: the label is a list key, is not
+        "Unknown species", and each key's summed count == video_count when
+        activity_complete, else <= video_count.
+    Soft checks (D-10 display consistency): top_species, timeline and
+    activity names equal the list common_name for that key.
+    """
+    hard = list(_lockstep_violations(strict_gallery))
+    soft = []
+    rows = database.get_species_list()
+    by_key = {r["label"]: r for r in rows}
+    stats = database.get_stats()
+
+    if stats["unique_species"] != len(rows):
+        hard.append(f"unique_species {stats['unique_species']} != len(species list) {len(rows)}")
+
+    expected_top = [r["label"] for r in rows if r["label"] != LBL_UNKNOWN][:5]
+    top_labels = [t["label"] for t in stats["top_species"]]
+    if top_labels != expected_top:
+        hard.append(f"top_species labels {top_labels} != first five list labels {expected_top}")
+    for t in stats["top_species"]:
+        row = by_key.get(t["label"])
+        if row is None:
+            hard.append(f"top_species label {t['label']!r} is not a list key")
+            continue
+        if t["cnt"] != row["detection_count"]:
+            hard.append(
+                f"top_species {t['label']!r} cnt {t['cnt']} != detection_count {row['detection_count']}"
+            )
+        if t["common_name"] != row["common_name"]:
+            soft.append(
+                f"top_species {t['label']!r} name {t['common_name']!r} != list {row['common_name']!r}"
+            )
+
+    tl_rows = database.get_timeline(date_from=TIMELINE_ALL[0], date_to=TIMELINE_ALL[1])["rows"]
+    tl_sums = {}
+    for r in tl_rows:
+        tl_sums[r["label"]] = tl_sums.get(r["label"], 0) + r["count"]
+        row = by_key.get(r["label"])
+        if row is None:
+            hard.append(f"timeline label {r['label']!r} is not a list key")
+        elif r["common_name"] != row["common_name"]:
+            soft.append(
+                f"timeline {r['label']!r} name {r['common_name']!r} != list {row['common_name']!r}"
+            )
+    for key, row in by_key.items():
+        if tl_sums.get(key, 0) != row["video_count"]:
+            hard.append(
+                f"timeline sum for {key!r} {tl_sums.get(key, 0)} != video_count {row['video_count']}"
+            )
+
+    act_sums = {}
+    for r in _activity_rows():
+        key = r["label"]
+        act_sums[key] = act_sums.get(key, 0) + r["count"]
+        row = by_key.get(key)
+        if key == LBL_UNKNOWN:
+            hard.append("activity contains the Unknown species label")
+        if row is None:
+            hard.append(f"activity label {key!r} is not a list key")
+        elif r["species"] != row["common_name"]:
+            soft.append(
+                f"activity {key!r} name {r['species']!r} != list {row['common_name']!r}"
+            )
+    for key, row in by_key.items():
+        if key == LBL_UNKNOWN:
+            continue
+        got = act_sums.get(key, 0)
+        if activity_complete and got != row["video_count"]:
+            hard.append(f"activity sum for {key!r} {got} != video_count {row['video_count']}")
+        elif got > row["video_count"]:
+            hard.append(f"activity sum for {key!r} {got} > video_count {row['video_count']}")
+    return hard, soft
+
+
 # ── `lockstep` suite ─────────────────────────────────────────────────────
 
 
@@ -463,10 +582,315 @@ def suite_lockstep():
     return (passed, total)
 
 
+# ── `grouping` suite ─────────────────────────────────────────────────────
+
+
+def _apply_gr2_corrections(ids):
+    """The mixed correction state GR2 (and the audit self-test) uses."""
+    rcs = [
+        database.correct_species(ids["c1"], "Northern Raccoon", "Procyon lotor"),
+        database.correct_species(ids["g1"], "Coyote", "Canis latrans"),
+        database.save_video_correction(ids["vid5"], LBL_DOG, "coyote_label", "coyote ", "Canis latrans"),
+        # scientific-only: key unchanged
+        database.correct_species(ids["c4"], "", "Felis silvestris"),
+        # blank name: key unchanged
+        database.save_video_correction(ids["vid6"], LBL_BOAR, "boar_label", "", ""),
+        # corrected away from Unknown
+        database.correct_species(ids["u1"], "Western Gray Squirrel", "Sciurus griseus"),
+    ]
+    return rcs
+
+
+def suite_grouping():
+    """`grouping` suite cases GR1-GR6 (6 total). See module docstring."""
+    passed = 0
+    total = 6
+
+    original_db_path = database.get_db_path()
+    tmpdir_obj = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    try:
+        # GR1 (LABEL-01/02, leave-bucket) — correcting c1 away from CAT lowers
+        # every CAT detection-count figure by exactly 1 and leaves every
+        # video-count figure alone (VID1 still has c2 and c3).
+        case_id = "GR1"
+        ids = _seed_phase15_fixture(os.path.join(tmpdir_obj.name, "gr1.db"))
+
+        def _cat_figures():
+            lst = {r["label"]: r for r in database.get_species_list()}
+            top = {t["label"]: t for t in database.get_stats()["top_species"]}
+            search_rows = {
+                r["label"]: r for r in database.search("domestic cat")["species"]
+            }
+            return {
+                "list_det": lst[LBL_CAT]["detection_count"],
+                "top_cnt": top[LBL_CAT]["cnt"],
+                "detail_det": database.get_species_detail(LBL_CAT)["info"]["total_detections"],
+                "search_cnt": search_rows[LBL_CAT]["cnt"],
+                "list_vid": lst[LBL_CAT]["video_count"],
+                "timeline_vid": _timeline_sums().get(LBL_CAT, 0),
+                "activity_vid": _activity_sums().get(LBL_CAT, 0),
+            }
+
+        before = _cat_figures()
+        rc = database.correct_species(ids["c1"], "Northern Raccoon", "Procyon lotor")
+        after = _cat_figures()
+        det_keys = ("list_det", "top_cnt", "detail_det", "search_cnt")
+        vid_keys = ("list_vid", "timeline_vid", "activity_vid")
+        lst_labels = {r["label"] for r in database.get_species_list()}
+        tl_labels = set(_timeline_sums())
+        act_labels = set(_activity_sums())
+        search_labels = {r["label"] for r in database.search("raccoon")["species"]}
+        ok = (
+            rc == 1
+            and all(after[k] == before[k] - 1 for k in det_keys)
+            and all(after[k] == before[k] for k in vid_keys)
+            and before["list_det"] == 7
+            and before["list_vid"] == 5
+            and "northern raccoon" in lst_labels
+            and "northern raccoon" in tl_labels
+            and "northern raccoon" in act_labels
+            and "northern raccoon" in search_labels
+        )
+        _check(case_id, ok, f"before={before}, after={after}, search_labels={search_labels}")
+        if ok:
+            passed += 1
+
+        # GR2 (cross-reader agreement) — a mixed correction state across both
+        # write paths, a scientific-only and a blank-name correction, and a
+        # correction away from Unknown: every reader agrees.
+        case_id = "GR2"
+        gr2_path = os.path.join(tmpdir_obj.name, "gr2.db")
+        ids = _seed_phase15_fixture(gr2_path)
+        rcs = _apply_gr2_corrections(ids)
+        hard, soft = _cross_reader_violations()
+        ok = all(rc is not None for rc in rcs) and not hard and not soft
+        _check(case_id, ok, f"rcs={rcs}, hard={hard}, soft={soft}")
+        if ok:
+            passed += 1
+
+        # GR3 (LABEL-05, on GR2's state) — every DOG detection was corrected
+        # away, so LBL_DOG is gone from every reader and its drilldown 404s.
+        case_id = "GR3"
+        stats = database.get_stats()
+        ok = (
+            LBL_DOG not in {r["label"] for r in database.get_species_list()}
+            and LBL_DOG not in {t["label"] for t in stats["top_species"]}
+            and LBL_DOG not in _timeline_sums()
+            and LBL_DOG not in _activity_sums()
+            and LBL_DOG not in {r["label"] for r in database.search("domestic dog")["species"]}
+            and database.get_gallery(species_label=LBL_DOG)["total"] == 0
+            and database.get_videos(species_label=LBL_DOG)["total"] == 0
+            and database.get_species_detail(LBL_DOG)["info"] == {}
+        )
+        _check(case_id, ok, f"top={[t['label'] for t in stats['top_species']]}")
+        if ok:
+            passed += 1
+
+        # GR4 (merge across write paths) — Gallery "Coyote" and video-player
+        # "coyote " land in one bucket.
+        case_id = "GR4"
+        coyote = next((r for r in database.get_species_list() if r["label"] == "coyote"), None)
+        ok = (
+            coyote is not None
+            and coyote["detection_count"] == 2
+            and coyote["video_count"] == 2
+        )
+        _check(case_id, ok, f"coyote={coyote}")
+        if ok:
+            passed += 1
+
+        # GR5 (search is drilldown-safe) — search hits are real buckets.
+        case_id = "GR5"
+        list_labels = {r["label"] for r in database.get_species_list()}
+        coyote_hits = database.search("coyote")["species"]
+        a_labels = [r["label"] for r in database.search("a")["species"]]
+        raccoon_labels = [r["label"] for r in database.search("raccoon")["species"]]
+        ok = (
+            len(coyote_hits) == 1
+            and coyote_hits[0]["label"] == "coyote"
+            and coyote_hits[0]["cnt"] == 2
+            and all(lbl in list_labels for lbl in a_labels + raccoon_labels)
+            and LBL_DOG not in a_labels + raccoon_labels
+        )
+        _check(
+            case_id, ok,
+            f"coyote_hits={coyote_hits}, a_labels={a_labels}, raccoon_labels={raccoon_labels}",
+        )
+        if ok:
+            passed += 1
+
+        # GR6 (audit self-test) — the production audit passes on GR2's
+        # fixture and does not SKIP.
+        case_id = "GR6"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            audit_result = suite_audit(gr2_path)
+        captured = buf.getvalue()
+        ok = audit_result == (4, 4) and "SKIP" not in captured and "FAIL" not in captured
+        _check(case_id, ok, f"audit_result={audit_result}, captured={captured!r}")
+        if ok:
+            passed += 1
+    finally:
+        database.set_db_path(original_db_path)
+        tmpdir_obj.cleanup()
+
+    return (passed, total)
+
+
+# ── `audit` suite (read-only; SKIPs without a database) ──────────────────
+
+_AUDIT_TABLES = ("videos", "detections", "species", "crops", "species_corrections", "blacklist")
+
+
+def suite_audit(db_path="data/wildlife.db"):
+    """`audit` suite cases AU1-AU4 (4 total). Read-only: every statement is a
+    SELECT and the readers only SELECT. If `db_path` does not exist, prints
+    `SKIP: audit (no database at <path>)` and returns (4, 4), the verify_phase10
+    idiom."""
+    total = 4
+    if not Path(db_path).exists():
+        print(f"SKIP: audit (no database at {db_path})")
+        return (total, total)
+
+    passed = 0
+    original_db_path = database.get_db_path()
+
+    def _select(conn, sql, params=()):
+        if not sql.lstrip().upper().startswith(("SELECT", "WITH")):
+            raise AssertionError("suite_audit attempted a non-SELECT statement")
+        return conn.execute(sql, params)
+
+    def _counts(conn):
+        return {
+            t: _select(conn, f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+            for t in _AUDIT_TABLES
+        }
+
+    try:
+        database.set_db_path(db_path)
+        with database.get_conn() as conn:
+            has_corrections_table = (
+                _select(
+                    conn,
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='species_corrections'",
+                ).fetchone()[0]
+                == 1
+            )
+            counts_before = _counts(conn) if has_corrections_table else {}
+
+            # AU1 — diagnostics (RESEARCH A2/A3, D-03, D-07).
+            case_id = "AU1"
+            print(f"INFO: sqlite_version {sqlite3.sqlite_version}")
+            multiplicity = 0
+            if has_corrections_table:
+                by_supp = _select(
+                    conn,
+                    "SELECT suppressed, COUNT(*) FROM species_corrections GROUP BY suppressed",
+                ).fetchall()
+                print(f"INFO: species_corrections by suppressed {[tuple(r) for r in by_supp]}")
+                kept0 = _select(
+                    conn,
+                    f"""SELECT COUNT(*) FROM species s
+                        JOIN detections d ON s.detection_id = d.id
+                        JOIN videos v ON d.video_id = v.id
+                        WHERE {database.KNOWN_SPECIES_FILTER}
+                          AND COALESCE(v.kept, 0) != 1""",
+                ).fetchone()[0]
+                print(f"INFO: known-filtered species rows on kept!=1 videos {kept0}")
+                multiplicity = _select(
+                    conn,
+                    f"""SELECT COUNT(*) FROM species s
+                        JOIN detections d ON s.detection_id = d.id
+                        WHERE {database.KNOWN_SPECIES_FILTER}
+                          AND (SELECT COUNT(*) FROM crops c WHERE c.detection_id = d.id) != 1""",
+                ).fetchone()[0]
+                print(f"INFO: known-filtered detections whose crop count is not 1 {multiplicity}")
+                corrected_blacklisted = _select(
+                    conn,
+                    f"""SELECT COUNT(*) FROM species s
+                        JOIN detections d ON s.detection_id = d.id
+                        WHERE s.label IN (SELECT label FROM blacklist)
+                          AND {database.CORRECTED_KEY} IS NOT NULL""",
+                ).fetchone()[0]
+                print(f"INFO: corrected detections whose raw label is blacklisted {corrected_blacklisted}")
+        ok = has_corrections_table
+        _check(case_id, ok, "species_corrections table is missing")
+        if ok:
+            passed += 1
+        if not has_corrections_table:
+            return (passed, total)
+
+        rows = database.get_species_list()
+        names = {}
+        for r in rows:
+            names[r["common_name"]] = names.get(r["common_name"], 0) + 1
+        shared = sum(1 for n in names.values() if n >= 2)
+        print(f"INFO: keys {len(rows)}")
+        print(f"INFO: display names shared by two or more keys {shared}")
+
+        # AU2 — the readers agree. activity_complete is False on real data:
+        # the 7-day activity window can lag the all-time list.
+        case_id = "AU2"
+        hard, soft = _cross_reader_violations(
+            strict_gallery=(multiplicity == 0), activity_complete=False
+        )
+        for line in soft:
+            print(f"WARN: {line}")
+        ok = not hard
+        _check(case_id, ok, f"{len(hard)} violation(s): {hard[:20]}")
+        if ok:
+            passed += 1
+
+        # AU3 (RESEARCH A4) — every reader stays inside the time budget.
+        case_id = "AU3"
+        timings = {}
+
+        def _timed(name, fn):
+            started = time.perf_counter()
+            fn()
+            timings[name] = time.perf_counter() - started
+
+        _timed("get_species_list", database.get_species_list)
+        _timed("get_stats", database.get_stats)
+        _timed("get_timeline", database.get_timeline)
+        _timed(
+            "get_timeline(all)",
+            lambda: database.get_timeline(date_from=TIMELINE_ALL[0], date_to=TIMELINE_ALL[1]),
+        )
+        if rows:
+            big = max(rows, key=lambda r: r["detection_count"])["label"]
+            _timed("get_species_detail", lambda: database.get_species_detail(big))
+            _timed("get_gallery(species)", lambda: database.get_gallery(species_label=big))
+            _timed("get_videos(species)", lambda: database.get_videos(species_label=big))
+        _timed("search", lambda: database.search("raccoon"))
+        for name, secs in timings.items():
+            print(f"INFO: timing {name} {secs:.3f}")
+        slow = {n: round(t, 3) for n, t in timings.items() if t >= READER_TIME_BUDGET_SECS}
+        ok = not slow
+        _check(case_id, ok, f"over the {READER_TIME_BUDGET_SECS}s budget: {slow}")
+        if ok:
+            passed += 1
+
+        # AU4 — the audit changed nothing.
+        case_id = "AU4"
+        with database.get_conn() as conn:
+            counts_after = _counts(conn)
+        ok = counts_after == counts_before
+        _check(case_id, ok, f"before={counts_before}, after={counts_after}")
+        if ok:
+            passed += 1
+    finally:
+        database.set_db_path(original_db_path)
+
+    return (passed, total)
+
+
 # ── registry / CLI ───────────────────────────────────────────────────────
 
 SUITES = {
     "lockstep": (suite_lockstep, 8),
+    "grouping": (suite_grouping, 6),
+    "audit": (suite_audit, 4),
 }
 
 
@@ -477,6 +901,10 @@ def main():
         help="which suite to run (default: all)",
     )
     parser.add_argument("--list", action="store_true", help="list suites and exit")
+    parser.add_argument(
+        "--db", default="data/wildlife.db",
+        help="database for the read-only audit suite (default: data/wildlife.db)",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -488,7 +916,7 @@ def main():
     all_passed = True
     for name in names:
         fn, _total = SUITES[name]
-        passed, total = fn()
+        passed, total = fn(args.db) if name == "audit" else fn()
         if passed == total:
             print(f"PASS: {name} ({passed}/{total})")
         else:

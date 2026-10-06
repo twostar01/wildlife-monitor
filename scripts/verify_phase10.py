@@ -325,6 +325,14 @@ def suite_fix01():
             database.get_videos()
             database.get_video_by_id(video1)
             database.get_timeline()
+            # Phase 15 (D-13): the effective-key readers and filters resolve
+            # their `s`/`d` aliases too — drilldown, search's species half,
+            # and both species_label predicates, plus an unknown key.
+            database.get_species_detail("domestic cat")
+            database.get_species_detail("zz-no-such-key")
+            database.search("cat")
+            database.get_gallery(species_label="domestic cat")
+            database.get_videos(species_label="domestic cat")
         except sqlite3.OperationalError as exc:
             f10_ok = False
             f10_detail = str(exc)

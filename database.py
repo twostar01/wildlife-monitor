@@ -522,44 +522,51 @@ VIDEO_CORRECTION_SCIENTIFIC = """(
 EFFECTIVE_COMMON = f"COALESCE(NULLIF({UNIFIED_CORRECTION_COMMON},''), s.common_name)"
 EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({UNIFIED_CORRECTION_SCIENTIFIC},''), s.scientific_name)"
 
-# ── Deliberately NOT converted to EFFECTIVE_COMMON/EFFECTIVE_SCIENTIFIC ──
+# ── Effective-key readers and the readers that stay raw (Phase 15) ───────
 #
-# The following readers stay on DISPLAY_COMMON/DISPLAY_SCIENTIFIC (or never
-# used them), on purpose, and case P10 (scripts/verify_phase12.py) pins
-# this boundary as a regression:
+# Phase 15 (LABEL-01..05) moved every species reader that groups or filters
+# by "which species is this?" onto EFFECTIVE_KEY (defined above, with the
+# key_display CTE and its display rule):
 #
-#   - get_species_list()      (GROUP BY s.label)
-#   - get_stats() top_species  (GROUP BY s.label)
-#   - get_timeline()           (GROUP BY period, s.label)
-#     These three GROUP BY the raw label. Selecting an effective name over
-#     a group keyed on the raw label makes SQLite return an arbitrary
-#     member row's value, so a label with some corrected and some
-#     uncorrected detections would display non-deterministically —
-#     strictly worse than the current stable-if-stale behaviour.
+#   - get_species_list()
+#   - get_stats(): unique_species, top_species, activity_7d_by_species
+#   - get_timeline()
+#   - get_species_detail() (all four of its queries)
+#   - get_gallery() and get_videos() species filters (species_label)
+#   - search(): the species half
 #
-#   - get_stats() activity_raw (selects the raw s.common_name directly)
-#     Already selects the raw common_name and has never used DISPLAY_COMMON
-#     at all — stale for BOTH correction paths. That predates this phase
-#     and is unrelated to it.
+# Each one interpolates the SAME constant in its GROUP BY / WHERE, takes its
+# display name from key_display (latest correction wins, id breaks ties),
+# and never GROUP BYs or ORDERs BY a bare `label`/`common_name` result alias
+# (SQLite would resolve that against the FROM-clause column and silently
+# regroup on the raw s.label). The API field `label` now carries the key, so
+# the dropdown <option> values, the ?species= predicates and the
+# /api/species/{label} drilldown stay in lockstep with no frontend change.
 #
-#   - search()
-#     Never used DISPLAY_COMMON, and its species query has no `d`
-#     (detections) alias in scope, so EFFECTIVE_COMMON cannot be
-#     interpolated there without a join change.
+# DISPLAY_COMMON and DISPLAY_SCIENTIFIC have no remaining readers. They stay
+# defined, and their removal belongs to the Phase-14 D-07 legacy-removal
+# follow-up.
 #
-#   - get_gallery()'s species filter (s.label = ?) and get_videos()'s
-#     species filter and its `s.common_name LIKE ?` search predicate
-#     Match on raw values — a video-corrected crop still answers to its
-#     original label in those filters.
+# Readers that STAY on the raw label, and why:
 #
-# Correcting any of the above means grouping and filtering by the
-# EFFECTIVE (post-correction) label instead of the raw one, which changes
-# the drilldown key get_species_detail(label) accepts, the <option> values
-# populateSpeciesFilters() emits (static/index.html), and chart series
-# identity. No source artifact decides what that key should be, so this
-# plan records the boundary rather than acting on it. If case P10 ever
-# fails, that decision has not been made yet — it failing is a request for
-# one, not a bug.
+#   Deferred follow-ups (operator decision 2 — not bugs, recorded so they are
+#   not silent drops):
+#     - get_videos(has_species=...) (dashboard "Recent detections", Videos-
+#       tab "has species" filter). It tests the raw s.label != 'Unknown
+#       species', so a video whose only detection was corrected away from
+#       Unknown still counts as "no species".
+#     - get_videos(search=...). It matches the raw s.common_name/s.label, so
+#       Videos-tab text search still finds a corrected detection by its old
+#       AI name and does not find it by its corrected name.
+#     - the videos half of search(), for the same reason.
+#
+#   Raw by design:
+#     - get_blacklist_affected_count() and requeue_species(): they operate on
+#       SpeciesNet labels for reprocessing.
+#     - _fanout_detection_ids() and the `label` field of gallery and video-
+#       player item dicts: the write-time fan-out matches raw labels, and the
+#       correction popover needs the raw label back.
+#     - the D-09 Unknown-sibling subquery in SUPPRESS_UNKNOWN_IF_IDENTIFIED.
 #
 # ── Phase 14 (Correction Unification) additions ─────────────────────────
 #
@@ -569,9 +576,7 @@ EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({UNIFIED_CORRECTION_SCIENTIFIC},''), s.
 # (Gallery popover, video-player editor) is resolved at WRITE time by the
 # species_corrections UNIQUE(detection_id) UPSERT (D-03, plain recency —
 # whichever write is most recent wins), not at read time by the order of a
-# COALESCE chain. This is a real behaviour change from the previously-
-# shipped "video-player value always wins" ordering this comment block used
-# to document (see the old EFFECTIVE_COMMON comment, now superseded).
+# COALESCE chain.
 #
 # species.user_common_name / species.user_scientific_name /
 # species.corrected_at, and the entire video_corrections table, are frozen
@@ -583,22 +588,10 @@ EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({UNIFIED_CORRECTION_SCIENTIFIC},''), s.
 # '/api/corrections' is a POST, in applyCorrection()), so it is deliberately
 # left reading the frozen table rather than rewired to species_corrections.
 #
-# Interim staleness window (accepted, not a bug): get_species_list(),
-# get_stats()'s top_species and get_timeline() (see the bullets above) still
-# resolve their displayed NAME through DISPLAY_COMMON, which reads the
-# now-frozen species.user_common_name. Any correction made after this phase
-# deploys and before Phase 15 ships will therefore NOT change the name shown
-# in the Species tab, Stats top-species tile, or Timeline chart — even
-# though it correctly changes the Gallery grid, species-detail crop grid,
-# Videos tab and video player (all rewired to EFFECTIVE_COMMON/
-# EFFECTIVE_SCIENTIFIC above). The ✏ corrected badge in the Species tab
-# stays accurate throughout, because HAS_CORRECTION is rewired here and
-# those three readers already consume it. This is RESEARCH.md's Pitfall 1,
-# accepted deliberately: converting those three readers' displayed name
-# without also converting their GROUP BY key would reintroduce the exact
-# SQLite arbitrary-row-per-group hazard this comment block exists to
-# prevent (see the bullets above). Phase 15 (LABEL-01..05) closes this
-# window.
+# The Phase-14 "interim staleness window" (the Species tab, Stats top-species
+# tile and Timeline still showing the frozen species.user_common_name) is
+# CLOSED: those readers now group on EFFECTIVE_KEY and name their buckets
+# from key_display.
 #
 # The `suppressed` column on species_corrections — not a NULL
 # corrected_label — is the suppression signal. A NULL corrected_label on a
@@ -1950,7 +1943,7 @@ def get_stats() -> dict:
             "SELECT COUNT(DISTINCT video_id) FROM detections WHERE category='person'"
         ).fetchone()[0]
         total_species = conn.execute(
-            f"""SELECT COUNT(DISTINCT s.label)
+            f"""SELECT COUNT(DISTINCT {EFFECTIVE_KEY})
                 FROM species s
                 JOIN detections d ON s.detection_id = d.id
                 WHERE {KNOWN_SPECIES_FILTER}"""
@@ -1958,39 +1951,67 @@ def get_stats() -> dict:
         total_detections = conn.execute("SELECT COUNT(*) FROM detections").fetchone()[0]
         total_crops = conn.execute("SELECT COUNT(*) FROM crops").fetchone()[0]
 
-        # Last 7 days activity broken out by species
+        # Last 7 days activity broken out by species. Keyed on EFFECTIVE_KEY and
+        # restructured around an inner-joined `ev` CTE: the species filter used to
+        # sit inside a LEFT JOIN ... ON, so a row whose species was filtered out
+        # still had a non-NULL `d` and the key would have resolved that
+        # detection's correction anyway. Inner-joining the filtered events first
+        # gives membership identical to every other reader. Empty days still
+        # produce one row with NULL label and count 0 (the frontend drops them).
         activity_raw = conn.execute(f"""
             WITH RECURSIVE dates(day) AS (
                 SELECT DATE('now', '-6 days')
                 UNION ALL
                 SELECT DATE(day, '+1 day')
                 FROM dates WHERE day < DATE('now')
+            ),
+            {KEY_DISPLAY_CTE},
+            ev AS (
+                SELECT DATE(v.recorded_at) AS day,
+                       v.id AS vid,
+                       {EFFECTIVE_KEY} AS ekey,
+                       s.common_name AS raw_common
+                FROM videos v
+                JOIN detections d ON v.id = d.video_id
+                JOIN species s ON s.detection_id = d.id
+                WHERE v.kept = 1
+                  AND DATE(v.recorded_at) >= DATE('now', '-6 days')
+                  AND {KNOWN_SPECIES_FILTER}
+                  AND {EFFECTIVE_KEY} != 'Unknown species'
             )
-            SELECT dates.day,
-                   s.common_name as species,
-                   s.label,
-                   COUNT(DISTINCT v.id) as count
+            SELECT dates.day AS day,
+                   COALESCE(MAX(kd.display_common), MAX(ev.raw_common)) AS species,
+                   ev.ekey AS label,
+                   COUNT(DISTINCT ev.vid) AS count
             FROM dates
-            LEFT JOIN videos v
-                ON DATE(v.recorded_at) = dates.day AND v.kept = 1
-            LEFT JOIN detections d ON v.id = d.video_id
-            LEFT JOIN species s ON s.detection_id = d.id
-                AND {KNOWN_SPECIES_FILTER}
-                AND s.label != 'Unknown species'
-            GROUP BY dates.day, s.label
+            LEFT JOIN ev ON ev.day = dates.day
+            LEFT JOIN key_display kd ON kd.k = ev.ekey
+            GROUP BY dates.day, ev.ekey
             ORDER BY dates.day
         """).fetchall()
 
         # Top 5 species — exclude Unknown species from this list entirely
-        # since it's not a real species and dominates the chart unhelpfully
+        # since it's not a real species and dominates the chart unhelpfully.
+        # The exclusion tests the KEY, not the raw label, so a detection
+        # corrected away from Unknown counts under its corrected key.
         top_species = conn.execute(f"""
-            SELECT {DISPLAY_COMMON} AS common_name, s.label, COUNT(*) as cnt
-            FROM species s
-            JOIN detections d ON s.detection_id = d.id
-            WHERE {KNOWN_SPECIES_FILTER}
-              AND s.label != 'Unknown species'
-            GROUP BY s.label
-            ORDER BY cnt DESC LIMIT 5
+            WITH {KEY_DISPLAY_CTE}
+            SELECT COALESCE(kd.display_common, g.raw_common) AS common_name,
+                   g.ekey AS label,
+                   g.cnt AS cnt
+            FROM (
+                SELECT {EFFECTIVE_KEY} AS ekey,
+                       MAX(s.common_name) AS raw_common,
+                       COUNT(*) AS cnt
+                FROM species s
+                JOIN detections d ON s.detection_id = d.id
+                WHERE {KNOWN_SPECIES_FILTER}
+                  AND {EFFECTIVE_KEY} != 'Unknown species'
+                GROUP BY {EFFECTIVE_KEY}
+            ) g
+            LEFT JOIN key_display kd ON kd.k = g.ekey
+            ORDER BY g.cnt DESC, g.ekey
+            LIMIT 5
         """).fetchall()
 
         # Most recent detection
@@ -2539,19 +2560,29 @@ def get_timeline(
             # Daily
             period_expr = "DATE(v.recorded_at)"
 
+        # Grouped on EFFECTIVE_KEY (the CTE adds no parameters, so the `params`
+        # order is unchanged). The display name is resolved once per key via
+        # key_display, never per output row.
         rows = conn.execute(f"""
-            SELECT
-                {period_expr} as period,
-                s.label,
-                {DISPLAY_COMMON} AS common_name,
-                COUNT(DISTINCT v.id) as count
-            FROM videos v
-            JOIN detections d ON v.id = d.video_id
-            JOIN species s ON s.detection_id = d.id
-            WHERE v.kept = 1 {where}
-              AND {KNOWN_SPECIES_FILTER}
-            GROUP BY period, s.label
-            ORDER BY period
+            WITH {KEY_DISPLAY_CTE}
+            SELECT g.period AS period,
+                   g.ekey AS label,
+                   COALESCE(kd.display_common, g.raw_common) AS common_name,
+                   g.count AS count
+            FROM (
+                SELECT {period_expr} AS period,
+                       {EFFECTIVE_KEY} AS ekey,
+                       MAX(s.common_name) AS raw_common,
+                       COUNT(DISTINCT v.id) AS count
+                FROM videos v
+                JOIN detections d ON v.id = d.video_id
+                JOIN species s ON s.detection_id = d.id
+                WHERE v.kept = 1 {where}
+                  AND {KNOWN_SPECIES_FILTER}
+                GROUP BY {period_expr}, {EFFECTIVE_KEY}
+            ) g
+            LEFT JOIN key_display kd ON kd.k = g.ekey
+            ORDER BY g.period, g.ekey
         """, params).fetchall()
 
         return {
@@ -2564,11 +2595,34 @@ def get_timeline(
 def search(query: str) -> dict:
     q = f"%{query}%"
     with get_conn() as conn:
-        species = conn.execute("""
-            SELECT DISTINCT label, common_name, scientific_name, COUNT(*) as cnt
-            FROM species
-            WHERE label LIKE ? OR common_name LIKE ? OR scientific_name LIKE ?
-            GROUP BY label LIMIT 10
+        # Species half keys on EFFECTIVE_KEY like every other species reader, so
+        # a hit is always a bucket get_species_list() would list (and
+        # openSpecies() can open). The videos half below stays on the raw
+        # label on purpose (see the deferred raw-label readers near
+        # EFFECTIVE_SCIENTIFIC).
+        species = conn.execute(f"""
+            WITH {KEY_DISPLAY_CTE}
+            SELECT g.ekey AS label,
+                   COALESCE(kd.display_common, g.raw_common) AS common_name,
+                   CASE WHEN kd.k IS NOT NULL THEN kd.display_scientific
+                        ELSE g.raw_sci END AS scientific_name,
+                   g.cnt AS cnt
+            FROM (
+                SELECT {EFFECTIVE_KEY} AS ekey,
+                       MAX(s.common_name) AS raw_common,
+                       MAX(s.scientific_name) AS raw_sci,
+                       COUNT(*) AS cnt
+                FROM species s
+                JOIN detections d ON s.detection_id = d.id
+                WHERE {KNOWN_SPECIES_FILTER}
+                  AND ({EFFECTIVE_KEY} LIKE ?
+                       OR {EFFECTIVE_COMMON} LIKE ?
+                       OR {EFFECTIVE_SCIENTIFIC} LIKE ?)
+                GROUP BY {EFFECTIVE_KEY}
+            ) g
+            LEFT JOIN key_display kd ON kd.k = g.ekey
+            ORDER BY g.cnt DESC, g.ekey
+            LIMIT 10
         """, (q, q, q)).fetchall()
 
         videos = conn.execute("""

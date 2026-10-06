@@ -25,8 +25,9 @@ Suites:
                   this plan never touches and which already produced the
                   correct value before this plan existed), P9 (the
                   suppression sentinel and the blank-corrected-name guard),
-                  and P10 (the non-goal pin — get_species_list(),
-                  get_stats() and get_timeline() stay on the raw label).
+                  and P10 (Phase 15, D-13: get_species_list(),
+                  get_stats() and get_timeline() group on the effective
+                  key, so corrected detections leave their raw-label bucket).
                   P8 (the video_corrections-vs-species.user_common_name
                   precedence case) checks get_gallery() AND
                   get_video_by_id() together — the get_video_by_id() half is
@@ -594,11 +595,11 @@ def suite_propagation():
     a species corrected through the video player's per-crop editor
     (video_corrections) now shows its corrected common/scientific name in
     the Gallery grid, the species-detail modal, the Videos tab and filename
-    search — not only inside that one video's own detail view — while the
-    five readers that group or filter on the raw species label
-    (get_species_list(), get_stats(), get_timeline(), search(), and the
-    species-filter predicates in get_gallery()/get_videos()) stay
-    unchanged, on purpose, pinned by case P10.
+    search — not only inside that one video's own detail view. Since Phase 15
+    (D-13) the readers that group or filter on a species (get_species_list(),
+    get_stats(), get_timeline(), search()'s species half, and the
+    species-filter predicates in get_gallery()/get_videos()) key on the
+    EFFECTIVE label, not the raw one; case P10 pins that grouping.
 
     Reuses `_seed_fixture_db()` as-is, then applies the Gallery-popover
     correction to dB itself (mirroring `suite_badge()`'s own post-seed
@@ -763,52 +764,58 @@ def suite_propagation():
         if ok:
             passed += 1
 
-        # P10 — non-goal pin: get_species_list()'s "domestic cat" row still
-        # reports the RAW SpeciesNet common name (via its unambiguous
-        # ai_common_name column — every "domestic cat" detection in this
-        # fixture shares the same raw s.common_name, so this check is
-        # deterministic regardless of which group member SQLite's bare
-        # GROUP BY column selection happens to pick), get_stats()
-        # ['top_species'] still keys on the raw label, and get_timeline()'s
-        # rows still carry the raw-label grouping key. Green before AND
-        # after. Grouping/filtering by an effective (post-correction) label
-        # is a DELIBERATE, DOCUMENTED NON-GOAL of this plan — see the
-        # comment block beneath EFFECTIVE_SCIENTIFIC in database.py —
-        # because it would change the drilldown key get_species_detail()
-        # accepts, the <option> values populateSpeciesFilters() emits, and
-        # chart series identity, and no source artifact decides what that
-        # key should be. If this case ever fails, that decision has not
-        # been made yet — it failing is a request for one, not a bug.
+        # P10 — effective-key grouping (Phase 15, D-13; formerly the
+        # "deliberate non-goal" pin of raw-label grouping). dB is corrected
+        # up front, and dA carries a video-player correction, so the corrected
+        # bucket "northern raccoon" holds exactly dA and dB. Every reader that
+        # groups on the effective key must agree: get_species_list() has one
+        # "northern raccoon" row (detection_count 2, video_count 2, display
+        # name "Northern Raccoon", no ai_common_name key anywhere),
+        # get_stats()["top_species"] reports it with cnt 2, get_timeline()
+        # rows labelled "northern raccoon" sum to 2, and dA/dB have left the
+        # "domestic cat" drilldown. Phase 15's key decision (the normalised
+        # corrected common name, raw label for uncorrected detections) is
+        # what made the old non-goal comment obsolete.
         case_id = "P10"
         species_rows = database.get_species_list()
-        cat_row = next((r for r in species_rows if r.get("label") == "domestic cat"), None)
         raccoon_row = next(
             (r for r in species_rows if r.get("label") == "northern raccoon"), None
         )
         stats = database.get_stats()
-        stats_cat_row = next(
-            (r for r in stats["top_species"] if r.get("label") == "domestic cat"), None
+        stats_raccoon_row = next(
+            (r for r in stats["top_species"] if r.get("label") == "northern raccoon"), None
         )
         # Explicit window around the fixture's fixed 2026-08-16 dates: the
         # default 30-day lookback ages the fixture out of range as real time passes.
         timeline = database.get_timeline(date_from="2026-08-01", date_to="2026-08-31")
-        timeline_cat_rows = [r for r in timeline["rows"] if r.get("label") == "domestic cat"]
+        timeline_raccoon_sum = sum(
+            r.get("count", 0) for r in timeline["rows"] if r.get("label") == "northern raccoon"
+        )
+        cat_detail_ids = {
+            c.get("detection_id") for c in database.get_species_detail("domestic cat")["crops"]
+        }
         ok = (
-            cat_row is not None
-            and all("ai_common_name" not in r for r in species_rows)
-            and raccoon_row is not None
+            raccoon_row is not None
             and raccoon_row.get("detection_count") == 2
-            and stats_cat_row is not None
-            and bool(timeline_cat_rows)
+            and raccoon_row.get("video_count") == 2
+            and raccoon_row.get("common_name") == "Northern Raccoon"
+            and all("ai_common_name" not in r for r in species_rows)
+            and stats_raccoon_row is not None
+            and stats_raccoon_row.get("cnt") == 2
+            and stats_raccoon_row.get("common_name") == "Northern Raccoon"
+            and timeline_raccoon_sum == 2
+            and d_a not in cat_detail_ids
+            and d_b not in cat_detail_ids
         )
         _check(
             case_id,
             ok,
-            "deliberate non-goal — grouping/filtering by an effective "
-            "label requires a decision on the drilldown key that no source "
-            "artifact has made (see database.py's EFFECTIVE_SCIENTIFIC "
-            f"comment block); cat_row={cat_row}, stats_cat_row={stats_cat_row}, "
-            f"timeline_cat_rows={timeline_cat_rows}",
+            "effective-key grouping (Phase 15 D-13): corrected detections dA/dB "
+            "must group under 'northern raccoon' in the species list, stats "
+            f"top_species and timeline; raccoon_row={raccoon_row}, "
+            f"stats_raccoon_row={stats_raccoon_row}, "
+            f"timeline_raccoon_sum={timeline_raccoon_sum}, "
+            f"cat_detail_ids={cat_detail_ids}",
         )
         if ok:
             passed += 1
