@@ -1,9 +1,17 @@
 ---
 phase: 14-correction-unification-schema-backfill-cutover
 verified: 2026-10-06T18:00:00Z
-status: human_needed
-score: 6/8 must-haves verified
+status: passed
+score: 8/8 must-haves verified
 covered_files:
+  - .planning/phases/14-correction-unification-schema-backfill-cutover/14-01-PLAN.md
+  - .planning/phases/14-correction-unification-schema-backfill-cutover/14-01-SUMMARY.md
+  - .planning/phases/14-correction-unification-schema-backfill-cutover/14-02-PLAN.md
+  - .planning/phases/14-correction-unification-schema-backfill-cutover/14-02-SUMMARY.md
+  - .planning/phases/14-correction-unification-schema-backfill-cutover/14-03-PLAN.md
+  - .planning/phases/14-correction-unification-schema-backfill-cutover/14-03-SUMMARY.md
+  - .planning/phases/14-correction-unification-schema-backfill-cutover/14-04-PLAN.md
+  - .planning/phases/14-correction-unification-schema-backfill-cutover/14-04-SUMMARY.md
   - database.py
   - scripts/backfill_species_corrections.py
   - scripts/verify_backfill_species_corrections.py
@@ -12,9 +20,18 @@ covered_files:
   - scripts/verify_phase14.py
   - web_app.py
   - wildlife_processor.py
-covered_digest: "v2:sha256:35b94748576f7cebbe8ad1721f10ab49473c8df4e2391232f3c76221bd7b25e0"
+covered_digest: "v2:sha256:1a94a901bd97df8a1b2100f45f57d70788770cec596e7d15207f30fc5efbc1ce"
 behavior_unverified: 1
-overrides_applied: 0
+overrides_applied: 2
+overrides:
+  - item: "SC1 process clause: retroactive record of the 2026-08-22 production write accepted in place of a contemporaneous dry-run, pre-Go/No-Go rehearsal and recorded Go"
+    accepted_by: operator
+    accepted_on: 2026-10-06
+    reason: "Operator stated the run was done jointly with Claude; data outcome independently re-verified (15 rows, digests unchanged, 0 FK violations/orphans/duplicates, 20 rows today); retroactive record in 14-04-SUMMARY.md."
+  - item: "CR-01 reprocess cleanup is pinned only by a source-text check (G1); behaviour not executed"
+    accepted_by: operator
+    accepted_on: 2026-10-06
+    reason: "Accepted; to be confirmed on the next real --reprocess-flagged run (PROJECT.md Live-Verification Follow-ups)."
 re_verification:
   previous_status: none
 gaps: []
@@ -36,7 +53,7 @@ human_verification:
 
 **Phase Goal:** A single `species_corrections` table (keyed uniquely per detection) becomes the one authoritative source for a detection's corrected species, replacing `species.user_common_name` and `video_corrections` as the system of record, with both existing write paths cut over to it and every historical correction preserved, per the operator-approved full-schema-unification decision.
 **Verified:** 2026-10-06
-**Status:** human_needed
+**Status:** passed (2 operator overrides applied 2026-10-06; deployment of 94a5f94 confirmed on ubuntulaptop 2026-10-06)
 **Re-verification:** No, initial verification
 
 ## Verdict
