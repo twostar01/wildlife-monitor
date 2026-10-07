@@ -618,20 +618,33 @@ EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({UNIFIED_CORRECTION_SCIENTIFIC},''), s.
 # defined, and their removal belongs to the Phase-14 D-07 legacy-removal
 # follow-up.
 #
-# Readers that STAY on the raw label, and why:
+# Phase 16 (READER-01..03) converted the three video readers that used to
+# stay on the raw label, so the Phase 15 "deferred follow-ups" list is gone:
 #
-#   Deferred follow-ups (operator decision 2 — not bugs, recorded so they are
-#   not silent drops):
-#     - get_videos(has_species=...) (dashboard "Recent detections", Videos-
-#       tab "has species" filter). It tests the raw s.label != 'Unknown
-#       species', so a video whose only detection was corrected away from
-#       Unknown still counts as "no species".
-#     - get_videos(search=...). It matches the raw s.common_name/s.label, so
-#       Videos-tab text search still finds a corrected detection by its old
-#       AI name and does not find it by its corrected name.
-#     - the videos half of search(), for the same reason.
+#   - get_videos(has_species=...) tests KNOWN_SPECIES_FILTER plus the
+#     Unknown-key comparison (`{EFFECTIVE_KEY} != 'Unknown species'`), the same
+#     shape get_stats uses (READER-01, D-09). A video whose only detection was
+#     corrected away from Unknown now counts; one whose only detections are
+#     suppressed, blacklisted, Unknown or named 'Unknown species' does not.
+#     The False branch is the exact complement (NOT IN, same predicate).
+#   - get_videos(search=...) and the videos half of search() match
+#     EFFECTIVE_COMMON plus an uncorrected-only raw-label branch
+#     (`CORRECTED_KEY IS NULL AND s.label LIKE ?`), inside KNOWN_SPECIES_FILTER
+#     (READER-02/03, D-08). A corrected detection is found by its corrected
+#     name only; an uncorrected one is still found by raw taxonomy tokens such
+#     as "canidae"; a suppressed one is found by neither (P15-D08).
+#   - the species half of search() carries the same taxonomy branch, so the
+#     two halves of global search stay consistent.
+#
+# Totals change by design, not by regression: a video whose only species
+# detections are blacklisted, suppressed, Unknown or named 'Unknown species'
+# moves from has-species to no-species and drops out of the dashboard "Recent
+# detections" list, and search hits exclude blacklisted-only and suppressed-only
+# videos, consistent with every other reader.
 #
 #   Raw by design:
+#     - the uncorrected-only taxonomy branch above (s.label LIKE ? guarded by
+#       CORRECTED_KEY IS NULL): taxonomy tokens live only on the raw label.
 #     - get_blacklist_affected_count() and requeue_species(): they operate on
 #       SpeciesNet labels for reprocessing.
 #     - _fanout_detection_ids() and the `label` field of gallery and video-
@@ -2502,18 +2515,22 @@ def get_videos(
         conditions.append(f"""
             v.id IN (SELECT d.video_id FROM detections d
                      JOIN species s ON s.detection_id=d.id
-                     WHERE {BLANK_LABEL_FILTER} AND s.label != 'Unknown species')
+                     WHERE {KNOWN_SPECIES_FILTER} AND {EFFECTIVE_KEY} != 'Unknown species')
         """)
     elif has_species is False:
         conditions.append(f"""
             v.id NOT IN (SELECT d.video_id FROM detections d
                          JOIN species s ON s.detection_id=d.id
-                         WHERE {BLANK_LABEL_FILTER} AND s.label != 'Unknown species')
+                         WHERE {KNOWN_SPECIES_FILTER} AND {EFFECTIVE_KEY} != 'Unknown species')
         """)
     if search:
-        conditions.append("(v.filename LIKE ? OR v.camera_name LIKE ? OR v.id IN "
-                          "(SELECT d.video_id FROM detections d JOIN species s ON s.detection_id=d.id "
-                          "WHERE s.common_name LIKE ? OR s.label LIKE ?))")
+        # Effective name, plus raw taxonomy tokens for uncorrected rows only
+        # (READER-02/03, D-08). Four `?`, four binds: change both together.
+        conditions.append(f"""(v.filename LIKE ? OR v.camera_name LIKE ? OR v.id IN
+            (SELECT d.video_id FROM detections d JOIN species s ON s.detection_id=d.id
+             WHERE {KNOWN_SPECIES_FILTER}
+               AND ({EFFECTIVE_COMMON} LIKE ?
+                    OR ({CORRECTED_KEY} IS NULL AND s.label LIKE ?))))""")
         params.extend([f"%{search}%", f"%{search}%", f"%{search}%", f"%{search}%"])
 
     where = "WHERE " + " AND ".join(conditions) if conditions else ""
@@ -2713,8 +2730,12 @@ def search(query: str) -> dict:
     with get_conn() as conn:
         # Species half keys on EFFECTIVE_KEY like every other species reader, so
         # a hit is always a bucket get_species_list() would list (and
-        # openSpecies() can open). The videos half below stays on the raw
-        # label on purpose (see the deferred raw-label readers near
+        # openSpecies() can open). Both halves match the effective name; raw
+        # taxonomy tokens (e.g. "canidae") still match, for UNCORRECTED rows
+        # only (READER-02/03, D-08), and always inside KNOWN_SPECIES_FILTER so
+        # a suppressed or blacklisted detection is never found (P15-D08).
+        # Totals change by design: blacklisted-only and suppressed-only videos
+        # are no longer hits (see "Effective-key readers" near
         # EFFECTIVE_SCIENTIFIC).
         species = conn.execute(f"""
             WITH {KEY_DISPLAY_CTE}, {NATIVE_DISPLAY_CTE}
@@ -2734,21 +2755,28 @@ def search(query: str) -> dict:
                 WHERE {KNOWN_SPECIES_FILTER}
                   AND ({EFFECTIVE_KEY} LIKE ?
                        OR {EFFECTIVE_COMMON} LIKE ?
-                       OR {EFFECTIVE_SCIENTIFIC} LIKE ?)
+                       OR {EFFECTIVE_SCIENTIFIC} LIKE ?
+                       OR ({CORRECTED_KEY} IS NULL AND s.label LIKE ?))
                 GROUP BY {EFFECTIVE_KEY}
             ) g
             LEFT JOIN key_display kd ON kd.k = g.ekey
             LEFT JOIN native_display nd ON nd.k = g.ekey
             ORDER BY g.cnt DESC, g.ekey
             LIMIT 10
-        """, (q, q, q)).fetchall()
+        """, (q, q, q, q)).fetchall()
 
-        videos = conn.execute("""
+        # A filename-only match must still work for a video with no species
+        # rows (s is NULL), hence the IS NOT NULL guard and the parenthesised
+        # group around the species predicate.
+        videos = conn.execute(f"""
             SELECT DISTINCT v.id, v.filename, v.recorded_at, v.thumbnail_path
             FROM videos v
             LEFT JOIN detections d ON v.id = d.video_id
             LEFT JOIN species s ON s.detection_id = d.id
-            WHERE v.filename LIKE ? OR s.common_name LIKE ? OR s.label LIKE ?
+            WHERE v.filename LIKE ?
+               OR (s.detection_id IS NOT NULL AND {KNOWN_SPECIES_FILTER}
+                   AND ({EFFECTIVE_COMMON} LIKE ?
+                        OR ({CORRECTED_KEY} IS NULL AND s.label LIKE ?)))
             ORDER BY v.recorded_at DESC LIMIT 10
         """, (q, q, q)).fetchall()
 

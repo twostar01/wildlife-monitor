@@ -21,7 +21,10 @@ Suites:
     resolver     - plan 16-02, D-06/BUCKET-05: an old raw label, a name in any
                    casing or the key resolves to the same bucket at
                    get_species_detail, get_gallery and get_videos (RS1-RS6).
-    (readers, frontend_src and live are added by plan 16-03.)
+    readers      - plan 16-03, READER-01..03/D-08/D-09: has_species, Videos
+                   search and both halves of global search on the effective
+                   name, with an uncorrected-only taxonomy branch (RD1-RD10).
+    (frontend_src and live are added by plan 16-03 task 2.)
 
 Fixture. _seed_phase16_fixture extends Phase 15's fixture (no fork) with rows
 whose RAW labels differ but whose common names normalise to the same bucket:
@@ -45,7 +48,7 @@ and Unknown species. Raw labels (LBL_*) and bucket keys (KEY_*) are separate
 constants (D-05).
 
 Usage:
-    python scripts/verify_phase16.py --suite audit_script|merge|unknown|resolver|all
+    python scripts/verify_phase16.py --suite audit_script|merge|unknown|resolver|readers|all
     python scripts/verify_phase16.py --list
 """
 
@@ -845,6 +848,258 @@ def suite_resolver():
     return (passed, total)
 
 
+# -- readers suite -----------------------------------------------------------
+
+def _has_species_ids(flag):
+    """Video ids in get_videos(has_species=flag, per_page=100)."""
+    return {v["id"] for v in database.get_videos(has_species=flag, per_page=100)["items"]}
+
+
+def _video_search_ids(q):
+    """Video ids in get_videos(search=q, per_page=100)."""
+    return {v["id"] for v in database.get_videos(search=q, per_page=100)["items"]}
+
+
+def _global_video_ids(q):
+    """Video ids in the videos half of database.search(q)."""
+    return {v["id"] for v in database.search(q)["videos"]}
+
+
+def _kept_video_ids():
+    with database.get_conn() as conn:
+        return {r[0] for r in conn.execute("SELECT id FROM videos WHERE kept = 1").fetchall()}
+
+
+def suite_readers():
+    """`readers` suite cases RD1-RD10 (10 total): READER-01..03, D-08, D-09."""
+    total = 10
+    passed = 0
+
+    # RD1 - has_species True and False partition every kept video.
+    def rd1():
+        with _fixture_db("rd1") as ids:
+            true_ids, false_ids = _has_species_ids(True), _has_species_ids(False)
+            kept = _kept_video_ids()
+            must_false = {ids[n] for n in ("vid8", "vid9", "vid14", "vid15", "vid18")}
+            must_true = {ids["vid1"], ids["vid16"]}
+            ok = (
+                true_ids | false_ids == kept
+                and not (true_ids & false_ids)
+                and must_true <= true_ids
+                and must_false <= false_ids
+            )
+            return ok, (
+                f"true={sorted(true_ids)}, false={sorted(false_ids)}, kept={sorted(kept)}, "
+                f"must_true={sorted(must_true)}, must_false={sorted(must_false)}"
+            )
+
+    passed += _case("RD1", rd1)
+
+    # RD2 - READER-01: a video whose only detection was corrected away from
+    # Unknown now has a species; the other Unknown-only videos still do not.
+    def rd2():
+        with _fixture_db("rd2") as ids:
+            before_false = ids["vid8"] in _has_species_ids(False)
+            rc = database.correct_species(ids["u2"], "Western Gray Squirrel", "Sciurus griseus")
+            true_ids, false_ids = _has_species_ids(True), _has_species_ids(False)
+            ok = (
+                before_false
+                and rc == 1
+                and ids["vid8"] in true_ids
+                and ids["vid14"] in false_ids
+                and ids["vid15"] in false_ids
+            )
+            return ok, f"before_false={before_false}, rc={rc}, true={sorted(true_ids)}, false={sorted(false_ids)}"
+
+    passed += _case("RD2", rd2)
+
+    # RD3 - D-09: suppressed-only and blacklisted-only videos do not count.
+    def rd3():
+        with _fixture_db("rd3") as ids:
+            before_true = ids["vid4"] in _has_species_ids(True)
+            n = database.save_video_correction(ids["vid4"], p15.LBL_DOG, None, None, None)
+            after_suppress = _has_species_ids(False)
+            database.add_to_blacklist(p15.LBL_BOAR, "Wild Boar", "Sus scrofa", "")
+            after_blacklist = _has_species_ids(False)
+            true_ids = _has_species_ids(True)
+            ok = (
+                before_true
+                and n == 1
+                and ids["vid4"] in after_suppress
+                and ids["vid6"] in after_blacklist
+                and ids["vid5"] in true_ids
+            )
+            return ok, (
+                f"before_true={before_true}, n={n}, suppress_false={sorted(after_suppress)}, "
+                f"blacklist_false={sorted(after_blacklist)}, true={sorted(true_ids)}"
+            )
+
+    passed += _case("RD3", rd3)
+
+    # RD4 / RD5 share one scenario: vid6's boar detections are corrected to
+    # Domestic Dog (video-player fan-out), u2 to Western Gray Squirrel.
+    def _corrected_scenario(ids):
+        n = database.save_video_correction(
+            ids["vid6"], p15.LBL_BOAR, "dog_label", "Domestic Dog", "Canis familiaris"
+        )
+        rc = database.correct_species(ids["u2"], "Western Gray Squirrel", "Sciurus griseus")
+        return n, rc
+
+    # RD4 - READER-02, get_videos(search=).
+    def rd4():
+        with _fixture_db("rd4") as ids:
+            n, rc = _corrected_scenario(ids)
+            vid6, vid8 = ids["vid6"], ids["vid8"]
+            ok = (
+                n == 3
+                and rc == 1
+                and vid6 not in _video_search_ids("boar")
+                and vid6 not in _video_search_ids("wild boar")
+                and vid6 in _video_search_ids("Domestic Dog")
+                and vid8 in _video_search_ids("squirrel")
+            )
+            return ok, (
+                f"n={n}, rc={rc}, boar={sorted(_video_search_ids('boar'))}, "
+                f"dog={sorted(_video_search_ids('Domestic Dog'))}, "
+                f"squirrel={sorted(_video_search_ids('squirrel'))}"
+            )
+
+    passed += _case("RD4", rd4)
+
+    # RD5 - READER-02, the videos half of search().
+    def rd5():
+        with _fixture_db("rd5") as ids:
+            n, rc = _corrected_scenario(ids)
+            vid6, vid8 = ids["vid6"], ids["vid8"]
+            ok = (
+                n == 3
+                and rc == 1
+                and vid6 not in _global_video_ids("boar")
+                and vid6 not in _global_video_ids("wild boar")
+                and vid6 in _global_video_ids("Domestic Dog")
+                and vid8 in _global_video_ids("squirrel")
+            )
+            return ok, (
+                f"n={n}, rc={rc}, boar={sorted(_global_video_ids('boar'))}, "
+                f"dog={sorted(_global_video_ids('Domestic Dog'))}, "
+                f"squirrel={sorted(_global_video_ids('squirrel'))}"
+            )
+
+    passed += _case("RD5", rd5)
+
+    # RD6 - READER-03: uncorrected detections still match raw taxonomy tokens
+    # in both video readers and in the species half of global search.
+    def rd6():
+        with _fixture_db("rd6") as ids:
+            _corrected_scenario(ids)
+            want = {ids["vid4"], ids["vid5"], ids["vid12"]}
+            vs, gs = _video_search_ids("canidae"), _global_video_ids("canidae")
+            hits = database.search("canidae")["species"]
+            hit_labels = [h["label"] for h in hits]
+            list_labels = p15._list_labels()
+            ok = (
+                want <= vs
+                and want <= gs
+                and ids["vid6"] not in vs
+                and ids["vid6"] not in gs
+                and ids["vid6"] not in _video_search_ids("suidae")
+                and ids["vid6"] not in _global_video_ids("suidae")
+                and KEY_DOG in hit_labels
+                and set(hit_labels) <= set(list_labels)
+            )
+            return ok, (
+                f"videos={sorted(vs)}, global={sorted(gs)}, species_hits={hit_labels}, "
+                f"list={sorted(list_labels)}"
+            )
+
+    passed += _case("RD6", rd6)
+
+    # RD7 - P15-D08: a suppressed detection is not found by its raw taxonomy.
+    def rd7():
+        with _fixture_db("rd7") as ids:
+            n = database.save_video_correction(ids["vid4"], p15.LBL_DOG, None, None, None)
+            vs, gs = _video_search_ids("canidae"), _global_video_ids("canidae")
+            ok = (
+                n == 1
+                and ids["vid4"] not in vs
+                and ids["vid4"] not in gs
+                and ids["vid5"] in vs
+                and ids["vid5"] in gs
+            )
+            return ok, f"n={n}, videos={sorted(vs)}, global={sorted(gs)}"
+
+    passed += _case("RD7", rd7)
+
+    # RD8 - a filename-only match survives for a video with no species rows.
+    def rd8():
+        with _fixture_db("rd8") as ids:
+            vs, gs = _video_search_ids("16_vid18"), _global_video_ids("16_vid18")
+            ok = ids["vid18"] in vs and ids["vid18"] in gs
+            return ok, f"videos={sorted(vs)}, global={sorted(gs)}, vid18={ids['vid18']}"
+
+    passed += _case("RD8", rd8)
+
+    # RD9 - source (comment-stripped database.py): predicates, placeholder and
+    # bound-value counts.
+    def rd9():
+        db_text = _src_db()
+        videos_fn = p15._slice(db_text, "def get_videos(", "\ndef ")
+        has_block = p15._slice(videos_fn, "if has_species is True:", "if search:")
+        search_block = p15._slice(videos_fn, "if search:", "where = ")
+        search_fn = p15._slice(db_text, "def search(", "\ndef ")
+        pred = "{KNOWN_SPECIES_FILTER} AND {EFFECTIVE_KEY} != 'Unknown species'"
+        bind = 'f"%{search}%"'
+        ok = (
+            has_block.count(pred) == 2
+            and "BLANK_LABEL_FILTER" not in has_block
+            and search_block.count("LIKE ?") == 4
+            and search_block.count(bind) == 4
+            and "{EFFECTIVE_COMMON} LIKE ?" in search_block
+            and search_fn.count("(q, q, q, q)") == 1
+            and search_fn.count("(q, q, q)") == 1
+            and search_fn.count("s.detection_id IS NOT NULL") == 1
+            and search_fn.count("{CORRECTED_KEY} IS NULL AND s.label LIKE ?") == 2
+        )
+        return ok, (
+            f"has_pred={has_block.count(pred)}, blank_filter={'BLANK_LABEL_FILTER' in has_block}, "
+            f"search_like={search_block.count('LIKE ?')}, "
+            f"search_binds={search_block.count(bind)}, "
+            f"q4={search_fn.count('(q, q, q, q)')}, q3={search_fn.count('(q, q, q)')}, "
+            f"notnull={search_fn.count('s.detection_id IS NOT NULL')}, "
+            f"taxo={search_fn.count('{CORRECTED_KEY} IS NULL AND s.label LIKE ?')}"
+        )
+
+    passed += _case("RD9", rd9)
+
+    # RD10 - lockstep still holds after MG7's correction set, and the two
+    # has_species lists still partition the kept videos.
+    def rd10():
+        with _fixture_db("rd10") as ids:
+            rcs = [
+                database.correct_species(ids["c1"], "domestic dog", "Canis lupus familiaris"),
+                database.correct_species(ids["b1"], "mule deer", "Odocoileus hemionus"),
+                database.correct_species(ids["p1"], "Coyote ", "Canis latrans"),
+                database.correct_species(ids["u1"], "Western Gray Squirrel", "Sciurus griseus"),
+                database.save_video_correction(
+                    ids["vid5"], LBL_DOG2, "raccoon_label", "Northern Raccoon", "Procyon lotor"
+                ),
+            ]
+            hard, soft = p15._cross_reader_violations()
+            t = database.get_videos(has_species=True, per_page=1)["total"]
+            f = database.get_videos(has_species=False, per_page=1)["total"]
+            kept = len(_kept_video_ids())
+            ok = (
+                all(rc is not None for rc in rcs)
+                and (hard, soft) == ([], [])
+                and t + f == kept
+            )
+            return ok, f"rcs={rcs}, hard={hard}, soft={soft}, true={t}, false={f}, kept={kept}"
+
+    passed += _case("RD10", rd10)
+
+    return (passed, total)
+
+
 # -- registry / CLI ----------------------------------------------------------
 
 SUITES = {
@@ -852,6 +1107,7 @@ SUITES = {
     "merge": (suite_merge, 9),
     "unknown": (suite_unknown, 6),
     "resolver": (suite_resolver, 6),
+    "readers": (suite_readers, 10),
 }
 
 # Suites that only run when explicitly requested (never part of --suite all).
