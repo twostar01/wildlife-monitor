@@ -7,8 +7,21 @@ Suites:
                    (scripts/audit_species_buckets.py) proven end to end on a
                    fixture with known collisions, in both pre-merge and merged
                    mode (AS1-AS7).
-    (merge, unknown and resolver are added by plan 16-02; readers, frontend_src
-    and live by plan 16-03.)
+    merge        - plan 16-02, BUCKET-01..04: same-name natives and corrections
+                   are ONE bucket, native-first display name, the corrected
+                   flag, the no-shared-name invariant and the single
+                   definitions (MG1-MG9; MG1 same-name natives, MG2 a
+                   correction joins them, MG3 adversarial display order, MG4
+                   most frequent native name, MG5 correction-only bucket, MG6
+                   re-correction, MG7 shared-name invariant, MG8 corrected
+                   badge flag, MG9 source pins).
+    unknown      - plan 16-02, BUCKET-02/D-05: both stored shapes of Unknown
+                   are one bucket and stay out of top_species and the 7-day
+                   chart (UN1-UN6).
+    resolver     - plan 16-02, D-06/BUCKET-05: an old raw label, a name in any
+                   casing or the key resolves to the same bucket at
+                   get_species_detail, get_gallery and get_videos (RS1-RS6).
+    (readers, frontend_src and live are added by plan 16-03.)
 
 Fixture. _seed_phase16_fixture extends Phase 15's fixture (no fork) with rows
 whose RAW labels differ but whose common names normalise to the same bucket:
@@ -32,7 +45,7 @@ and Unknown species. Raw labels (LBL_*) and bucket keys (KEY_*) are separate
 constants (D-05).
 
 Usage:
-    python scripts/verify_phase16.py --suite audit_script|all
+    python scripts/verify_phase16.py --suite audit_script|merge|unknown|resolver|all
     python scripts/verify_phase16.py --list
 """
 
@@ -371,10 +384,474 @@ def suite_audit_script():
     return (passed, total)
 
 
+# -- shared helpers for the merge / unknown / resolver suites ----------------
+
+BADGE_LINE = (
+    "${s.has_correction ? ' <span class=\"badge-corrected\">✏ corrected</span>' : ''}"
+)
+
+
+@contextlib.contextmanager
+def _fixture_db(name):
+    """A fresh Phase 16 fixture in its own temp dir; restores the DB path."""
+    original = database.get_db_path()
+    tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    try:
+        yield _seed_phase16_fixture(str(Path(tmp.name) / f"{name}.db"))
+    finally:
+        database.set_db_path(original)
+        tmp.cleanup()
+
+
+def _case(case_id, fn):
+    """Run one case body returning (ok, detail). An exception is a FAIL, not
+    an abort, so the suite still reports a count. Returns 1 or 0."""
+    try:
+        ok, detail = fn()
+    except Exception as exc:  # noqa: BLE001 - a harness reports, never aborts
+        ok, detail = False, f"raised {type(exc).__name__}: {exc}"
+    p15._check(case_id, ok, detail)
+    return 1 if ok else 0
+
+
+def _row(key):
+    return p15._list_row(key)
+
+
+def _src_db():
+    """database.py with Python comment lines stripped."""
+    return p15._strip_hash_comment_lines(p15._read_text("database.py"))
+
+
+# -- merge suite -------------------------------------------------------------
+
+def suite_merge():
+    """`merge` suite cases MG1-MG9 (9 total): BUCKET-01..04, D-01, D-04, D-07."""
+    total = 9
+    passed = 0
+
+    # MG1 - same-name natives merge; videos are a distinct union.
+    def mg1():
+        with _fixture_db("mg1") as ids:
+            dog = _row(KEY_DOG)
+            labels = p15._list_labels()
+            detail = database.get_species_detail(KEY_DOG)
+            ok = (
+                dog is not None
+                and dog["detection_count"] == 4
+                and dog["video_count"] == 3
+                and database.get_gallery(species_label=KEY_DOG)["total"] == 4
+                and database.get_videos(species_label=KEY_DOG)["total"] == 3
+                and detail["info"].get("total_detections") == 4
+                and p15._detail_crop_ids(KEY_DOG) == {ids["g1"], ids["g2"], ids["n1"], ids["n2"]}
+                and p15.LBL_DOG not in labels
+                and LBL_DOG2 not in labels
+                and LBL_NONAME in labels
+            )
+            return ok, f"dog={dog}, labels={sorted(labels)}"
+
+    passed += _case("MG1", mg1)
+
+    # MG2 + MG6 share one DB: a correction joins the native bucket, then is
+    # re-pointed at another bucket.
+    with _fixture_db("mg2") as ids:
+        def mg2():
+            rc = database.correct_species(ids["c1"], "domestic dog", "Canis domesticus")
+            dog, cat = _row(KEY_DOG), _row(KEY_CAT)
+            ok = (
+                rc == 1
+                and dog is not None
+                and dog["detection_count"] == 5
+                and dog["video_count"] == 4
+                and dog["has_correction"] == 1
+                and dog["common_name"] == "Domestic Dog"
+                and dog["scientific_name"] == "Canis lupus familiaris"
+                and cat is not None
+                and cat["detection_count"] == 6
+                and ids["c1"] in p15._gallery_ids(species_label=KEY_DOG)
+                and ids["c1"] in p15._detail_crop_ids(KEY_DOG)
+            )
+            return ok, f"rc={rc}, dog={dog}, cat={cat}"
+
+        passed += _case("MG2", mg2)
+
+        def mg6():
+            rc = database.correct_species(ids["c1"], "Domestic Cat", "Felis catus")
+            dog, cat = _row(KEY_DOG), _row(KEY_CAT)
+            ok = (
+                rc == 1
+                and cat is not None
+                and cat["detection_count"] == 7
+                and cat["video_count"] == 5
+                and cat["has_correction"] == 1
+                and cat["common_name"] == "Domestic Cat"
+                and dog is not None
+                and dog["detection_count"] == 4
+                and dog["video_count"] == 3
+            )
+            return ok, f"rc={rc}, dog={dog}, cat={cat}"
+
+        passed += _case("MG6", mg6)
+
+    # MG3 - adversarial order: the corrected member's wrong AI name ("Wild
+    # Boar") sorts after the bucket name and a lowercase correction text sorts
+    # after it too; the native tie breaks by name.
+    def mg3():
+        with _fixture_db("mg3") as ids:
+            rc = database.correct_species(ids["b1"], "mule deer", "Cervus fakeus")
+            names = p15._display_names_for(KEY_DEER)
+            deer = _row(KEY_DEER)
+            ok = (
+                rc == 1
+                and names == {"Mule Deer"}
+                and deer is not None
+                and deer["scientific_name"] == "Odocoileus hemionus"
+            )
+            return ok, f"rc={rc}, names={names}, deer={deer}"
+
+    passed += _case("MG3", mg3)
+
+    # MG4 - the most frequent native name wins, deterministically.
+    def mg4():
+        with _fixture_db("mg4"):
+            rac = _row(KEY_RACCOON)
+            lists = [
+                [(r["label"], r["common_name"]) for r in database.get_species_list()]
+                for _ in range(3)
+            ]
+            ok = (
+                rac is not None
+                and rac["common_name"] == "Northern Raccoon"
+                and rac["scientific_name"] == "Procyon lotor"
+                and rac["detection_count"] == 3
+                and rac["video_count"] == 3
+                and lists[0] == lists[1] == lists[2]
+            )
+            return ok, f"rac={rac}"
+
+    passed += _case("MG4", mg4)
+
+    # MG5 - a correction-only bucket keeps its key_display name.
+    def mg5():
+        with _fixture_db("mg5") as ids:
+            rc = database.correct_species(ids["p1"], "Coyote ", "Canis latrans")
+            coyote = _row("coyote")
+            ok = (
+                rc == 1
+                and coyote is not None
+                and coyote["common_name"] == "Coyote"
+                and coyote["scientific_name"] == "Canis latrans"
+                and KEY_BOBCAT not in p15._list_labels()
+                and p15._display_names_for("coyote") == {"Coyote"}
+            )
+            return ok, f"rc={rc}, coyote={coyote}"
+
+    passed += _case("MG5", mg5)
+
+    # MG7 - BUCKET-04 hard invariant after a mixed correction state.
+    def mg7():
+        with _fixture_db("mg7") as ids:
+            rcs = [
+                database.correct_species(ids["c1"], "domestic dog", "Canis lupus familiaris"),
+                database.correct_species(ids["b1"], "mule deer", "Odocoileus hemionus"),
+                database.correct_species(ids["p1"], "Coyote ", "Canis latrans"),
+                database.correct_species(ids["u1"], "Western Gray Squirrel", "Sciurus griseus"),
+                database.save_video_correction(
+                    ids["vid5"], LBL_DOG2, "raccoon_label", "Northern Raccoon", "Procyon lotor"
+                ),
+            ]
+            shared = _shared_name_violations(database.get_species_list())
+            hard, soft = p15._cross_reader_violations()
+            ok = all(rc is not None for rc in rcs) and shared == [] and (hard, soft) == ([], [])
+            return ok, f"rcs={rcs}, shared={shared}, hard={hard}, soft={soft}"
+
+    passed += _case("MG7", mg7)
+
+    # MG8 - BUCKET-03 / D-07: a merged bucket carries the existing boolean flag.
+    def mg8():
+        with _fixture_db("mg8") as ids:
+            before = _row(KEY_DOG)
+            rc = database.correct_species(ids["n1"], "Domestic Dog", "Canis lupus familiaris")
+            after = _row(KEY_DOG)
+            html = p15._read_text("static/index.html")
+            ok = (
+                rc == 1
+                and before is not None
+                and before["has_correction"] == 0
+                and after is not None
+                and after["has_correction"] == 1
+                and after["detection_count"] == 4
+                and html.count(BADGE_LINE) == 1
+            )
+            return ok, f"before={before}, after={after}, badge_count={html.count(BADGE_LINE)}"
+
+    passed += _case("MG8", mg8)
+
+    # MG9 - single definitions in the comment-stripped source.
+    def mg9():
+        db_text = _src_db()
+        lines = db_text.splitlines()
+        n_nat = sum(1 for ln in lines if ln.startswith("NATIVE_KEY = "))
+        n_cte = sum(1 for ln in lines if ln.startswith("NATIVE_DISPLAY_CTE = "))
+        cte_region = p15._slice(db_text, "NATIVE_DISPLAY_CTE = ", "\n\n")
+        n_lower = db_text.count("LOWER(")
+        n_join = db_text.count("LEFT JOIN native_display nd ON nd.k = ")
+        predicted = " ".join(audit._PREDICTED_NATIVE_KEY.split())
+        shipped = " ".join(database.NATIVE_KEY.split())
+        ok = (
+            n_nat == 1
+            and n_cte == 1
+            and "{NATIVE_KEY}" in cte_region
+            and n_lower == 1
+            and n_join == 6
+            and predicted == shipped
+        )
+        return ok, (
+            f"n_nat={n_nat}, n_cte={n_cte}, cte_uses_key={'{NATIVE_KEY}' in cte_region}, "
+            f"n_lower={n_lower}, n_join={n_join}, audit_key_equal={predicted == shipped}"
+        )
+
+    passed += _case("MG9", mg9)
+
+    return (passed, total)
+
+
+# -- unknown suite -----------------------------------------------------------
+
+def suite_unknown():
+    """`unknown` suite cases UN1-UN6 (6 total): BUCKET-02, D-05."""
+    total = 6
+    passed = 0
+
+    # UN1 - both stored shapes of Unknown land in ONE bucket.
+    def un1():
+        with _fixture_db("un1"):
+            with database.get_conn() as conn:
+                named = conn.execute(
+                    "SELECT COUNT(*) FROM species WHERE label = 'Unknown species' "
+                    "AND common_name = 'Unknown species'"
+                ).fetchone()[0]
+                nulled = conn.execute(
+                    "SELECT COUNT(*) FROM species WHERE label = 'Unknown species' "
+                    "AND common_name IS NULL"
+                ).fetchone()[0]
+            rows = database.get_species_list()
+            unknown_labels = [r["label"] for r in rows if _ascii_norm(r["label"]) == "unknown species"]
+            row = _row(KEY_UNKNOWN)
+            ok = (
+                named >= 1
+                and nulled >= 1
+                and unknown_labels == [KEY_UNKNOWN]
+                and row is not None
+                and row["detection_count"] == 4
+                and LBL_PSEUDO not in {r["label"] for r in rows}
+            )
+            return ok, f"named={named}, nulled={nulled}, unknown_labels={unknown_labels}, row={row}"
+
+    passed += _case("UN1", un1)
+
+    # UN2 - still excluded from top_species and the 7-day chart.
+    def un2():
+        with _fixture_db("un2"):
+            stats = database.get_stats()
+            bad_top = [
+                t for t in stats["top_species"]
+                if "unknown species" in (_ascii_norm(t["label"]), _ascii_norm(t["common_name"]))
+            ]
+            bad_act = [
+                r for r in p15._activity_rows()
+                if "unknown species" in (_ascii_norm(r["label"]), _ascii_norm(r["species"]))
+            ]
+            ok = not bad_top and not bad_act
+            return ok, f"bad_top={bad_top}, bad_act={bad_act}"
+
+    passed += _case("UN2", un2)
+
+    # UN3 - still present in the timeline and drilldown.
+    def un3():
+        with _fixture_db("un3") as ids:
+            row = _row(KEY_UNKNOWN)
+            tl = p15._timeline_sums().get(KEY_UNKNOWN)
+            detail = database.get_species_detail(KEY_UNKNOWN)
+            ok = (
+                row is not None
+                and row["video_count"] == 3
+                and tl == row["video_count"]
+                and detail["info"].get("total_detections") == 4
+                and ids["z1"] in p15._detail_crop_ids(KEY_UNKNOWN)
+            )
+            return ok, f"row={row}, timeline={tl}, detail_info={detail['info']}"
+
+    passed += _case("UN3", un3)
+
+    # UN4 - old raw labels resolve to the Unknown bucket.
+    def un4():
+        with _fixture_db("un4"):
+            ok = (
+                database.resolve_species_key(LBL_PSEUDO) == KEY_UNKNOWN
+                and database.get_gallery(species_label=LBL_PSEUDO)["total"] == 4
+                and database.get_gallery(species_label=p15.LBL_UNKNOWN)["total"] == 4
+            )
+            return ok, (
+                f"resolved={database.resolve_species_key(LBL_PSEUDO)!r}, "
+                f"pseudo_total={database.get_gallery(species_label=LBL_PSEUDO)['total']}"
+            )
+
+    passed += _case("UN4", un4)
+
+    # UN5 - a detection corrected away from Unknown counts under its new key.
+    def un5():
+        with _fixture_db("un5") as ids:
+            rc = database.correct_species(ids["uu1"], "Western Gray Squirrel", "Sciurus griseus")
+            squirrel = _row("western gray squirrel")
+            unknown = _row(KEY_UNKNOWN)
+            act = p15._activity_sums().get("western gray squirrel")
+            stats = database.get_stats()
+            ok = (
+                rc == 1
+                and squirrel is not None
+                and squirrel["detection_count"] == 1
+                and unknown is not None
+                and unknown["detection_count"] == 3
+                and act == 1
+                and stats["unique_species"] == len(database.get_species_list())
+            )
+            return ok, f"rc={rc}, squirrel={squirrel}, unknown={unknown}, activity={act}"
+
+    passed += _case("UN5", un5)
+
+    # UN6 - source: the Unknown literal guard and the two get_stats exclusions.
+    def un6():
+        db_text = _src_db()
+        native = p15._slice(db_text, "NATIVE_KEY = ", "\nEFFECTIVE_KEY = ")
+        stats_fn = p15._slice(db_text, "def get_stats(", "\ndef ")
+        n_excl = stats_fn.count("{EFFECTIVE_KEY} != 'Unknown species'")
+        ok = "'Unknown species'" in native and "'unknown species'" in native and n_excl == 2
+        return ok, f"n_excl={n_excl}, native={native!r}"
+
+    passed += _case("UN6", un6)
+
+    return (passed, total)
+
+
+# -- resolver suite ----------------------------------------------------------
+
+def suite_resolver():
+    """`resolver` suite cases RS1-RS6 (6 total): D-06, BUCKET-05."""
+    total = 6
+    passed = 0
+
+    # RS1 - every spelling of the dog bucket lands on it at all three entry points.
+    def rs1():
+        with _fixture_db("rs1"):
+            bad = []
+            for v in (p15.LBL_DOG, LBL_DOG2, "Domestic Dog", "  DOMESTIC DOG\t", KEY_DOG):
+                detail = database.get_species_detail(v)
+                got = (
+                    database.resolve_species_key(v),
+                    detail["label"],
+                    detail["info"].get("total_detections"),
+                    database.get_gallery(species_label=v)["total"],
+                    database.get_videos(species_label=v)["total"],
+                )
+                if got != (KEY_DOG, KEY_DOG, 4, 4, 3):
+                    bad.append((v, got))
+            return not bad, f"bad={bad}"
+
+    passed += _case("RS1", rs1)
+
+    # RS2 - an unknown value still yields nothing (the route's 404).
+    def rs2():
+        with _fixture_db("rs2"):
+            ok = (
+                database.get_species_detail(NO_SUCH_KEY)["info"] == {}
+                and database.get_gallery(species_label=NO_SUCH_KEY)["total"] == 0
+                and database.get_videos(species_label=NO_SUCH_KEY)["total"] == 0
+            )
+            return ok, ""
+
+    passed += _case("RS2", rs2)
+
+    # RS3 - a blank-name native and the Unknown key resolve to themselves.
+    def rs3():
+        with _fixture_db("rs3"):
+            got = (
+                database.resolve_species_key(LBL_NONAME),
+                database.resolve_species_key(KEY_UNKNOWN),
+            )
+            return got == (LBL_NONAME, KEY_UNKNOWN), f"got={got}"
+
+    passed += _case("RS3", rs3)
+
+    # RS4 - empty input passes through unchanged and filters nothing.
+    def rs4():
+        with _fixture_db("rs4"):
+            ok = (
+                database.resolve_species_key("") == ""
+                and database.resolve_species_key(None) is None
+                and database.get_gallery(species_label="")["total"] == database.get_gallery()["total"]
+            )
+            return ok, ""
+
+    passed += _case("RS4", rs4)
+
+    # RS5 - an old link to a bucket that was corrected away still 404s.
+    def rs5():
+        with _fixture_db("rs5") as ids:
+            rcs = [
+                database.correct_species(ids["m1"], "Elk", "Cervus canadensis"),
+                database.correct_species(ids["m2"], "Elk", "Cervus canadensis"),
+            ]
+            detail = database.get_species_detail(LBL_DEER)
+            elk = _row("elk")
+            ok = (
+                rcs == [1, 1]
+                and detail["info"] == {}
+                and detail["label"] == KEY_DEER
+                and elk is not None
+                and elk["detection_count"] == 2
+            )
+            return ok, f"rcs={rcs}, info={detail['info']}, label={detail['label']!r}, elk={elk}"
+
+    passed += _case("RS5", rs5)
+
+    # RS6 - source (comment-stripped): the value is bound, never interpolated,
+    # and each entry point resolves once.
+    def rs6():
+        db_text = _src_db()
+        resolver = p15._slice(db_text, "def resolve_species_key(", "\ndef ")
+        detail_fn = p15._slice(db_text, "def get_species_detail(", "\ndef ")
+        gallery_fn = p15._slice(db_text, "def get_gallery(", "\ndef ")
+        videos_fn = p15._slice(db_text, "def get_videos(", "\ndef ")
+        web_text = p15._strip_hash_comment_lines(p15._read_text("web_app.py"))
+        route = p15._slice(web_text, '@app.get("/api/species/{label:path}")', "@app.")
+        ok = (
+            "s.label = ?" in resolver
+            and "_normalize_key_sql('?')" in resolver
+            and "{value}" not in resolver
+            and "label = resolve_species_key(label)" in detail_fn
+            and gallery_fn.count("resolve_species_key(species_label)") == 1
+            and videos_fn.count("resolve_species_key(species_label)") == 1
+            and "db.get_species_detail(label)" in route
+        )
+        return ok, (
+            f"resolver_ok={'s.label = ?' in resolver}, "
+            f"gallery_n={gallery_fn.count('resolve_species_key(species_label)')}, "
+            f"videos_n={videos_fn.count('resolve_species_key(species_label)')}, route={route!r}"
+        )
+
+    passed += _case("RS6", rs6)
+
+    return (passed, total)
+
+
 # -- registry / CLI ----------------------------------------------------------
 
 SUITES = {
     "audit_script": (suite_audit_script, 7),
+    "merge": (suite_merge, 9),
+    "unknown": (suite_unknown, 6),
+    "resolver": (suite_resolver, 6),
 }
 
 # Suites that only run when explicitly requested (never part of --suite all).
