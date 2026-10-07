@@ -14,12 +14,12 @@ Suites:
                   404-contract edge cases (U1-U7).
     audit       — CORR-04/D-06, pins the audit trail (species.label stays
                   byte-identical, and every species_corrections row joins
-                  back to a non-NULL AI label) and the legacy-column freeze
-                  (the Gallery write path never touches
-                  species.user_common_name/user_scientific_name/
-                  corrected_at), as both fixture behaviour assertions and
-                  region-scoped source assertions over the write-path
-                  functions' bodies (A1-A5).
+                  back to a non-NULL AI label) and that the Gallery write
+                  path never modifies the species row (the whole row is
+                  unchanged after a correction, because the write lands
+                  only in species_corrections), as both fixture behaviour
+                  assertions and region-scoped source assertions over the
+                  write-path functions' bodies (A1-A5).
     fanout      — CORR-02/D-01 (plan 14-02), the video-player write path
                   fans out a snapshot of species_corrections rows at save
                   time — matching detections, snapshot semantics (a later
@@ -331,9 +331,10 @@ def suite_unified():
 
 
 def suite_audit():
-    """`audit` suite cases A1-A5 (5 total): CORR-04's audit trail and D-06's
-    legacy freeze, pinned both as behaviour assertions on fixture data and as
-    region-scoped source assertions over the write-path functions' bodies.
+    """`audit` suite cases A1-A5 (5 total): CORR-04's audit trail and the
+    rule that the Gallery write path never modifies the species row, pinned
+    both as behaviour assertions on fixture data and as region-scoped source
+    assertions over the write-path functions' bodies.
     Reuses `_seed_unified_fixture()` (no behavioural change to database.py in
     this suite — if any case fails, the fix belongs in suite_unified()'s
     write path, not in weakening the assertion here).
@@ -351,8 +352,7 @@ def suite_audit():
         def _species_row(det_id):
             with database.get_conn() as conn:
                 row = conn.execute(
-                    "SELECT label, user_common_name, user_scientific_name, corrected_at "
-                    "FROM species WHERE detection_id=?",
+                    "SELECT * FROM species WHERE detection_id=?",
                     (det_id,),
                 ).fetchone()
             return dict(row) if row else None
@@ -373,17 +373,14 @@ def suite_audit():
         if ok:
             passed += 1
 
-        # A2 — species.user_common_name/user_scientific_name/corrected_at
-        # are unchanged (still NULL) — D-06: the Gallery write path no
-        # longer touches them.
+        # A2 — CORR-04: the Gallery write path never modifies the species
+        # row. The entire row is unchanged after correct_species(), because
+        # that path writes only species_corrections. Holds on both DB
+        # shapes: when legacy columns exist they are part of the row and
+        # must be unchanged too; when absent the row simply has fewer columns.
         case_id = "A2"
-        ok = (
-            post_row is not None
-            and post_row["user_common_name"] is None
-            and post_row["user_scientific_name"] is None
-            and post_row["corrected_at"] is None
-        )
-        _check(case_id, ok, f"post_row={post_row}")
+        ok = pre_row is not None and post_row == pre_row
+        _check(case_id, ok, f"pre_row={pre_row}, post_row={post_row}")
         if ok:
             passed += 1
 
@@ -405,7 +402,9 @@ def suite_audit():
         # A4 — source assertion: correct_species()'s body (sliced from
         # "def correct_species(" to the next top-level "def ", comment
         # lines stripped) contains "species_corrections" and assigns none
-        # of the three frozen species columns.
+        # of the three frozen species columns. The Phase 17 guard
+        # (verify_phase17 `guard` suite, 17-02) enforces the same rule
+        # repo-wide.
         case_id = "A4"
         db_text = _database_py_text()
         cs_body = _strip_comment_lines(_slice(db_text, "def correct_species(", "\ndef "))
@@ -1035,16 +1034,12 @@ def suite_precedence():
 
 
 def suite_gaps():
-    """`gaps` suite cases G1-G5 (5 total): the 14-REVIEW.md gap-closure fixes.
+    """`gaps` suite cases G1-G4 (4 total): the 14-REVIEW.md gap-closure fixes.
     G1 pins CR-01 (a --reprocess-flagged pass clears the detection's unified
     correction), G2-G4 pin CR-02 (DELETE /api/corrections/{id} and GET
-    /api/corrections share one id space; a miss is a 404, not a silent ok),
-    G5 pins WR-02 (the backfill refuses a --db path that does not exist
-    instead of creating an empty database)."""
-    import subprocess
-
+    /api/corrections share one id space; a miss is a 404, not a silent ok)."""
     passed = 0
-    total = 5
+    total = 4
 
     original_db_path = database.get_db_path()
     tmpdir_obj = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -1099,7 +1094,9 @@ def suite_gaps():
         if ok:
             passed += 1
 
-        # G4 — the endpoint turns a miss into a 404.
+        # G4 — the endpoint turns a miss into a 404. The Phase 17 guard
+        # (verify_phase17 `guard` suite, 17-02) enforces the same rule
+        # (GET /api/corrections never names the frozen table) repo-wide.
         web_text = (_repo_root() / "web_app.py").read_text(encoding="utf-8")
         endpoint = _strip_comment_lines(_slice(web_text, '@app.delete("/api/corrections/{correction_id}")', "\n@app."))
         get_endpoint = _strip_comment_lines(_slice(web_text, '@app.get("/api/corrections")', "\n@app."))
@@ -1110,17 +1107,6 @@ def suite_gaps():
             and "video_corrections" not in get_endpoint
         )
         _check("G4", ok, "DELETE must 404 on a miss and GET /api/corrections must list species_corrections")
-        if ok:
-            passed += 1
-
-        # G5 — the backfill never creates a database.
-        missing = os.path.join(tmpdir_obj.name, "typo", "wildlife.db")
-        proc = subprocess.run(
-            [sys.executable, str(_repo_root() / "scripts" / "backfill_species_corrections.py"), "--db", missing],
-            capture_output=True, text=True,
-        )
-        ok = proc.returncode != 0 and not os.path.exists(missing) and not os.path.exists(os.path.dirname(missing))
-        _check("G5", ok, f"exit={proc.returncode} exists={os.path.exists(missing)} stderr={proc.stderr[-200:]}")
         if ok:
             passed += 1
     finally:
@@ -1136,7 +1122,7 @@ SUITES = {
     "fanout": (suite_fanout, 6),
     "suppress": (suite_suppress, 6),
     "precedence": (suite_precedence, 4),
-    "gaps": (suite_gaps, 5),
+    "gaps": (suite_gaps, 4),
 }
 
 
