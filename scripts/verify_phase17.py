@@ -41,6 +41,18 @@ Suites:
                 added later cannot escape the proof. Needs fastapi and httpx:
                 skipped under `--suite all` when they are missing, a FAIL when
                 `--suite endpoints` is asked for explicitly.
+    bytecopy  - BC1-BC5 (explicit, --db): a read-only rehearsal on a real
+                database. The source is opened mode=ro and copied with
+                Connection.backup(). Copy A keeps the legacy objects: init_db()
+                must change nothing. Copy B has them dropped (SQLite >= 3.35):
+                integrity and foreign-key checks clean, init_db() re-adds
+                nothing. Every GET route answers below 500 on both and matches,
+                the read and write exerciser runs clean on both, and the source's
+                schema and row counts are unchanged afterwards (D-03).
+    live      - LV1-LV5 (explicit, --base-url): GET only against a running
+                service. Against the pre-Phase-17 service exactly LV2 fails (the
+                old code still serves the corrections key); the restart turns
+                it green. It never sends a write.
 
 Fixture. Both shapes are built from scripts/verify_phase15.py's fixture plus a
 dual-lens pair and a flagged video with two crops on disk. The legacy DDL below
@@ -49,6 +61,8 @@ harness re-creates them with raw statements on a copy.
 
 Usage:
     python scripts/verify_phase17.py --suite schema|decoupled|guard|endpoints|all
+    python scripts/verify_phase17.py --suite bytecopy --db <path to a database>
+    python scripts/verify_phase17.py --suite live --base-url http://127.0.0.1:8080
     python scripts/verify_phase17.py --list
 
 verify_phase15 is a sibling import, so run this file without `python -I`.
@@ -65,6 +79,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -327,9 +342,10 @@ def _dump(value):
     return json.dumps(value, sort_keys=True, default=str)
 
 
-def _reader_outputs(path, ids):
+def _reader_outputs(path, ids, timings=None):
     """JSON of every reader the dashboard drives, against the database at
-    `path`. Each result must be identical between the two shapes."""
+    `path`. Each result must be identical between the two shapes. When
+    `timings` is a dict, the seconds each reader took are recorded in it."""
     database.set_db_path(path)
     calls = {
         "get_stats": lambda: database.get_stats(),
@@ -356,7 +372,13 @@ def _reader_outputs(path, ids):
         "get_video_by_id(paired)": lambda: database.get_video_by_id(ids["pair0"]),
         "get_video_by_id(unpaired)": lambda: database.get_video_by_id(ids["vid1"]),
     }
-    return {name: _dump(fn()) for name, fn in calls.items()}
+    out = {}
+    for name, fn in calls.items():
+        started = time.monotonic()
+        out[name] = _dump(fn())
+        if timings is not None:
+            timings[name] = time.monotonic() - started
+    return out
 
 
 # The processor run. A child process stubs the ML modules (so no model loads and
@@ -1108,13 +1130,17 @@ def _all_templates():
     return list(GET_URLS.values()) + list(EXTRA_GET_URLS)
 
 
-def _get_all(client, params):
+def _get_all(client, params, timings=None):
     """Request every GET_URLS and EXTRA_GET_URLS entry with the placeholders in
-    `params` filled in. Returns {url: (status, parsed JSON or text)}."""
+    `params` filled in. Returns {url: (status, parsed JSON or text)}. When
+    `timings` is a dict, the seconds each request took are recorded in it."""
     out = {}
     for template in _all_templates():
         url = template.format(**params)
+        started = time.monotonic()
         resp = client.get(url)
+        if timings is not None:
+            timings[url] = time.monotonic() - started
         body = None
         if "json" in resp.headers.get("content-type", ""):
             try:
@@ -1359,6 +1385,519 @@ def suite_endpoints():
     return (passed, total)
 
 
+# -- bytecopy suite ------------------------------------------------------------
+#
+# A rehearsal on a real database. The source is opened read-only (mode=ro) and
+# copied with Connection.backup() into a TemporaryDirectory; everything else
+# (init_db, the DROP statements, the endpoint requests, the write paths) runs on
+# the copies through database.set_db_path() and get_conn(). The source is never
+# written (D-03), and BC5 proves its schema and row counts are unchanged.
+
+def _src_state(src):
+    """sqlite_master rows and COUNT(*) of every table, through `src`."""
+    master = sorted(
+        tuple(r) for r in src.execute("SELECT type, name, tbl_name, sql FROM sqlite_master")
+    )
+    counts = {}
+    names = src.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+        "ORDER BY name"
+    ).fetchall()
+    for (name,) in names:
+        counts[name] = src.execute('SELECT COUNT(*) FROM "%s"' % name.replace('"', '""')).fetchone()[0]
+    return {"master": master, "counts": counts}
+
+
+def _backup_copy(src, dest_path):
+    """Connection.backup() of `src` into a new file. Returns the seconds taken."""
+    started = time.monotonic()
+    dst = sqlite3.connect(str(dest_path))
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+    return time.monotonic() - started
+
+
+def _pick_params():
+    """Placeholder values chosen by SQL on the database the caller has already
+    pointed database.py at. The species and search values come from the API."""
+    with database.get_conn() as conn:
+        def one(sql):
+            row = conn.execute(sql).fetchone()
+            return row[0] if row else None
+
+        paired = one(
+            "SELECT v.id FROM videos v WHERE v.paired_video_id IS NOT NULL "
+            "AND EXISTS (SELECT 1 FROM detections d WHERE d.video_id = v.id) "
+            "ORDER BY v.id DESC LIMIT 1"
+        ) or one("SELECT id FROM videos WHERE paired_video_id IS NOT NULL ORDER BY id DESC LIMIT 1")
+        unpaired = one("SELECT id FROM videos WHERE paired_video_id IS NULL ORDER BY id DESC LIMIT 1")
+        purged = one("SELECT id FROM videos WHERE filepath IS NULL ORDER BY id DESC LIMIT 1")
+        run_id = one("SELECT MAX(id) FROM runs") or 1
+        crop = one("SELECT crop_path FROM crops ORDER BY id DESC LIMIT 1")
+        thumb = one(
+            "SELECT thumbnail_path FROM videos WHERE thumbnail_path IS NOT NULL "
+            "ORDER BY id DESC LIMIT 1"
+        )
+    missing = [n for n, v in (("paired", paired), ("unpaired", unpaired), ("purged", purged)) if v is None]
+    if missing:
+        raise AssertionError(f"the database has no {missing} video to drive the endpoints with")
+    return {
+        "paired_video_id": paired,
+        "unpaired_video_id": unpaired,
+        # Never request /media/video for a video with a real filepath: TestClient
+        # would read the whole NAS file into memory. A purged id still drives
+        # get_video_by_id and must answer 404.
+        "playable_video_id": purged,
+        "purged_video_id": purged,
+        "run_id": run_id,
+        "crop_name": _quote(Path(crop).name if crop else "none.jpg"),
+        "thumb_name": _quote(Path(thumb).name if thumb else "none.jpg"),
+    }
+
+
+def _species_fields(path, det_id):
+    """The columns a reprocess rewrites, by name (production's column order
+    differs from a fresh database's)."""
+    database.set_db_path(path)
+    with database.get_conn() as conn:
+        row = conn.execute(
+            "SELECT label, common_name, scientific_name, confidence, top_candidates_json "
+            "FROM species WHERE detection_id=?", (det_id,)
+        ).fetchone()
+        return tuple(row) if row else None
+
+
+def suite_bytecopy(db_path):
+    """`bytecopy` suite cases BC1-BC5 (5 total) against the database at
+    `db_path`, opened read-only. Explicit only: needs --db."""
+    total = 5
+    passed = 0
+    src_file = Path(db_path).resolve()
+    original = database.get_db_path()
+    tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    st = {}
+
+    # The one raw connection in this suite. get_conn() opens read-write, so it
+    # cannot open the production file read-only; the file is therefore opened
+    # with a mode=ro URI here and nowhere else.
+    src = sqlite3.connect(src_file.as_uri() + "?mode=ro", uri=True)
+
+    def need(key):
+        if key not in st:
+            raise RuntimeError(f"copy {key.upper()} is unavailable (an earlier case failed)")
+        return st[key]
+
+    try:
+        start = _src_state(src)
+        print(f"INFO: python {sys.version.split()[0]}")
+        print(f"INFO: sqlite {sqlite3.sqlite_version}")
+        print(f"INFO: source_bytes {src_file.stat().st_size}")
+
+        # BC1 - production's shape: init_db() is inert.
+        def bc1():
+            cols = [r[1] for r in src.execute("PRAGMA table_info(species)")]
+            names = {r[0] for r in src.execute("SELECT name FROM sqlite_master")}
+            present = [c for c in LEGACY_COLUMNS if c in cols]
+            present += [n for n in [LEGACY_TABLE] + LEGACY_INDEXES if n in names]
+            if len(present) != len(LEGACY_COLUMNS) + 1 + len(LEGACY_INDEXES):
+                return False, (
+                    "source already lacks the legacy objects; this rehearsal expects the "
+                    f"pre-Phase-18 production shape (present: {sorted(present)})"
+                )
+            path_a = Path(tmp.name) / "copy_a.db"
+            secs = _backup_copy(src, path_a)
+            st["a"] = str(path_a)
+            print(f"INFO: backup_seconds_a {secs:.2f}")
+            before = _schema_snapshot(st["a"])
+            database.init_db(st["a"])
+            database.init_db(st["a"])
+            after = _schema_snapshot(st["a"])
+            database.set_db_path(st["a"])
+            with database.get_conn() as conn:
+                nonblank = conn.execute(
+                    "SELECT COUNT(*) FROM species WHERE NULLIF(user_common_name,'') IS NOT NULL"
+                ).fetchone()[0]
+            print(f"INFO: legacy_table_rows {before['table_rows']}")
+            print(f"INFO: species_rows_with_frozen_value {before['frozen_values']}")
+            print(f"INFO: species_rows_with_nonblank_frozen_name {nonblank}")
+            print(f"INFO: species_corrections_rows {start['counts'].get('species_corrections')}")
+            if before == after:
+                return True, ""
+            added = sorted(set(map(str, after["master"])) - set(map(str, before["master"])))
+            dropped = sorted(set(map(str, before["master"])) - set(map(str, after["master"])))
+            return False, (
+                f"init_db() changed the production-shaped copy: columns {before['columns']} -> "
+                f"{after['columns']}; added {added}; dropped {dropped}; "
+                f"rows {before['table_rows']} -> {after['table_rows']}"
+            )
+
+        passed += _case("BC1", bc1)
+
+        # BC2 - a copy with the legacy columns and table dropped.
+        def bc2():
+            if sqlite3.sqlite_version_info < (3, 35, 0):
+                return False, f"SQLite {sqlite3.sqlite_version} is older than 3.35: no DROP COLUMN"
+            path_b = Path(tmp.name) / "copy_b.db"
+            secs = _backup_copy(src, path_b)
+            st["b"] = str(path_b)
+            print(f"INFO: backup_seconds_b {secs:.2f}")
+            database.set_db_path(st["b"])
+            started = time.monotonic()
+            with database.get_conn() as conn:
+                for column in LEGACY_COLUMNS:
+                    conn.execute(f"ALTER TABLE species DROP COLUMN {column}")
+                conn.execute(f"DROP TABLE {LEGACY_TABLE}")
+            print(f"INFO: drop_seconds {time.monotonic() - started:.2f}")
+            with database.get_conn() as conn:
+                integrity = [tuple(r) for r in conn.execute("PRAGMA integrity_check").fetchall()]
+                fk = [tuple(r) for r in conn.execute("PRAGMA foreign_key_check").fetchall()]
+            problems = []
+            if integrity != [("ok",)]:
+                problems.append(f"integrity_check {integrity[:3]}")
+            if fk:
+                problems.append(f"foreign_key_check returned {len(fk)} row(s), first {fk[:3]}")
+            database.init_db(st["b"])
+            database.init_db(st["b"])
+            present = _legacy_objects(st["b"])
+            cols = _schema_snapshot(st["b"])["columns"]
+            if present:
+                problems.append(f"init_db() re-added {present}")
+            if set(cols) != set(SPECIES_COLUMNS):
+                problems.append(f"species columns {cols}")
+            return not problems, "; ".join(problems)
+
+        passed += _case("BC2", bc2)
+
+        # BC3 - every GET route on both copies, before any write.
+        def bc3():
+            web_app, TestClient = _import_web()
+            data_dir = Path(tmp.name) / "data"
+            data_dir.mkdir(exist_ok=True)
+            got, params, slowest = {}, {}, ("", 0.0)
+            for key in ("a", "b"):
+                with _web_context(web_app, need(key), data_dir):
+                    p = _pick_params()
+                    client = TestClient(web_app.app, raise_server_exceptions=False)
+                    species = client.get("/api/species").json()
+                    if not species:
+                        return False, f"[{key}] /api/species is empty"
+                    p["species_key"] = _quote(species[0]["label"])
+                    p["search_q"] = _quote(species[0].get("common_name") or species[0]["label"])
+                    timings = {}
+                    got[key] = _get_all(client, p, timings)
+                    params[key] = p
+                    worst = max(timings.items(), key=lambda kv: kv[1])
+                    if worst[1] > slowest[1]:
+                        slowest = worst
+            st["params"] = params["a"]
+            print(f"INFO: slowest_get_seconds {slowest[1]:.2f} {slowest[0]}")
+            problems = []
+            if params["a"] != {**params["b"]}:
+                problems.append("the two copies picked different placeholder values")
+            for key in ("a", "b"):
+                bad = {u: s for u, (s, _b) in got[key].items() if s >= 500}
+                if bad:
+                    problems.append(f"[{key}] 5xx responses: {bad}")
+                detail = got[key]["/api/videos/{paired_video_id}".format(**params[key])]
+                if detail[0] != 200 or not isinstance(detail[1], dict):
+                    problems.append(f"[{key}] video detail -> {detail[0]}")
+                elif set(detail[1]) != {"video", "detections", "paired", "pair_detections"}:
+                    problems.append(f"[{key}] video detail keys {sorted(detail[1])}")
+                purged = got[key]["/media/video/{purged_video_id}".format(**params[key])]
+                if purged[0] != 404 or "purged" not in _dump(purged[1]):
+                    problems.append(f"[{key}] purged video -> {purged[0]} {str(purged[1])[:80]}")
+            for template in COMPARE_URLS:
+                url = template.format(**params["a"])
+                if got["a"][url] != got["b"][url]:
+                    problems.append(f"{url} differs between the undropped and the dropped copy")
+            return not problems, "; ".join(problems)
+
+        passed += _case("BC3", bc3)
+
+        # BC4 - the read and write exerciser on both copies (copies only).
+        def bc4():
+            params = st.get("params")
+            if not params:
+                return False, "BC3 did not run far enough to choose real ids"
+            rids = {
+                "pair0": params["paired_video_id"],
+                "rp_vid": params["paired_video_id"],
+                "vid1": params["unpaired_video_id"],
+            }
+            database.set_db_path(need("a"))
+            with database.get_conn() as conn:
+                pick = conn.execute(
+                    "SELECT d.id, d.video_id, s.label FROM detections d "
+                    "JOIN species s ON s.detection_id = d.id "
+                    "WHERE NOT EXISTS (SELECT 1 FROM species_corrections sc WHERE sc.detection_id = d.id) "
+                    "ORDER BY d.id DESC LIMIT 1"
+                ).fetchone()
+            if not pick:
+                return False, "no uncorrected detection to write against"
+            det, video_id, label = pick[0], pick[1], pick[2]
+            reader_secs = {}
+            snaps = {}
+            for key in ("a", "b"):
+                path = need(key)
+                timings = {}
+                snaps[key] = {"before": _reader_outputs(path, rids, timings)}
+                reader_secs.update({f"{key}:{n}": s for n, s in timings.items()})
+                if key == "a":
+                    legacy_before = (_schema_snapshot(path), _frozen_rows(path))
+
+                species_before = _species_row(path, det)
+                database.set_db_path(path)
+                if database.correct_species(det, "Bobcat", "Lynx rufus") != 1:
+                    return False, f"[{key}] correct_species did not return 1"
+                if _species_row(path, det) != species_before:
+                    return False, f"[{key}] correct_species changed the species row"
+                sc = _correction_row(path, det)
+                if not sc or sc[0] != "Bobcat" or sc[2] != "gallery":
+                    return False, f"[{key}] species_corrections after correct_species: {sc}"
+
+                count = database.save_video_correction(video_id, label, "corr_x", "Red Fox", "Vulpes vulpes")
+                if not count or count < 1:
+                    return False, f"[{key}] save_video_correction fanned out to {count}"
+                sc = _correction_row(path, det)
+                if not sc or sc[0] != "Red Fox" or sc[2] != "video_player":
+                    return False, f"[{key}] species_corrections after save_video_correction: {sc}"
+                if _species_row(path, det) != species_before:
+                    return False, f"[{key}] save_video_correction changed the species row"
+
+                with database.get_conn() as conn:
+                    cid = conn.execute(
+                        "SELECT id FROM species_corrections WHERE detection_id=?", (det,)
+                    ).fetchone()[0]
+                if database.delete_correction(cid) != 1 or _correction_row(path, det) is not None:
+                    return False, f"[{key}] delete_correction did not remove the row"
+
+                database.correct_species(det, "Bobcat", "Lynx rufus")
+                with database.get_conn() as conn:
+                    database.rewrite_species_for_reprocess(
+                        conn, det, STUB_LABEL, STUB_COMMON, STUB_SCIENTIFIC, 0.95, '[{"label": "x"}]'
+                    )
+                fields = _species_fields(path, det)
+                if fields != (STUB_LABEL, STUB_COMMON, STUB_SCIENTIFIC, 0.95, '[{"label": "x"}]'):
+                    return False, f"[{key}] species row after the reprocess helper: {fields}"
+                if _correction_row(path, det) is not None:
+                    return False, f"[{key}] the reprocess helper left the species_corrections row"
+
+                snaps[key]["after"] = _reader_outputs(path, rids)
+            diff = [k for k in snaps["a"]["before"] if snaps["a"]["before"][k] != snaps["b"]["before"][k]]
+            diff += [f"after:{k}" for k in snaps["a"]["after"] if snaps["a"]["after"][k] != snaps["b"]["after"][k]]
+            if diff:
+                return False, f"readers differ between the undropped and dropped copy: {diff}"
+            legacy_after = (_schema_snapshot(st["a"]), _frozen_rows(st["a"]))
+            if legacy_after != legacy_before:
+                return False, "the decoupled code changed a legacy object on the production-shaped copy"
+            if _legacy_objects(st["b"]):
+                return False, f"legacy objects appeared on the dropped copy: {_legacy_objects(st['b'])}"
+            slowest = max(reader_secs.items(), key=lambda kv: kv[1])
+            print(f"INFO: slowest_reader_seconds {slowest[1]:.2f} {slowest[0]}")
+            return True, ""
+
+        passed += _case("BC4", bc4)
+
+        # BC5 - the source file is untouched.
+        def bc5():
+            end = _src_state(src)
+            problems = []
+            if end["master"] != start["master"]:
+                problems.append("sqlite_master differs")
+            changed = {t: (start["counts"].get(t), n) for t, n in end["counts"].items()
+                       if start["counts"].get(t) != n}
+            if changed or set(end["counts"]) != set(start["counts"]):
+                problems.append(f"row counts changed: {changed}")
+            return not problems, "; ".join(problems)
+
+        passed += _case("BC5", bc5)
+    finally:
+        src.close()
+        database.set_db_path(original)
+        tmp.cleanup()
+
+    return (passed, total)
+
+
+# -- live suite ---------------------------------------------------------------
+#
+# HTTP GET only, against a running service. It never writes: the write paths are
+# proven on fixtures and copies (EP5, EP6, BC4). 17-03 runs it against the
+# pre-Phase-17 service, where exactly LV2 fails (the old code still serves the
+# corrections key); 17-04 turns it green with the restart.
+
+def _live_head_bytes(base_url, path, n=1024):
+    """Ranged GET returning (status, at most n bytes). Never raises: a transport
+    failure comes back as (None, reason bytes). For /media/video, so a whole NAS
+    file is never downloaded."""
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(
+        base_url.rstrip("/") + path, method="GET", headers={"Range": f"bytes=0-{n - 1}"}
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=p15.LIVE_TIMEOUT_SECS) as resp:
+            return resp.status, resp.read(n)
+    except urllib.error.HTTPError as exc:
+        return exc.code, b""
+    except Exception as exc:  # noqa: BLE001 - URLError, timeout, refused, ...
+        return None, f"{type(exc).__name__}: {exc}".encode()
+
+
+def _live_find_videos(base_url):
+    """(paired id, unpaired id, playable id, purged id, thumbnail basename) read
+    from the API itself; any of them may be None."""
+    paired = unpaired = playable = purged = thumb = None
+    st, listing, _d = p15._live_json(base_url, "/api/videos?per_page=100")
+    items = listing.get("items", []) if isinstance(listing, dict) else []
+    for item in items:
+        if paired is None and item.get("paired_video_id"):
+            paired = item["id"]
+        if unpaired is None and not item.get("paired_video_id"):
+            unpaired = item["id"]
+        if thumb is None and item.get("thumbnail_path"):
+            thumb = Path(item["thumbnail_path"]).name
+    for item in items[:15]:
+        st, detail, _d = p15._live_json(base_url, f"/api/videos/{item['id']}")
+        if st == 200 and isinstance(detail, dict) and (detail.get("video") or {}).get("filepath"):
+            playable = item["id"]
+            break
+    # Purged files: blank videos carry filepath in the listing, oldest page first.
+    st, blanks, _d = p15._live_json(base_url, "/api/blanks?per_page=100")
+    if st == 200 and isinstance(blanks, dict):
+        for page in (blanks.get("pages", 1), 1):
+            st, body, _d = p15._live_json(base_url, f"/api/blanks?per_page=100&page={page}")
+            rows = body.get("videos", []) if isinstance(body, dict) else []
+            hit = next((r for r in rows if not r.get("filepath")), None)
+            if hit:
+                purged = hit["id"]
+                break
+    return paired, unpaired, playable, purged, thumb
+
+
+def suite_live(base_url="http://localhost:8080"):
+    """`live` suite cases LV1-LV5 (5 total). Explicit only (--base-url)."""
+    total = 5
+    passed = 0
+
+    st, species, _d = p15._live_json(base_url, "/api/species")
+    species = species if st == 200 and isinstance(species, list) and species else []
+    paired, unpaired, playable, purged, thumb = _live_find_videos(base_url)
+    st, last_run, _d = p15._live_json(base_url, "/api/runs/last")
+    first = species[0] if species else {}
+    key = _quote(first.get("label", ""))
+    params = {
+        "paired_video_id": paired, "unpaired_video_id": unpaired,
+        "playable_video_id": playable, "purged_video_id": purged,
+        "species_key": key,
+        "run_id": (last_run or {}).get("id", 1) if isinstance(last_run, dict) else 1,
+        # Production file names carry spaces ("Back Wall_00_..."): percent-quote.
+        "crop_name": _quote(first.get("best_crop") or "none.jpg"),
+        "thumb_name": _quote(thumb or "none.jpg"),
+        "search_q": _quote(first.get("common_name") or first.get("label") or "a"),
+    }
+
+    # LV1 - every GET route answers below 500.
+    def lv1():
+        problems = []
+        if not species:
+            problems.append("/api/species gave no rows to resolve placeholders from")
+        for name in ("paired_video_id", "unpaired_video_id", "purged_video_id"):
+            if params[name] is None:
+                problems.append(f"could not find a value for {{{name}}}")
+        if problems:
+            return False, "; ".join(problems)
+        for template in _all_templates():
+            if template.startswith("/media/video/"):
+                continue  # LV3 owns these, with a ranged read
+            url = template.format(**params)
+            status, body = p15._live_get(base_url, url)
+            if status is None or status >= 500:
+                problems.append(f"{url} -> {status if status is not None else body}")
+        try:
+            web_app, _client = _import_web()
+        except ImportError:
+            web_app = None
+        if web_app is not None:
+            declared = {r.path for r in web_app.app.routes
+                        if "GET" in (getattr(r, "methods", None) or ())}
+            if declared != set(GET_URLS) | set(SKIP_ROUTES):
+                problems.append("GET route coverage differs from GET_URLS / SKIP_ROUTES")
+        return not problems, "; ".join(problems)
+
+    passed += _case("LV1", lv1)
+
+    # LV2 - video detail has exactly four keys, and no corrections key.
+    def lv2():
+        st, detail, why = p15._live_json(base_url, f"/api/videos/{params['paired_video_id']}")
+        if st != 200 or not isinstance(detail, dict):
+            return False, f"/api/videos/{params['paired_video_id']} -> {why or st}"
+        want = {"video", "detections", "paired", "pair_detections"}
+        return set(detail) == want and "corrections" not in detail, (
+            f"keys {sorted(detail)}; want exactly {sorted(want)}"
+        )
+
+    passed += _case("LV2", lv2)
+
+    # LV3 - a playable file streams (ranged), a purged one answers 404.
+    def lv3():
+        if params["playable_video_id"] is None:
+            return False, "no video with a file on disk was found"
+        status, body = _live_head_bytes(base_url, f"/media/video/{params['playable_video_id']}")
+        if status not in (200, 206):
+            return False, f"playable video -> {status} {body[:80]!r}"
+        status, _body = p15._live_get(base_url, f"/media/video/{params['purged_video_id']}")
+        return status == 404, f"purged video -> {status}, want 404"
+
+    passed += _case("LV3", lv3)
+
+    # LV4 - the index page, the corrections list and a species detail; plus a
+    # source assertion that this suite can never send a write.
+    def lv4():
+        import inspect
+        status, page = p15._live_get(base_url, "/")
+        if status != 200 or "applyDetectionCorrection" not in page:
+            return False, f"GET / -> {status}, or applyDetectionCorrection is missing"
+        status, listed, why = p15._live_json(base_url, "/api/corrections")
+        if status != 200 or not isinstance(listed, list):
+            return False, f"/api/corrections -> {why or status}"
+        status, _body = p15._live_get(base_url, f"/api/species/{params['species_key']}")
+        if status != 200:
+            return False, f"/api/species/<key> -> {status}"
+        source = inspect.getsource(suite_live)
+        write_markers = ["method=" + '"POST"', "da" + "ta=", "method=" + '"PUT"', "method=" + '"DELETE"']
+        found = [m for m in write_markers if m in source]
+        return not found, f"suite_live source contains a write marker: {found}"
+
+    passed += _case("LV4", lv4)
+
+    # LV5 - INFO lines 17-04 diffs before and after the restart.
+    def lv5():
+        info = {}
+        status, stats, _w = p15._live_json(base_url, "/api/stats")
+        if status == 200 and isinstance(stats, dict):
+            scalars = {k: v for k, v in sorted(stats.items()) if isinstance(v, (int, float))}
+            info["stats"] = json.dumps(scalars, sort_keys=True)
+        info["species_count"] = len(species) if species else None
+        status, listed, _w = p15._live_json(base_url, "/api/corrections")
+        info["corrections_count"] = len(listed) if status == 200 and isinstance(listed, list) else None
+        status, videos, _w = p15._live_json(base_url, "/api/videos?per_page=1")
+        info["videos_total"] = videos.get("total") if status == 200 and isinstance(videos, dict) else None
+        status, gallery, _w = p15._live_json(base_url, "/api/gallery?per_page=1")
+        info["gallery_total"] = gallery.get("total") if status == 200 and isinstance(gallery, dict) else None
+        info["last_run_id"] = last_run.get("id") if isinstance(last_run, dict) else None
+        for name, value in info.items():
+            print(f"INFO: {name} {value}")
+        unreadable = [n for n, v in info.items() if v is None]
+        return not unreadable, f"unreadable: {unreadable}"
+
+    passed += _case("LV5", lv5)
+
+    return (passed, total)
+
+
 # -- registry / CLI ----------------------------------------------------------
 
 SUITES = {
@@ -1366,10 +1905,12 @@ SUITES = {
     "decoupled": (suite_decoupled, 6),
     "guard": (suite_guard, 6),
     "endpoints": (suite_endpoints, 6),
+    "bytecopy": (suite_bytecopy, 5),
+    "live": (suite_live, 5),
 }
 
 # Suites that only run when explicitly requested (never part of --suite all).
-EXPLICIT_ONLY = set()
+EXPLICIT_ONLY = {"bytecopy", "live"}
 
 
 def main():
@@ -1379,12 +1920,32 @@ def main():
         help="which suite to run (default: all)",
     )
     parser.add_argument("--list", action="store_true", help="list suites and exit")
+    parser.add_argument(
+        "--db", default=None,
+        help="database for the bytecopy suite (required for it, no default). It is "
+             "opened read-only (mode=ro) and copied with Connection.backup(); it is "
+             "never written",
+    )
+    parser.add_argument(
+        "--base-url", default="http://localhost:8080",
+        help="running service for the live suite, GET only (default: http://localhost:8080)",
+    )
     args = parser.parse_args()
 
     if args.list:
         for name, (_fn, total) in SUITES.items():
             print(f"{name}: {total} cases")
         return 0
+
+    if args.suite == "bytecopy":
+        if not args.db:
+            print("ERROR: --db is required for the bytecopy suite")
+            return 2
+        # sqlite3.connect creates a missing file, so check before any connect
+        # (the audit_species_buckets pattern).
+        if not os.path.isfile(args.db):
+            print(f"ERROR: no database at {args.db}")
+            return 2
 
     # web_app.root() reads static/index.html with the locale's default encoding.
     # On a UTF-8 box (the Linux target) that is right; on a cp1252 dev box GET /
@@ -1402,7 +1963,12 @@ def main():
     all_passed = True
     for name in names:
         fn, _total = SUITES[name]
-        passed, total = fn()
+        if name == "bytecopy":
+            passed, total = fn(args.db)
+        elif name == "live":
+            passed, total = fn(args.base_url)
+        else:
+            passed, total = fn()
         if passed is None:
             # A suite that cannot run returns (None, reason). Under `all` that is a
             # skip (never a PASS); asked for by name it is a FAIL, so the phase
