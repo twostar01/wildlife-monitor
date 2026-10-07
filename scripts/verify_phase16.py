@@ -24,7 +24,12 @@ Suites:
     readers      - plan 16-03, READER-01..03/D-08/D-09: has_species, Videos
                    search and both halves of global search on the effective
                    name, with an uncorrected-only taxonomy branch (RD1-RD10).
-    (frontend_src and live are added by plan 16-03 task 2.)
+    frontend_src - plan 16-03, D-06/D-07/Pitfall 7: source contracts on
+                   static/index.html for the old-link canonicalizer, View-all
+                   on the resolved key, one chip per bucket spelling and the
+                   untouched corrected badge (FS1-FS6).
+    live         - plan 16-03: HTTP GET proof against a running service
+                   (LV1-LV5); explicit `--suite live` only, never in all.
 
 Fixture. _seed_phase16_fixture extends Phase 15's fixture (no fork) with rows
 whose RAW labels differ but whose common names normalise to the same bucket:
@@ -48,7 +53,8 @@ and Unknown species. Raw labels (LBL_*) and bucket keys (KEY_*) are separate
 constants (D-05).
 
 Usage:
-    python scripts/verify_phase16.py --suite audit_script|merge|unknown|resolver|readers|all
+    python scripts/verify_phase16.py --suite audit_script|merge|unknown|resolver|readers|frontend_src|live|all
+    python scripts/verify_phase16.py --suite live --base-url http://localhost:8080
     python scripts/verify_phase16.py --list
 """
 
@@ -1100,6 +1106,232 @@ def suite_readers():
     return (passed, total)
 
 
+# -- frontend_src suite ------------------------------------------------------
+
+BADGE_CSS_RULE = (
+    ".badge-corrected { background: rgba(109,186,92,0.15); color: var(--accent); "
+    "font-size: 10px; font-family: var(--font-mono); padding: 2px 6px; border-radius: 3px; }"
+)
+PALETTE_LINE = (
+    "const SPECIES_PALETTE = ['#6dba5c','#c8a84b','#e07b2a','#4fa3d4','#9b59b6',"
+    "'#e05c5c','#2abfbf','#f0c040'];"
+)
+
+
+def _fs_slices():
+    """Comment-stripped slices of static/index.html used by the FS cases."""
+    text = p15._read_text("static/index.html")
+    strip = p15._strip_slash_comment_lines
+    sl = p15._slice
+    return {
+        "all": strip(text),
+        "canon": strip(sl(text, "async function canonicalizeSpeciesFilter(", "\n}")),
+        "load_dashboard": strip(sl(text, "async function loadDashboard(", "// Stat cards")),
+        "load_species": strip(sl(text, "async function loadSpecies(", "async function openSpecies(")),
+        "open_species": strip(sl(text, "async function openSpecies(", "\n// ── Gallery")),
+        "video_item": strip(sl(text, "function videoItemHtml(", "\n}")),
+        "recent": strip(sl(text, "has_species=true')", "sighting-item")),
+        "unique": strip(sl(text, "function uniqueSpeciesNames(", "\n}")),
+        "confidence": strip(sl(text, "function confidenceBadge(", "\nfunction escHtml(")),
+        "raw": text,
+    }
+
+
+def suite_frontend_src():
+    """`frontend_src` suite cases FS1-FS6 (6 total): D-06, D-07, Pitfall 7.
+    Source-contract assertions over comment-stripped slices of the single
+    static file (no build step, so no browser run here)."""
+    total = 6
+    passed = 0
+    s = _fs_slices()
+
+    # FS1 - canonicalizeSpeciesFilter: one attempt per value, resolver call,
+    # exact-key result, hash rewrite only on a #gallery hash, silent failure.
+    def fs1():
+        c = s["canon"]
+        needed = [
+            "state._speciesCanonTried", "/species/", "encodeURIComponent", "d.label",
+            "location.hash.startsWith('#gallery')", "writeGalleryHash()",
+            "applyGalleryFiltersToControls()", "renderGalleryChips()", "catch",
+        ]
+        missing = [n for n in needed if n not in c]
+        banned = [n for n in ("innerHTML", "alert(") if n in c]
+        return bool(c) and not missing and not banned, f"missing={missing}, banned={banned}"
+
+    passed += _case("FS1", fs1)
+
+    # FS2 - called after the dropdowns are populated, in both loaders.
+    def fs2():
+        ld, ls = s["load_dashboard"], s["load_species"]
+        call = "canonicalizeSpeciesFilter()"
+        i_pop_d = ld.find("populateSpeciesFilters(state.speciesList)")
+        i_call_d = ld.find(call)
+        i_pop_s = ls.find("populateSpeciesFilters(data)")
+        i_call_s = ls.find(call)
+        ok = -1 < i_pop_d < i_call_d and -1 < i_pop_s < i_call_s
+        return ok, f"dashboard pop/call={(i_pop_d, i_call_d)}, species pop/call={(i_pop_s, i_call_s)}"
+
+    passed += _case("FS2", fs2)
+
+    # FS3 - openSpecies hands the resolved key to both View-all buttons.
+    def fs3():
+        o = s["open_species"]
+        needed = [
+            "const key = d.label || label", "state.gallerySpecies = key",
+            "sel.value = key", "navigateToVideos({ species: key })",
+        ]
+        missing = [n for n in needed if n not in o]
+        i_key, i_catch = o.find("const key"), o.find("catch")
+        ok = bool(o) and not missing and i_key > i_catch > -1
+        return ok, f"missing={missing}, const key at {i_key}, catch at {i_catch}"
+
+    passed += _case("FS3", fs3)
+
+    # FS4 - D-07: the card badge, its CSS rule and the per-crop badge are untouched.
+    def fs4():
+        a = s["all"]
+        n_badge = a.count(BADGE_LINE)
+        ok = (
+            n_badge == 1
+            and BADGE_CSS_RULE in a
+            and "if (hasCorrection)" in s["confidence"]
+        )
+        return ok, (
+            f"badge_lines={n_badge}, css_rule={BADGE_CSS_RULE in a}, "
+            f"confidence_branch={'if (hasCorrection)' in s['confidence']}"
+        )
+
+    passed += _case("FS4", fs4)
+
+    # FS5 - one chip per bucket spelling, in both chip builders.
+    def fs5():
+        u = s["unique"]
+        n_def = s["all"].count("function uniqueSpeciesNames(")
+        ok = (
+            n_def == 1
+            and "toLowerCase()" in u
+            and "trim()" in u
+            and "uniqueSpeciesNames(" in s["video_item"]
+            and "uniqueSpeciesNames(" in s["recent"]
+        )
+        return ok, (
+            f"defs={n_def}, lower={'toLowerCase()' in u}, trim={'trim()' in u}, "
+            f"video_item={'uniqueSpeciesNames(' in s['video_item']}, "
+            f"recent={'uniqueSpeciesNames(' in s['recent']}"
+        )
+
+    passed += _case("FS5", fs5)
+
+    # FS6 - no palette change, and no new markup from the new functions.
+    def fs6():
+        bad = [
+            (name, tok)
+            for name in ("canon", "unique")
+            for tok in ("class=", "style=")
+            if tok in s[name]
+        ]
+        ok = PALETTE_LINE in s["all"] and bool(s["canon"]) and bool(s["unique"]) and not bad
+        return ok, f"palette={PALETTE_LINE in s['all']}, markup={bad}"
+
+    passed += _case("FS6", fs6)
+
+    return (passed, total)
+
+
+# -- live suite (explicit only) ----------------------------------------------
+
+def _is_unknown_name(value):
+    return _ascii_norm(value) == "unknown species"
+
+
+def suite_live(base_url="http://localhost:8080"):
+    """`live` suite cases LV1-LV5 (5 total): HTTP GET only, against a running
+    service. Explicit `--suite live` only; never part of `--suite all`."""
+    import urllib.parse
+
+    total = 5
+    passed = 0
+    get_json, get_text = p15._live_json, p15._live_get
+
+    def _species():
+        st, rows, detail = get_json(base_url, "/api/species")
+        if st != 200 or not isinstance(rows, list):
+            raise RuntimeError(detail or "/api/species is not a list")
+        return rows
+
+    # LV1 - BUCKET-04 live: unique labels, no two rows share a normalised name.
+    def lv1():
+        species = _species()
+        labels = [r.get("label") for r in species]
+        shared = _shared_name_violations(species)
+        ok = bool(species) and len(set(labels)) == len(labels) and shared == []
+        return ok, f"rows={len(species)}, unique_labels={len(set(labels))}, shared={shared}"
+
+    passed += _case("LV1", lv1)
+
+    # LV2 - stats agree with the list and never show Unknown.
+    def lv2():
+        species = _species()
+        st, stats, detail = get_json(base_url, "/api/stats")
+        if st != 200 or not isinstance(stats, dict):
+            return False, detail or "/api/stats not a dict"
+        bad = [
+            t for t in stats.get("top_species", [])
+            if _is_unknown_name(t.get("label")) or _is_unknown_name(t.get("common_name"))
+        ] + [
+            r for r in stats.get("activity_7d_by_species", [])
+            if _is_unknown_name(r.get("label")) or _is_unknown_name(r.get("species"))
+        ]
+        ok = stats.get("unique_species") == len(species) and not bad
+        return ok, f"unique_species={stats.get('unique_species')}, list={len(species)}, unknown rows={bad}"
+
+    passed += _case("LV2", lv2)
+
+    # LV3 - D-06 live: a raw label from the gallery resolves to a current key.
+    def lv3():
+        species = _species()
+        st, gal, detail = get_json(base_url, "/api/gallery?per_page=1")
+        if st != 200 or not isinstance(gal, dict) or not gal.get("items"):
+            return False, detail or "/api/gallery returned no items"
+        raw = gal["items"][0]["label"]
+        st, det, detail = get_json(base_url, "/api/species/" + urllib.parse.quote(raw, safe=""))
+        keys = {r.get("label") for r in species}
+        ok = st == 200 and isinstance(det, dict) and det.get("label") in keys
+        return ok, f"raw={raw!r}, status={st}, resolved={det.get('label') if isinstance(det, dict) else None!r}, {detail}"
+
+    passed += _case("LV3", lv3)
+
+    # LV4 - the converted video readers answer on live data.
+    def lv4():
+        species = _species()
+        if not species:
+            return False, "no species rows"
+        st, vids, detail = get_json(base_url, "/api/videos?has_species=true&per_page=1")
+        if st != 200 or not isinstance(vids, dict) or vids.get("total", 0) < 1:
+            return False, detail or f"has_species total={vids.get('total') if isinstance(vids, dict) else None}"
+        name = urllib.parse.quote(species[0]["common_name"], safe="")
+        st, vs, detail = get_json(base_url, f"/api/videos?search={name}&per_page=1")
+        if st != 200 or not isinstance(vs, dict) or vs.get("total", 0) < 1:
+            return False, detail or f"search total={vs.get('total') if isinstance(vs, dict) else None}"
+        st, res, detail = get_json(base_url, f"/api/search?q={name}")
+        keys = {r.get("label") for r in species}
+        hits = res.get("species") if isinstance(res, dict) else None
+        ok = st == 200 and bool(hits) and all(h.get("label") in keys for h in hits)
+        return ok, detail or f"search species hits={hits}"
+
+    passed += _case("LV4", lv4)
+
+    # LV5 - the served page carries the new functions.
+    def lv5():
+        st, body = get_text(base_url, "/")
+        ok = st == 200 and "canonicalizeSpeciesFilter" in body and "uniqueSpeciesNames" in body
+        return ok, f"GET / -> {st if st is not None else body}"
+
+    passed += _case("LV5", lv5)
+
+    return (passed, total)
+
+
 # -- registry / CLI ----------------------------------------------------------
 
 SUITES = {
@@ -1108,10 +1340,12 @@ SUITES = {
     "unknown": (suite_unknown, 6),
     "resolver": (suite_resolver, 6),
     "readers": (suite_readers, 10),
+    "frontend_src": (suite_frontend_src, 6),
+    "live": (suite_live, 5),
 }
 
 # Suites that only run when explicitly requested (never part of --suite all).
-EXPLICIT_ONLY = set()
+EXPLICIT_ONLY = {"live"}
 
 
 def main():
@@ -1121,6 +1355,10 @@ def main():
         help="which suite to run (default: all)",
     )
     parser.add_argument("--list", action="store_true", help="list suites and exit")
+    parser.add_argument(
+        "--base-url", default="http://localhost:8080",
+        help="running service for the live suite (default: http://localhost:8080)",
+    )
     args = parser.parse_args()
 
     if args.list:
@@ -1133,7 +1371,10 @@ def main():
     all_passed = True
     for name in names:
         fn, _total = SUITES[name]
-        passed, total = fn()
+        if name == "live":
+            passed, total = fn(args.base_url)
+        else:
+            passed, total = fn()
         if passed == total:
             print(f"PASS: {name} ({passed}/{total})")
         else:

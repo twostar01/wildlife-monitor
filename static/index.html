@@ -1084,6 +1084,9 @@ const state = {
   timelineDays: 30, timelineDateFrom: '', timelineDateTo: '',
   currentVideoId: null,
   speciesList: [],
+  // Last gallery species value canonicalizeSpeciesFilter() tried to resolve:
+  // the one-attempt-per-value loop guard (Phase 16 D-06).
+  _speciesCanonTried: '',
   // Last-loaded/last-saved run_time_hhmm value, used by collectSettingsPayload()
   // so the general/notification settings saves never fall back to a hardcoded
   // default (WR-03) — see collectSettingsPayload() below.
@@ -1193,6 +1196,9 @@ async function loadDashboard() {
     // loadCameras()'s gallerySel.value = state.galleryCamera re-apply.
     const gallerySpeciesSel = document.getElementById('gallerySpeciesFilter');
     if (gallerySpeciesSel) gallerySpeciesSel.value = state.gallerySpecies;
+    // An old #gallery?species=<raw label> link now matches no option; repair
+    // it once against the resolver. Not awaited: the page never waits on it.
+    canonicalizeSpeciesFilter();
   }
 
   // Stat cards — clicking navigates to the relevant tab/filter
@@ -1322,9 +1328,7 @@ async function loadDashboard() {
   const vids = await api('/videos?per_page=10&has_species=true');
   document.getElementById('recentList').innerHTML = vids.items.length ? vids.items.map(v => {
     // Build clickable species name chips
-    const speciesNames = v.species_list
-      ? v.species_list.split(',').filter(Boolean).slice(0,3)
-      : [];
+    const speciesNames = uniqueSpeciesNames(v.species_list ? v.species_list.split(',') : []).slice(0,3);
     const speciesHtml = speciesNames.length
       ? speciesNames.map(name => {
           const trimmed = name.trim();
@@ -1541,6 +1545,7 @@ async function loadSpecies() {
   const data = await api('/species');
   state.speciesList = data;
   populateSpeciesFilters(data);
+  canonicalizeSpeciesFilter();
 
   document.getElementById('speciesCount').textContent = `${data.length} species identified`;
   if (!data.length) {
@@ -1598,20 +1603,23 @@ async function openSpecies(label) {
     if (speciesTrendChartInst) { speciesTrendChartInst.destroy(); speciesTrendChartInst = null; }
     return;
   }
+  // The API echoes the resolved bucket key as d.label (Phase 16 D-06), so a raw
+  // label opened from an old path still navigates with a current key.
+  const key = d.label || label;
   document.getElementById('modalTitle').textContent = d.info.common_name || label;
   document.getElementById('modalSubtitle').textContent = d.info.scientific_name || label;
 
   // Wire "View all" buttons — close modal and navigate
   document.getElementById('modalViewGalleryBtn').onclick = () => {
     closeModal('speciesModal');
-    state.gallerySpecies = label; state.galleryPage = 1;
+    state.gallerySpecies = key; state.galleryPage = 1;
     const sel = document.getElementById('gallerySpeciesFilter');
-    if (sel) sel.value = label;
+    if (sel) sel.value = key;
     switchTab('gallery'); writeGalleryHash(); loadGallery();
   };
   document.getElementById('modalViewVideosBtn').onclick = () => {
     closeModal('speciesModal');
-    navigateToVideos({ species: label });
+    navigateToVideos({ species: key });
   };
 
   // Trend chart
@@ -1697,6 +1705,34 @@ function writeGalleryHash() {
   if (state.galleryMinConf)  p.set('min_conf',  state.galleryMinConf);
   const qs = p.toString();
   history.replaceState(null, '', qs ? `#gallery?${qs}` : '#gallery');
+}
+
+// Repairs an old #gallery?species=<raw SpeciesNet label> link (Phase 16 D-06,
+// BUCKET-05). Bucket keys are now names, so a raw label matches no dropdown
+// option and the chip would print the whole label. The server-side resolver
+// already maps it to its bucket, and GET /api/species/{value} echoes that key
+// as d.label, so one request is enough to switch state onto the current key.
+// Loop guard: at most one attempt per value, and no retry on failure. The
+// gallery itself already loaded correct rows through the backend resolver, so
+// nothing is reloaded here. An unresolvable value keeps the stale-key
+// behaviour silently (no modal, no toast).
+async function canonicalizeSpeciesFilter() {
+  const v = state.gallerySpecies;
+  if (!v || state._speciesCanonTried === v) return;
+  if ((state.speciesList || []).some(s => s.label === v)) return;   // already a current key
+  state._speciesCanonTried = v;
+  try {
+    const d = await api(`/species/${encodeURIComponent(v)}`);
+    // The operator may have changed the filter while the request was in flight.
+    if (d.label && state.gallerySpecies === v
+        && (state.speciesList || []).some(s => s.label === d.label)) {
+      state.gallerySpecies = d.label;
+      // Only rewrite the URL while the gallery owns it, never on another tab.
+      if (location.hash.startsWith('#gallery')) writeGalleryHash();
+      applyGalleryFiltersToControls();
+      renderGalleryChips();
+    }
+  } catch (e) { /* unresolvable value: keep the stale-key behaviour silently */ }
 }
 
 // Writes the five gallery filter state fields back into the DOM controls.
@@ -1931,7 +1967,7 @@ async function loadVideos(page) {
 }
 
 function videoItemHtml(v) {
-  const tags = (v.species_list || '').split(',').filter(Boolean).slice(0,5);
+  const tags = uniqueSpeciesNames((v.species_list || '').split(',')).slice(0,5);
   const cameraLabel = v.camera_name
     ? `<span class="tag" style="background:rgba(200,168,75,0.12);color:var(--gold);border-color:rgba(200,168,75,0.25)">📷 ${escHtml(v.camera_name)}</span>`
     : '';
@@ -2532,6 +2568,24 @@ function confidenceBadge(value, hasCorrection) {
   const pct = Math.round(value * 100);
   const style = pct < 70 ? ' style="color:var(--danger);font-weight:700"' : '';
   return `<span class="quality-score"${style}>${pct}%</span>`;
+}
+
+// First-seen, trimmed, non-empty names with case-insensitive duplicates dropped.
+// A video holding a native "Domestic Dog" and a corrected "domestic dog" comes
+// back from the API as one GROUP_CONCAT string with both spellings, but they are
+// one bucket and must render as one chip (Phase 16 Pitfall 7). Output is still
+// rendered through escHtml by every caller.
+function uniqueSpeciesNames(names) {
+  const seen = new Set();
+  const out = [];
+  for (const raw of names) {
+    const name = (raw || '').trim();
+    const k = name.toLowerCase();
+    if (!name || seen.has(k)) continue;
+    seen.add(k);
+    out.push(name);
+  }
+  return out;
 }
 
 function escHtml(s) {

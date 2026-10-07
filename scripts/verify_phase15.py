@@ -1412,7 +1412,11 @@ def suite_frontend_src():
         "d.info.common_name || label",
         "modalViewGalleryBtn').onclick = () =>",
         "modalViewVideosBtn').onclick = () =>",
-        "navigateToVideos({ species: label })",
+        # Phase 16 D-06: View-all navigates with the resolved key d.label (not
+        # the value openSpecies was opened with), so an old raw label lands on
+        # a current key.
+        "const key = d.label || label",
+        "navigateToVideos({ species: key })",
     ]
     missing = [n for n in needed if n not in os_src]
     ok = not missing
