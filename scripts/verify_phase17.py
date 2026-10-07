@@ -25,6 +25,14 @@ Suites:
                 `wildlife_processor.py --reprocess-flagged` run (ML modules
                 stubbed) behave identically on both shapes, and a frozen
                 legacy value is never surfaced, written or cleared.
+    guard     - GD1-GD6: a permanent static scan of the non-harness sources.
+                No file may name the legacy objects, comments included; the
+                live API field `user_common_name` is allowed only inside an
+                explicit allowlist of regions. GD1 is a negative control that
+                proves the scanner can fail; GD5 proves it is not vacuous;
+                GD6 keeps the four retired one-shot scripts gone. The scan is
+                data-driven (SCAN_GLOBS, FORBIDDEN_*, BARE_ALLOW,
+                GUARD_EXEMPT), so Phase 18 extends it with one line.
 
 Fixture. Both shapes are built from scripts/verify_phase15.py's fixture plus a
 dual-lens pair and a flagged video with two crops on disk. The legacy DDL below
@@ -32,7 +40,7 @@ lives ONLY in this file: database.py no longer declares those objects, so the
 harness re-creates them with raw statements on a copy.
 
 Usage:
-    python scripts/verify_phase17.py --suite schema|decoupled|all
+    python scripts/verify_phase17.py --suite schema|decoupled|guard|all
     python scripts/verify_phase17.py --list
 
 verify_phase15 is a sibling import, so run this file without `python -I`.
@@ -40,7 +48,9 @@ verify_phase15 is a sibling import, so run this file without `python -I`.
 
 import argparse
 import contextlib
+import fnmatch
 import json
+import re
 import sqlite3
 import subprocess
 import sys
@@ -687,11 +697,303 @@ def suite_decoupled():
     return (passed, total)
 
 
+# -- guard suite -------------------------------------------------------------
+#
+# A permanent static guard: no non-harness source may name the legacy objects.
+# It is driven by the data structures below, so Phase 18 can extend it with one
+# line. The patterns are data HERE, which is why scripts/verify_*.py (this file
+# included) is excluded from the scan: the harness fixtures legitimately build
+# the legacy shape. BUILDLOG.md, CHANGELOG.md, .planning and .gsd are simply not
+# matched by SCAN_GLOBS.
+
+# Relative to the repo root.
+SCAN_GLOBS = [
+    "*.py", "*.sh", "static/*.html", "systemd/*", "README.md",
+    "scripts/*.py", "scripts/*.sh", "scripts/*.ps1",
+]
+SCAN_EXCLUDE_GLOBS = ["scripts/verify_*.py"]
+
+# Whole-file exemptions: path -> reason. Empty in Phase 17. Phase 18's
+# standalone production drop script is expected to be added here with one line
+# and a reason, because it must name the objects it drops.
+GUARD_EXEMPT = {}
+
+# Unambiguous names: forbidden everywhere scanned, comments included (this is
+# what forces the stale-comment cleanup).
+FORBIDDEN_ANYWHERE = [
+    r"\bvideo_corrections\b",
+    r"\bMIGRATION_ADD_CORRECTIONS\b",
+    r"\bHAS_VIDEO_CORRECTION\b",
+    r"\bVIDEO_CORRECTION_(?:COMMON|SCIENTIFIC)\b",
+    r"\bDISPLAY_(?:COMMON|SCIENTIFIC)\b",
+    r"\bget_video_corrections\b",
+    r"\bapply_corrections_to_species\b",
+    r"\bidx_corrections_(?:video|label)\b",
+]
+
+# Names that are ambiguous on their own (corrected_at lives on
+# species_corrections): forbidden only in a SQL-shaped context.
+FORBIDDEN_SQLISH = [
+    r"\b(?:s|s2|species)\.(?:user_common_name|user_scientific_name|corrected_at)\b",
+    r"\b(?:user_common_name|user_scientific_name|corrected_at)\s*=\s*(?i:null)\b",
+    r"(?i:add\s+column)\s+(?:user_common_name|user_scientific_name|corrected_at)\b",
+    r"NULLIF\(\s*(?:\w+\.)?user_(?:common|scientific)_name",
+]
+
+# The live API field name. Allowed only inside the regions below.
+BARE_TOKEN = r"\buser_(?:common|scientific)_name\b"
+
+# path -> (start marker, end marker, reason). The region runs from the first
+# start marker to the next end marker after it.
+BARE_ALLOW = {
+    "database.py": (
+        "def correct_species(", "\ndef ", "live API field: correct_species parameters",
+    ),
+    "web_app.py": (
+        "class SpeciesCorrectionRequest(", '@app.get("/api/videos")',
+        "live API request model and handler",
+    ),
+    "static/index.html": (
+        "async function applyDetectionCorrection(", "\n}", "Gallery correction POST body",
+    ),
+}
+
+# The four one-shot scripts retired in 17-01 (D-01): they stay absent.
+RETIRED_SCRIPTS = [
+    "scripts/backfill_dedup_videos.py",
+    "scripts/backfill_species_corrections.py",
+    "scripts/verify_dedup_backfill.py",
+    "scripts/verify_backfill_species_corrections.py",
+]
+
+# Core files the guard must be scanning (GD5), so a mistyped glob cannot make it
+# pass vacuously.
+REQUIRED_SCANNED = [
+    "database.py", "web_app.py", "wildlife_processor.py", "notifications.py",
+    "image_quality.py", "static/index.html", "README.md", "nas_sync.sh",
+    "nas_connect.sh", "setup.sh",
+    "systemd/wildlife-analysis.service", "systemd/wildlife-analysis.timer",
+    "systemd/wildlife-monitor.service",
+    "scripts/migrate_stale_paths.py", "scripts/audit_species_buckets.py",
+]
+
+
+def _scan_files():
+    """Sorted repo-relative posix paths the guard covers."""
+    root = _repo_root()
+    found = set()
+    for pattern in SCAN_GLOBS:
+        for p in root.glob(pattern):
+            if p.is_file():
+                found.add(p.relative_to(root).as_posix())
+    found = {
+        f for f in found
+        if not any(fnmatch.fnmatch(f, ex) for ex in SCAN_EXCLUDE_GLOBS)
+        and f not in GUARD_EXEMPT
+    }
+    return sorted(found)
+
+
+def _read_scanned(relpath):
+    """LF-normalised text; undecodable bytes are replaced rather than raised, so
+    one odd file cannot abort the whole scan. Comments are NOT stripped."""
+    raw = (_repo_root() / relpath).read_bytes().decode("utf-8", errors="replace")
+    return raw.replace("\r\n", "\n")
+
+
+def _allowed_region(relpath, text):
+    """(start, end) character offsets of the file's BARE_ALLOW region, or None
+    when the file has no entry or its start marker is absent."""
+    entry = BARE_ALLOW.get(relpath)
+    if not entry:
+        return None
+    start_marker, end_marker, _reason = entry
+    start = text.find(start_marker)
+    if start == -1:
+        return None
+    end = text.find(end_marker, start + len(start_marker))
+    return (start, len(text) if end == -1 else end)
+
+
+def _scan_text(relpath, text):
+    """Violations in `text` as (relpath, line number, pattern, line text). The
+    text is scanned raw: the guard deliberately covers stale comments."""
+    out = []
+
+    def _add(match, pattern):
+        line_no = text.count("\n", 0, match.start()) + 1
+        line = text.splitlines()[line_no - 1] if text else ""
+        out.append((relpath, line_no, pattern, line.strip()))
+
+    for pattern in FORBIDDEN_ANYWHERE + FORBIDDEN_SQLISH:
+        for m in re.finditer(pattern, text):
+            _add(m, pattern)
+    region = _allowed_region(relpath, text)
+    for m in re.finditer(BARE_TOKEN, text):
+        if region and region[0] <= m.start() < region[1]:
+            continue
+        _add(m, BARE_TOKEN)
+    return out
+
+
+def _scan_repo():
+    """All violations across the scanned set, plus the {path: text} read."""
+    texts = {f: _read_scanned(f) for f in _scan_files()}
+    violations = []
+    for rel, text in texts.items():
+        violations += _scan_text(rel, text)
+    return violations, texts
+
+
+def _show(violations):
+    """Print one `path:line: pattern` per violation and return a short detail."""
+    for rel, line_no, pattern, line in violations:
+        print(f"  {rel}:{line_no}: {pattern}   {line[:100]}")
+    return f"{len(violations)} violation(s), listed above"
+
+
+def suite_guard():
+    """`guard` suite cases GD1-GD6 (6 total)."""
+    total = 6
+    passed = 0
+
+    # GD1 - negative control: the scanner can fail, and does not over-fire.
+    def gd1():
+        always = [
+            "FROM video_corrections vc", "MIGRATION_ADD_CORRECTIONS", "HAS_VIDEO_CORRECTION",
+            "VIDEO_CORRECTION_COMMON", "VIDEO_CORRECTION_SCIENTIFIC", "DISPLAY_COMMON",
+            "DISPLAY_SCIENTIFIC", "get_video_corrections(", "apply_corrections_to_species(",
+            "idx_corrections_video", "idx_corrections_label",
+        ]
+        sqlish = [
+            "s.user_common_name", "s2.user_scientific_name", "species.corrected_at",
+            "user_common_name = NULL", "corrected_at=null", "ADD COLUMN user_common_name",
+            "add  column corrected_at", "NULLIF(s.user_common_name,'')",
+            "NULLIF( user_scientific_name,'')",
+        ]
+        missed = []
+        for sample in always + sqlish:
+            if not _scan_text("synthetic.py", f"x = 1\n{sample}\n"):
+                missed.append(sample)
+        if not _scan_text("synthetic.py", "payload = user_common_name\n"):
+            missed.append("bare token outside any region")
+        if not _scan_text("database.py", "def other():\n    return user_common_name\n"):
+            missed.append("bare token in database.py outside correct_species")
+        if not _scan_text(
+            "database.py", "def correct_species(\n    user_common_name: str,\n)\ndef other():\n"
+            "    return user_scientific_name\n"
+        ):
+            missed.append("bare token after the correct_species region")
+        if missed:
+            return False, f"the scanner missed: {missed}"
+
+        # The allowlisted regions and the live look-alikes stay clean.
+        inside = (
+            "def correct_species(\n    user_common_name: str,\n    user_scientific_name: str,\n)\n"
+            "def other():\n    pass\n"
+        )
+        web = (
+            "class SpeciesCorrectionRequest(BaseModel):\n    user_common_name: str\n"
+            "def f(body):\n    return body.user_common_name\n"
+            '@app.get("/api/videos")\n'
+        )
+        clean = (
+            "SELECT species_corrections.corrected_at, sc.corrected_at FROM species_corrections sc\n"
+            "ON CONFLICT(detection_id) DO UPDATE SET corrected_at=excluded.corrected_at\n"
+            "ORDER BY sc.corrected_at DESC\n"
+            "k = KEY_DISPLAY_CTE + NATIVE_DISPLAY_CTE\n"
+            "CREATE INDEX idx_species_corrections_label ON species_corrections(corrected_label)\n"
+            "display_common = save_video_correction()\n"
+        )
+        noisy = (
+            _scan_text("database.py", inside)
+            + _scan_text("web_app.py", web)
+            + _scan_text("synthetic.py", clean)
+        )
+        if noisy:
+            return False, f"look-alikes were flagged: {noisy}"
+        return True, ""
+
+    passed += _case("GD1", gd1)
+
+    violations, texts = _scan_repo()
+    forbidden = set(FORBIDDEN_ANYWHERE)
+    sqlish = set(FORBIDDEN_SQLISH)
+
+    # GD2 - no always-forbidden token anywhere, comments included.
+    def gd2():
+        hits = [v for v in violations if v[2] in forbidden]
+        return (not hits), (_show(hits) if hits else "")
+
+    passed += _case("GD2", gd2)
+
+    # GD3 - no SQL-shaped legacy pattern.
+    def gd3():
+        hits = [v for v in violations if v[2] in sqlish]
+        return (not hits), (_show(hits) if hits else "")
+
+    passed += _case("GD3", gd3)
+
+    # GD4 - bare tokens only inside the allowlisted regions, and no stale entry.
+    def gd4():
+        problems = []
+        hits = [v for v in violations if v[2] == BARE_TOKEN]
+        for rel, (start_marker, _end, _reason) in BARE_ALLOW.items():
+            text = texts.get(rel)
+            if text is None:
+                problems.append(f"{rel}: allowlisted but not scanned")
+                continue
+            region = _allowed_region(rel, text)
+            if region is None:
+                problems.append(f"{rel}: start marker {start_marker!r} not found (stale allowlist)")
+            elif not re.search(BARE_TOKEN, text[region[0]:region[1]]):
+                problems.append(f"{rel}: region holds no live-field token (stale allowlist)")
+        if hits:
+            problems.append(_show(hits))
+        return (not problems), "; ".join(problems)
+
+    passed += _case("GD4", gd4)
+
+    # GD5 - coverage: the core files are scanned, no harness is, none was empty.
+    def gd5():
+        scanned = set(texts)
+        missing = [f for f in REQUIRED_SCANNED if f not in scanned]
+        harnesses = [f for f in scanned if fnmatch.fnmatch(f, "scripts/verify_*.py")]
+        empty = [f for f, t in texts.items() if not t.strip()]
+        ok = not (missing or harnesses or empty)
+        return ok, f"not scanned: {missing}; harness files scanned: {harnesses}; empty reads: {empty}"
+
+    passed += _case("GD5", gd5)
+
+    # GD6 - the four retired scripts stay absent and unreferenced.
+    def gd6():
+        root = _repo_root()
+        back = [r for r in RETIRED_SCRIPTS if (root / r).exists()]
+        stems = [Path(r).stem for r in RETIRED_SCRIPTS]
+        others = [
+            p.relative_to(root).as_posix() for p in (root / "scripts").glob("verify_*.py")
+            if p.name != "verify_phase17.py"
+        ]
+        refs = []
+        for rel in sorted(set(texts) | set(others)):
+            text = texts.get(rel) or _read_scanned(rel)
+            for stem in stems:
+                if stem in text:
+                    refs.append(f"{rel} -> {stem}")
+        ok = not (back or refs)
+        return ok, f"retired scripts present: {back}; references: {refs}"
+
+    passed += _case("GD6", gd6)
+
+    return (passed, total)
+
+
 # -- registry / CLI ----------------------------------------------------------
 
 SUITES = {
     "schema": (suite_schema, 4),
     "decoupled": (suite_decoupled, 6),
+    "guard": (suite_guard, 6),
 }
 
 # Suites that only run when explicitly requested (never part of --suite all).
