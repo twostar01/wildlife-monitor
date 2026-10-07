@@ -2,20 +2,19 @@
 gsd_state_version: "1.0"
 milestone: v1.4
 milestone_name: Effective Species Labeling
-current_phase: 15
-current_phase_name: Effective-Label Grouping & Filtering
-status: planning
-stopped_at: Phase 14 complete, ready to plan Phase 15
-last_updated: "2026-10-06T21:00:00.153Z"
+status: Awaiting next milestone
+stopped_at: Phase 15 complete — all phases complete
+last_updated: "2026-10-07T04:47:12.456Z"
 last_activity: 2026-10-06
-last_activity_desc: Phase 14 complete, transitioned to Phase 15
-state_head: 4dee37e5f694dd20f4453d00fad6397470996f5b
+last_activity_desc: Milestone v1.4 completed and archived
+state_head: 6a278706d40fa6cbe1f768ccf8a1ea31e6948cd0
 progress:
   total_phases: 2
-  completed_phases: 1
-  total_plans: 4
-  completed_plans: 4
-  percent: 50
+  completed_phases: 2
+  total_plans: 7
+  completed_plans: 7
+  percent: 100
+current_phase: 15
 ---
 
 # Project State
@@ -25,22 +24,20 @@ progress:
 See: .planning/PROJECT.md (updated 2026-08-21)
 
 **Core value:** Every animal that passes a camera gets detected, identified, and browsable — without the operator having to intervene to keep the system running.
-**Current focus:** Phase 14 — correction-unification-schema-backfill-cutover
+**Current focus:** Phase 15 — Effective-Label Grouping & Filtering
 
 ## Current Position
 
-Phase: 15 — Effective-Label Grouping & Filtering
-Plan: Not started
-Status: Ready to plan
-Last activity: 2026-10-06 — Phase 14 complete, transitioned to Phase 15
-
-Progress: [█████░░░░░] 50% of plans (phase verification pending)
+Phase: Milestone v1.4 complete
+Plan: —
+Status: Awaiting next milestone
+Last activity: 2026-10-06 — Milestone v1.4 completed and archived
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 45
+- Total plans completed: 48
 - Average duration: —
 - Total execution time: —
 
@@ -62,7 +59,7 @@ Progress: [█████░░░░░] 50% of plans (phase verification pend
 | 12 | TBD | - | - |
 | 13 | 3 | - | - |
 | 14 | 4 | - | - |
-| 15 | TBD | - | - |
+| 15 | 3 | - | - |
 
 **Recent Trend:**
 
@@ -84,6 +81,9 @@ Progress: [█████░░░░░] 50% of plans (phase verification pend
 | Phase 11 P04 | 24min | 3 tasks | 2 files |
 | Phase 12 P04 | ~65min | 3 tasks | 3 files |
 | Phase 13 P03 | 40min | 3 tasks | 1 files |
+| Phase 15 P01 | 23 min | 3 tasks | 5 files |
+| Phase 15 P02 | 12 min | 2 tasks | 2 files |
+| Phase 15 P03 | 45 min | 2 tasks | 3 files |
 
 ## Accumulated Context
 
@@ -110,6 +110,10 @@ Recent decisions affecting current work:
 - [Phase ?]: 11-04: Production --apply write executed on ubuntulaptop -- 14,354 rows rewritten (4,274 crops.crop_path, 10,080 videos.thumbnail_path), reconciled byte-identical against 11-03 baseline (row counts, both non_path_digest values, zero FK violations, exhaustive existence check). Operator confirmed no dashboard regression (SC3). FIX-02 closed.
 - [Phase ?]: Phase 12 closed 2026-08-16: OBS-02, UI-05, NOTIFY-03 all Complete. Operator approved all 6 browser checkpoint items with no deviations, and requested a follow-up phase (7a) covering effective-label grouping/filter-matching plus whether to unify the two species-correction mechanisms (7b) -- filed as .planning/todos/pending/2026-08-16-effective-label-grouping-and-correction-unification.md. Video-player-correction-wins accepted as a stopgap precedence rule pending that follow-up.
 - [Phase ?]: Phase 13 (CLEANUP-04, CLEANUP-05) deployed to ubuntulaptop and fully operator-verified: SC1-SC4 all confirmed against the real NAS, real production DB, and a real browser; both remaining harness suites and the import smoke check passed on the real production Python 3.12 environment
+- [Phase 15]: 15-01: get_species_list() has no kept=1 predicate (matches gallery/detail/top_species so lockstep counts hold); timeline and activity keep kept=1, audit AU1 reports the divergence
+- [Phase 15]: 15-01: effective key = normalised (trim space/tab/LF/CR, ASCII lower) corrected common name else raw label; blacklist override tests CORRECTED_KEY IS NOT NULL; suppression excluded globally in KNOWN_SPECIES_FILTER
+- [Phase 15]: 15-02: openSpecies catch path uses textContent/static HTML only and nulls both View-all handlers; dropdown options sorted from a copy (display name, key tiebreak) with selection re-applied inside populateSpeciesFilters
+- [Phase 15]: Phase 15-03: service restarted onto effective-key code only after byte-copy audit and all harnesses passed; operator deferred the 8 rendered browser checks (PENDING, not completed)
 
 ### Pending Todos
 
@@ -121,6 +125,7 @@ Recent decisions affecting current work:
 - ~~~22% of `crops`/`videos.thumbnail_path` references (14,354 rows) in production point at stale `/home/nash/...` paths that no longer exist~~ — a pre-existing historical home-directory rename (`nash` → `twostar`) with no accompanying database path-rewrite migration. Discovered during Phase 9's 09-04 rehearsal. **Resolved 2026-08-16 as FIX-02 / Phase 11**: 14,354 rows migrated in a single production `--apply` write, zero nash-prefixed rows remain, reconciled byte-identical against the pre-write baseline.
 - ~~`scripts/backfill_dedup_videos.py`'s printed summary report says "would be deleted"/"would be removed" even when run with `--apply`~~ — cosmetic wording bug in `render_plan_report()`'s shared dry-run/apply template. **Resolved 2026-08-15 as FIX-03 / Phase 10** (fix was written 2026-08-11 but stranded on an orphaned worktree branch until merged to `main`/deployed this session).
 - ~~Video-player species corrections (the `video_corrections` table) were only ever displayed inside that video's own detail view.~~ **Display propagation resolved 2026-08-20 as UI-05 / Phase 12** (Gallery grid, species-detail modal, Videos tab, filename search, and video detail all now show the corrected label via `EFFECTIVE_COMMON`/`EFFECTIVE_SCIENTIFIC`). **Grouping/filter-matching and correction-mechanism unification now scoped into v1.4 as Phase 14 (CORR-01..04) and Phase 15 (LABEL-01..05).** `.planning/todos/pending/2026-08-16-effective-label-grouping-and-correction-unification.md` (source todo; can be moved to done/ once Phase 15 ships)
+- Merge corrected and AI-detected species into a single bucket (major) — Phase 15 UAT test 5: native and corrected same-name species show as two cards/dropdown entries/chart series (D-03). Deferred by operator; needs a merge-key design decision. `.planning/todos/pending/2026-10-06-merge-corrected-and-ai-detected-species-into-a-single-bucket.md`
 
 ### Blockers/Concerns
 
@@ -156,14 +161,18 @@ None open. ROADMAP.md created for v1.4 (Phases 14-15); ready to discuss/plan Pha
 | v1.2 milestone close | Formal verification override — Phases 8 and 9 have no scripted `*-VERIFICATION.md` report (the automated verify step never ran in either phase's execution flow). Both are functionally complete: Phase 8's 3 plans executed and its own standing checkpoints (RUN-01/02 confirmed, RUN-03/04 tracked above) were worked through directly against production; Phase 9's 4 plans included an extensive manual production rehearsal, real production write, and full post-run verification (0 FK violations, 0 broken pairings, all deltas reconciled), all operator-witnessed and recorded in `09-04-SUMMARY.md`. | **Operator-authorized override at v1.2 close (2026-08-11)** — proceeding without the formal artifact; the underlying verification work was done, just not through the scripted tool path. | 2026-08-11 |
 | v1.3 milestone close | Formal verification override — Phase 10's readiness check flagged `verification_status: stale` (not phase_complete) at milestone close, because Phase 12's later commits (12-01 to 12-04) re-touched `static/index.html`/`database.py`/`web_app.py` after Phase 10's own `10-VERIFICATION.md` was written (2026-08-15). This is a mechanical file-touch heuristic, not a detected regression: the v1.3 milestone audit's `gsd-integration-checker` independently re-read the *current* `static/index.html` and confirmed Phase 10's dual-lens `data-video-id` fix is still present and undisturbed by Phase 12's badge changes. | **Operator-authorized override at v1.3 close (2026-08-21)** — proceeding without re-running `/gsd-verify-work 10`; see `.planning/milestones/v1.3-MILESTONE-AUDIT.md` for the integration checker's independent re-confirmation. | 2026-08-21 |
 | v1.4 milestone (open, no deadline) | NOTIFY-02: zero-detection alert fires on a real no-animal night but not on an empty directory — `alert_on_zero_detections` armed true in production 2026-08-07; the firing shape has never occurred in 13+ runs to date. | Standing observation item, not scoped into v1.4 (see PROJECT.md Live-Verification Follow-ups) | 2026-08-07 (armed) → carried forward |
+| v1.4 milestone close | Merge corrected and AI-detected species into a single bucket (major) — Phase 15 UAT test 5; operator says the split is not acceptable, fix later. Needs a merge-key design decision. `.planning/todos/pending/2026-10-06-merge-corrected-and-ai-detected-species-into-a-single-bucket.md` | Acknowledged, deferred | 2026-10-06 |
+| v1.4 milestone close | has_species=true, get_videos(search=) and the videos half of search() still use the raw label. `.planning/todos/pending/2026-10-06-has-species-and-video-search-raw-label.md` | Acknowledged, deferred | 2026-10-06 |
+| v1.4 milestone close | Legacy correction columns/table removal (D-07 of Phase 14). `.planning/todos/pending/2026-08-21-legacy-correction-column-removal.md` | Acknowledged, deferred | 2026-10-06 |
+| v1.4 milestone close | Species correction from unknown species does not save (todo file still pending though resolved as FIX-01 / Phase 10). | Acknowledged (already resolved) | 2026-10-06 |
+| v1.4 milestone close | Archived v1.1 open artifacts: Phase 02 UAT, Phase 06 UAT, Phase 02 verification (human_needed). | Acknowledged, carried forward | 2026-10-06 |
 
 ## Session Continuity
 
-Last session: 2026-08-21T22:44:01.218Z
-Stopped at: Phase 14 complete, ready to plan Phase 15
-Resume file: C:/Users/nclem/Claude Code/wildlife-monitor/.planning/phases/14-correction-unification-schema-backfill-cutover/14-CONTEXT.md
+Last session: 2026-10-07T03:28:56.946Z
+Stopped at: Phase 15 complete — all phases complete
+Resume file: None
 
 ## Operator Next Steps
 
-- Review ROADMAP.md's Phase 14/15 structure and success criteria
-- `/gsd-discuss-phase 14` — gather context and clarify approach for Phase 14 (Correction Unification)
+- Start the next milestone with /gsd-new-milestone

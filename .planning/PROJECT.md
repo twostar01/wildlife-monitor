@@ -10,9 +10,16 @@ Every animal that passes a camera gets detected, identified, and browsable — w
 
 ## Current State
 
-**Shipped:** v1.3 Bug Fixes & Data Integrity (2026-08-21) — see `.planning/milestones/v1.3-ROADMAP.md`
+**Shipped:** v1.4 Effective Species Labeling (2026-10-06) — see `.planning/milestones/v1.4-ROADMAP.md`
+
+v1.4 made a corrected detection's species the single effective label everywhere. Phase 14 unified the two correction mechanisms into one `species_corrections` table (UPSERT write-time precedence, one-time production backfill, legacy columns frozen). Phase 15 then made the species list, Stats, Timeline, drilldown, Gallery/Videos species filters and the species half of search group on one SQL-defined effective key, with correction-aware blacklist override and global suppression; the frontend gained a recoverable "Species not found" modal, sorted dropdowns that keep the active filter, and species names on gallery chips. Operator UAT: 6 pass, 1 issue, 1 optional check skipped. The one issue is deferred: a native AI-detected species and its corrected counterpart still show as two separate buckets (decision D-03); the operator says that is not acceptable and the fix can wait.
+
+<details>
+<summary>Previous state (v1.3, shipped 2026-08-21)</summary>
 
 v1.3 closed out the last known bugs, data-quality gaps, and monitoring decisions left over from v1.0-v1.2, with no new user-facing features. Species correction from "unknown species" now saves correctly, including a previously-undiscovered dual-lens video-id misattribution bug found and fixed while closing that exact case out (Phase 10). ~14,354 stale `/home/nash/...` path references in `crops`/`videos` were migrated to `/home/twostar/...` in a single production write, reconciled byte-identical against a pre-write baseline (Phase 11). Gallery tiles for a human-corrected species now show a "corrected" pencil indicator instead of a stale confidence score, `web_app.py` gained five new operational logging call sites, and the NOTIFY-01 live-verification gap was formally closed as a permanent, documented limitation (Phase 12). The raw-cleanup preview is now reachable from `nas_sync.sh --dry-run` directly, and the retention-misconfiguration warning independently checks raw-vs-kept retention alongside the existing raw-vs-blank check — including a post-review fix for a `set -e` bug in the new preview branch, redeployed and reverified in production before the milestone closed (Phase 13).
+
+</details>
 
 <details>
 <summary>Previous state (v1.2, shipped 2026-08-11)</summary>
@@ -21,15 +28,9 @@ v1.2 closed out the last known rough edges from the first two milestones: mobile
 
 </details>
 
-## Current Milestone: v1.4 Effective Species Labeling
+## Next Milestone Goals
 
-**Goal:** A corrected detection's species stops appearing under its stale AI label everywhere in the app (Species tab, Stats, Timeline, filters), and the two correction mechanisms get a single authoritative resolution order.
-
-**Target features:**
-- Effective-label grouping/filtering across `get_species_list()`, `get_stats()`, `get_timeline()`, and the gallery/video species filters — a corrected detection fully leaves its original stale AI label's bucket everywhere, not just in display (which Phase 12 already fixed)
-- Research whether to unify the two correction mechanisms (`species.user_common_name` vs. `video_corrections`) into one schema or reconcile at read-time with a fixed precedence order, then implement the chosen approach
-
-One standing observation item remains open with no deadline (NOTIFY-02, see Live-Verification Follow-ups below), and three non-blocking documentation-hygiene items surfaced during the v1.3 milestone audit (see `.planning/milestones/v1.3-MILESTONE-AUDIT.md`) remain deferred, out of scope for v1.4: stale/missing `requirements-completed` frontmatter on a few SUMMARY files, and a stale CLAUDE.md claim that `.planning/` is entirely untracked in git (several files, including `PROJECT.md`/`REQUIREMENTS.md` as of Phase 12, are intentionally tracked).
+(None defined yet — run `/gsd-new-milestone`.) Candidates carried forward: merge a corrected species and its AI-detected counterpart into one bucket (`.planning/todos/pending/2026-10-06-merge-corrected-and-ai-detected-species-into-a-single-bucket.md`); convert the remaining raw-label readers `has_species` and `get_videos(search=)`; remove the frozen legacy correction columns (D-07); NOTIFY-02 observation (no deadline).
 
 ## Requirements
 
@@ -78,6 +79,8 @@ One standing observation item remains open with no deadline (NOTIFY-02, see Live
 - ✓ OBS-02: `web_app.py` gained five `log.info` call sites at decided operational events (correction save/delete, settings/schedule save) beyond the 18 `print()` sites converted in Phase 7 — Phase 12, validated 2026-08-20 on production (journald-confirmed)
 - ✓ UI-05: gallery confidence badge replaced with a "corrected" pencil indicator on tiles whose species was human-corrected via either the Gallery popover or the video player's per-crop editor, in both the Gallery grid and species-detail modal — Phase 12, validated 2026-08-20 on production (operator confirmed both correction paths, both grids)
 - ✓ NOTIFY-03: NOTIFY-01 (partial-run failure alert live-verification) recorded as a permanent, accepted limitation and removed from the open live-verification backlog — Phase 12, closed 2026-08-16 (alert code itself unchanged and remains live)
+- ✓ CORR-01..CORR-04: one `species_corrections` table, keyed uniquely per detection, is the authoritative source of a detection's corrected species; both correction write paths feed it with write-time recency precedence, the audit trail is preserved, and a one-time production backfill ran 2026-08-22 — Phase 14, v1.4
+- ✓ LABEL-01..LABEL-05: the species list, Stats, Timeline, drilldown and the Gallery/Videos species filters key on one effective label; a corrected detection fully leaves its stale AI bucket and an emptied bucket disappears everywhere; blacklist/suppression decided (correction overrides the blacklist, suppression is global) — Phase 15, v1.4 (browser UAT 6 pass / 1 deferred issue / 1 skipped)
 
 ### Active
 
@@ -89,7 +92,7 @@ One standing observation item remains open with no deadline (NOTIFY-02, see Live
 - [x] Phase 14: browser checks 5(a)-(i) repeated and recorded 2026-10-06 (all pass; see 14-04-SUMMARY.md)
 - [ ] Phase 14 (D-02): observe on the next real reprocess that a reprocessed video's detections start uncorrected (accepted consequence of snapshot fan-out)
 - [ ] Phase 14: legacy `video_corrections` row for video 31680 (spotted hyaena, 2026-06-15) matched 0 detections and is not in `species_corrections`; decide whether to re-apply by hand or drop
-- [ ] Phase 15: rendered browser checks are PENDING with the operator (deferred 2026-10-06, "Skip, I'll check them later"), not completed: Species-tab cards and badges, donut slice click and Timeline series, dropdown alphabetical order and the "Species: Northern Raccoon" chip surviving reload/navigation, the "Species not found" modal and inert View-all buttons, acknowledgement of the D-03 duplicate-name and D-10 lowercase-heading behaviour, acknowledgement that suppressed crops are gone from the Gallery (crop 23412), the optional correction round-trip, and the D-07 blacklist-override display (1 corrected detection with a blacklisted raw label exists). Backend/HTTP proof is done (live suite 5/5, byte-copy audit, orchestrator live API checks); see 15-03-SUMMARY.md
+- [x] Phase 15: rendered browser UAT completed 2026-10-06 (6 pass, 1 issue deferred — native vs corrected same-name buckets, 1 optional round-trip skipped); see `.planning/milestones/v1.4-phases/15-effective-label-grouping-filtering/15-UAT.md`
 - [ ] Phase 15 (operator decision 2): three readers still match the raw SpeciesNet label by design: `get_videos(has_species=...)`, `get_videos(search=...)` and the videos half of `search()`; tracked in `.planning/todos/pending/2026-10-06-has-species-and-video-search-raw-label.md`
 
 ### Out of Scope
@@ -178,4 +181,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-10-06 — Phase 15 (effective-label grouping and filtering) deployed to production; browser checks pending with the operator*
+*Last updated: 2026-10-06 after v1.4 milestone*
