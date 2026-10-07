@@ -779,7 +779,10 @@ if __name__ == "__main__":
 
     # ── Reprocess flagged videos (SpeciesNet only) ─────────────────────────────
     if args.reprocess_flagged:
-        from database import init_db, get_reprocess_queue, clear_reprocess_flag, get_blacklist
+        from database import (
+            init_db, get_reprocess_queue, clear_reprocess_flag, get_blacklist,
+            rewrite_species_for_reprocess,
+        )
         import sqlite3 as _sqlite3
         init_db(os.path.join(args.data_dir, "wildlife.db"))
         queue = get_reprocess_queue()
@@ -852,16 +855,11 @@ if __name__ == "__main__":
                     break
 
                 sci, common = parse_label(label)
-                conn.execute("""
-                    UPDATE species SET label=?, common_name=?, scientific_name=?,
-                           confidence=?, top_candidates_json=?,
-                           user_common_name=NULL, user_scientific_name=NULL, corrected_at=NULL
-                    WHERE detection_id=?
-                """, (label, common, sci, score, top5_json, det_id))
-                # The detection keeps its id across a reprocess, so its unified
-                # correction would otherwise survive and keep overriding (or, for a
-                # video-player suppress, hiding) the freshly classified label.
-                conn.execute("DELETE FROM species_corrections WHERE detection_id=?", (det_id,))
+                # The detection keeps its id across a reprocess, so the helper also
+                # clears its unified correction: left in place it would keep
+                # overriding (or, for a video-player suppress, hiding) the freshly
+                # classified label.
+                rewrite_species_for_reprocess(conn, det_id, label, common, sci, score, top5_json)
 
             conn.commit()
             clear_reprocess_flag(vid_id)

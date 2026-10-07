@@ -84,9 +84,6 @@ CREATE TABLE IF NOT EXISTS species (
     common_name         TEXT,
     scientific_name     TEXT,
     confidence          REAL,
-    user_common_name    TEXT,           -- human correction (overrides SpeciesNet)
-    user_scientific_name TEXT,
-    corrected_at        TEXT,           -- ISO datetime of last correction
     top_candidates_json TEXT
 );
 
@@ -113,27 +110,14 @@ CREATE TABLE IF NOT EXISTS blacklist (
     note            TEXT
 );
 
-CREATE TABLE IF NOT EXISTS video_corrections (
-    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    video_id             INTEGER NOT NULL REFERENCES videos(id),
-    original_label       TEXT NOT NULL,
-    corrected_label      TEXT,           -- NULL means suppress
-    corrected_common     TEXT,
-    corrected_scientific TEXT,
-    corrected_at         TEXT NOT NULL,
-    note                 TEXT
-);
-
 -- Unified correction record (D-00, CORR-01): the single authoritative
--- per-detection correction row, replacing species.user_common_name/
--- user_scientific_name/corrected_at and video_corrections as the system of
--- record. UNIQUE(detection_id) + an UPSERT write path (add_to_blacklist()'s
--- proven ON CONFLICT ... DO UPDATE shape) gives deterministic most-recent-
--- write-wins semantics (D-03) with no read-time precedence chain needed.
--- `suppressed` (not a NULL corrected_label) is the suppression signal — see
--- this plan's objective discretion note for why a dedicated column was
--- chosen over RESEARCH.md's corrected_label-IS-NULL encoding. `source` is
--- carried for observability only, never for precedence (D-03).
+-- per-detection correction row that both write paths (the Gallery popover and
+-- the video-player editor) upsert. UNIQUE(detection_id) + an UPSERT write path
+-- (add_to_blacklist()'s proven ON CONFLICT ... DO UPDATE shape) gives
+-- deterministic most-recent-write-wins semantics (D-03) with no read-time
+-- precedence chain needed. `suppressed` (not a NULL corrected_label) is the
+-- suppression signal. `source` is carried for observability only, never for
+-- precedence (D-03).
 CREATE TABLE IF NOT EXISTS species_corrections (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     detection_id         INTEGER NOT NULL UNIQUE REFERENCES detections(id),
@@ -173,8 +157,6 @@ CREATE INDEX IF NOT EXISTS idx_detections_video_id ON detections(video_id);
 CREATE INDEX IF NOT EXISTS idx_species_label ON species(label);
 CREATE INDEX IF NOT EXISTS idx_crops_quality ON crops(quality_score DESC);
 CREATE INDEX IF NOT EXISTS idx_blacklist_label ON blacklist(label);
-CREATE INDEX IF NOT EXISTS idx_corrections_video ON video_corrections(video_id);
-CREATE INDEX IF NOT EXISTS idx_corrections_label ON video_corrections(original_label);
 -- No index on species_corrections(detection_id): the UNIQUE constraint above
 -- already creates one.
 CREATE INDEX IF NOT EXISTS idx_species_corrections_label ON species_corrections(corrected_label);
@@ -200,12 +182,6 @@ CREATE INDEX IF NOT EXISTS idx_videos_paired_video_id ON videos(paired_video_id)
 # Migration: add camera_name to existing databases that predate this column
 MIGRATION_ADD_CAMERA = """
 ALTER TABLE videos ADD COLUMN camera_name TEXT;
-"""
-
-MIGRATION_ADD_CORRECTIONS = """
-ALTER TABLE species ADD COLUMN user_common_name TEXT;
-ALTER TABLE species ADD COLUMN user_scientific_name TEXT;
-ALTER TABLE species ADD COLUMN corrected_at TEXT;
 """
 
 MIGRATION_ADD_PURGED_AT = """
@@ -707,8 +683,6 @@ def init_db(db_path: Optional[str] = None):
         if "lens_index" not in cols:
             conn.executescript(MIGRATION_ADD_LENS)
         sp_cols = [r[1] for r in conn.execute("PRAGMA table_info(species)").fetchall()]
-        if "user_common_name" not in sp_cols:
-            conn.executescript(MIGRATION_ADD_CORRECTIONS)
         if "top_candidates_json" not in sp_cols:
             conn.executescript(MIGRATION_ADD_CANDIDATES)
         if "needs_reprocess" not in cols:
@@ -1696,6 +1670,35 @@ def clear_reprocess_flag(video_id: int):
         conn.execute("UPDATE videos SET needs_reprocess=0 WHERE id=?", (video_id,))
 
 
+def rewrite_species_for_reprocess(
+    conn,
+    detection_id: int,
+    label: str,
+    common_name: Optional[str],
+    scientific_name: Optional[str],
+    confidence: float,
+    top_candidates_json: Optional[str],
+) -> None:
+    """
+    Re-classify one detection in place and drop its unified correction, so a
+    reprocessed detection starts uncorrected (Phase 14 D-02). The detection
+    keeps its id across a reprocess, so its species_corrections row would
+    otherwise survive and keep overriding (or, for a video-player suppress,
+    hiding) the freshly classified label.
+
+    The caller owns the connection and the commit, the same convention as
+    _upsert_species_correction(): wildlife_processor.py's --reprocess-flagged
+    loop passes its own connection and commits once per video. Every value is
+    bound with a `?` placeholder (T-14-02).
+    """
+    conn.execute(
+        "UPDATE species SET label=?, common_name=?, scientific_name=?, "
+        "confidence=?, top_candidates_json=? WHERE detection_id=?",
+        (label, common_name, scientific_name, confidence, top_candidates_json, detection_id),
+    )
+    conn.execute("DELETE FROM species_corrections WHERE detection_id=?", (detection_id,))
+
+
 def _fanout_detection_ids(conn, video_id: int, original_label: str) -> list:
     """
     Return the list of detection ids matching (video_id, original_label) at
@@ -1783,24 +1786,6 @@ def save_video_correction(
     return len(detection_ids)
 
 
-def get_video_corrections(video_id: int) -> list:
-    """
-    Read the frozen legacy video_corrections table for video_id (D-06: still
-    readable, never written, by any code path after Phase 14's cutover).
-    GET /api/corrections?video_id= has no frontend caller (grep-verified —
-    static/index.html's only reference to '/api/corrections' is the POST in
-    applyCorrection()), so this is deliberately left reading the frozen
-    table rather than rewired to species_corrections (RESEARCH.md Open
-    Question 2).
-    """
-    with get_conn() as conn:
-        rows = conn.execute(
-            "SELECT * FROM video_corrections WHERE video_id=? ORDER BY corrected_at",
-            (video_id,)
-        ).fetchall()
-    return [dict(r) for r in rows]
-
-
 def delete_correction(correction_id: int):
     """Delete a single species_corrections row by id (replaces
     delete_video_correction() — D-00/CORR-01, the unified table is the only
@@ -1829,36 +1814,6 @@ def get_corrections(video_id: Optional[int] = None) -> list:
     sql += " ORDER BY sc.corrected_at DESC, sc.id DESC"
     with get_conn() as conn:
         return [dict(r) for r in conn.execute(sql, params).fetchall()]
-
-
-def apply_corrections_to_species(species_list: list, corrections: list) -> list:
-    """
-    Post-processing: overlay video_corrections onto a species list.
-    corrections is the result of get_video_corrections(video_id).
-    Returns species_list with corrected entries modified in place.
-
-    Retained, unreferenced pending D-07 (legacy-table removal follow-up
-    phase): get_video_by_id() stopped calling this function in Phase 14
-    plan 14-02's read-path cutover (species_corrections is now read
-    directly via SQL) — kept defined only because the legacy table it
-    overlays stays readable (D-06) until a future removal phase.
-    """
-    corr_map = {c["original_label"]: c for c in corrections}
-    result = []
-    for sp in species_list:
-        label = sp.get("label")
-        if label and label in corr_map:
-            c = corr_map[label]
-            if c["corrected_label"] is None:
-                continue  # suppressed
-            sp = dict(sp)
-            sp["label"]           = c["corrected_label"]
-            sp["common_name"]     = c["corrected_common"]
-            sp["scientific_name"] = c["corrected_scientific"]
-            sp["corrected"]       = True
-            sp["original_label"]  = label
-        result.append(sp)
-    return result
 
 
 def search_taxonomy(
@@ -2606,11 +2561,6 @@ def get_video_by_id(video_id: int) -> dict:
 
         det_list = [dict(r) for r in detections]
 
-        # get_video_corrections() reads the frozen legacy correction table
-        # on purpose (RESEARCH.md Open Question 2, D-06) — kept only for
-        # this response's `corrections` key, whose shape is unchanged.
-        corrections = get_video_corrections(video_id)
-
         # Fetch paired lens video if this is a dual-lens camera
         paired = None
         pair_detections = []
@@ -2638,8 +2588,7 @@ def get_video_by_id(video_id: int) -> dict:
         return {
             "video":           dict(video),
             "detections":      det_list,
-            "corrections":     corrections,
-            "paired":          paired,
+            "paired":         paired,
             "pair_detections": pair_detections,
         }
 

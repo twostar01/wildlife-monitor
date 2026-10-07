@@ -1036,7 +1036,8 @@ def suite_precedence():
 def suite_gaps():
     """`gaps` suite cases G1-G4 (4 total): the 14-REVIEW.md gap-closure fixes.
     G1 pins CR-01 (a --reprocess-flagged pass clears the detection's unified
-    correction), G2-G4 pin CR-02 (DELETE /api/corrections/{id} and GET
+    correction: the loop calls database.rewrite_species_for_reprocess() and
+    the helper UPDATEs before it DELETEs), G2-G4 pin CR-02 (DELETE /api/corrections/{id} and GET
     /api/corrections share one id space; a miss is a 404, not a silent ok)."""
     passed = 0
     total = 4
@@ -1050,18 +1051,28 @@ def suite_gaps():
         det_cat_b = ids["det_cat_b"]
         video2 = ids["video2"]
 
-        # G1 — CR-01: the reprocess loop deletes the detection's unified row.
+        # G1 — CR-01: the reprocess loop clears the detection's unified row. Since
+        # Phase 17 the write lives in database.rewrite_species_for_reprocess(): the
+        # loop must call it, and the helper must rewrite the label (UPDATE) before
+        # it deletes the correction, with bound parameters only (T-17-05).
         processor_text = (_repo_root() / "wildlife_processor.py").read_text(encoding="utf-8")
         reprocess_block = _strip_comment_lines(
             _slice(processor_text, "if args.reprocess_flagged:", "Reprocessing complete")
         )
-        ok = (
-            "UPDATE species SET label=?" in reprocess_block
-            and "DELETE FROM species_corrections WHERE detection_id=?" in reprocess_block
-            and reprocess_block.index("DELETE FROM species_corrections")
-            > reprocess_block.index("UPDATE species SET label=?")
+        helper_body = _strip_comment_lines(
+            _slice(_database_py_text(), "def rewrite_species_for_reprocess(", "\ndef ")
         )
-        _check("G1", ok, "wildlife_processor.py's --reprocess-flagged loop must DELETE the detection's species_corrections row after rewriting its label")
+        ok = (
+            "rewrite_species_for_reprocess(conn, det_id" in reprocess_block
+            and "UPDATE species" not in reprocess_block
+            and "UPDATE species SET label=?" in helper_body
+            and "DELETE FROM species_corrections WHERE detection_id=?" in helper_body
+            and helper_body.index("DELETE FROM species_corrections")
+            > helper_body.index("UPDATE species SET label=?")
+            and 'f"' not in helper_body
+            and "f'" not in helper_body
+        )
+        _check("G1", ok, "wildlife_processor.py's --reprocess-flagged loop must call database.rewrite_species_for_reprocess(), which UPDATEs the label before it DELETEs the detection's species_corrections row, with no f-string SQL")
         if ok:
             passed += 1
 
