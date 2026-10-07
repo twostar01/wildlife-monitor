@@ -287,7 +287,7 @@ IS_SUPPRESSED_DETECTION = """EXISTS (
     WHERE sc.detection_id = d.id AND sc.suppressed = 1
 )"""
 
-# ── Effective grouping key (Phase 15, LABEL-01..05) ─────────────────────────
+# ── Effective grouping key (Phase 15 LABEL-01..05, Design B in Phase 16) ─────────────────────────
 #
 # Every species reader that groups or filters by "which species is this?"
 # keys on ONE expression, EFFECTIVE_KEY, defined here and nowhere else
@@ -299,11 +299,29 @@ IS_SUPPRESSED_DETECTION = """EXISTS (
 #     carry corrected_label = NULL (free-text name only), so a taxonomy label
 #     cannot be the key; a normalised name lets "Raccoon" from the Gallery
 #     popover and "raccoon " from the video player land in one bucket.
-#   - Every other detection keeps its raw s.label (D-02). A scientific-only or
-#     blank-name correction therefore leaves the key unchanged (RESEARCH
-#     Pitfall 3).
-#   - A corrected bucket and a native SpeciesNet bucket are NOT force-merged
-#     (D-03): they stay separate unless their keys happen to be equal.
+#   - Every other (native) detection is keyed by NATIVE_KEY (Phase 16 D-01):
+#     the normalised common name, so two native taxonomy labels that share a
+#     name are one bucket; the raw s.label when the name is blank (a blank-name
+#     native stays its own bucket and no correction can merge into it); and the
+#     literal 'Unknown species' for the Unknown pseudo-label AND for any native
+#     row whose name normalises to 'unknown species' (parse_label writes the
+#     label itself as the common name), so the two get_stats comparisons
+#     `EFFECTIVE_KEY != 'Unknown species'` keep excluding it (D-05).
+#     A scientific-only or blank-name correction leaves the key unchanged
+#     (RESEARCH Pitfall 3).
+#   - A native bucket and a corrected bucket with the same normalised name are
+#     therefore ONE bucket (Phase 16 D-01, superseding Phase 15 D-03). Phase 16
+#     D-03 says two different taxa sharing a name merge as well.
+#
+# NATIVE_KEY is built only from _normalize_key_sql and needs only the `s`
+# alias; EFFECTIVE_KEY additionally needs `d`. scripts/audit_species_buckets.py
+# holds a predicted copy of the NATIVE_KEY text and verify_phase16 MG9 pins the
+# two equal.
+#
+# Display rule (D-04): native_display (NATIVE_DISPLAY_CTE, the most frequent
+# native common name for the key, ties broken by name), then key_display (a
+# correction-only bucket keeps the most recent correction's text), then
+# MAX(raw). The scientific name follows the same source.
 #
 # Alias precondition: like every constant above, each interpolation site needs
 # `s` (species) and `d` (detections) in scope.
@@ -324,11 +342,13 @@ IS_SUPPRESSED_DETECTION = """EXISTS (
 # need SQLite >= 3.25; production runs 3.45.1.
 #
 # Display rule used by every aggregate reader: if the group's key has a
-# key_display row, the common name is display_common and the scientific name
-# is display_scientific (even when that is NULL, never the raw AI scientific
+# native_display row, the common name is its display_common and the scientific
+# name its display_scientific; else if it has a key_display row, display_common
+# / display_scientific (even when that is NULL, never the raw AI scientific
 # name of an arbitrary member); otherwise MAX(raw common) / MAX(raw
-# scientific). Join `key_display kd ON kd.k = <group key>` once per group; never
-# resolve the display name per output row (measured 7.7 s vs 0.26 s).
+# scientific). Join `native_display nd ON nd.k = <group key>` and
+# `key_display kd ON kd.k = <group key>` once per group; never resolve the
+# display name per output row (measured 7.7 s vs 0.26 s).
 #
 # The trim set covers space, tab, LF and CR because the API accepts those in
 # names and one-argument TRIM strips only spaces. SQLite LOWER folds ASCII
@@ -348,7 +368,11 @@ def _normalize_key_sql(expr: str) -> str:
 
 
 CORRECTED_KEY = _normalize_key_sql(UNIFIED_CORRECTION_COMMON)
-EFFECTIVE_KEY = f"COALESCE({CORRECTED_KEY}, s.label)"
+NATIVE_KEY = f"""CASE WHEN s.label = 'Unknown species'
+              OR {_normalize_key_sql('s.common_name')} = 'unknown species'
+             THEN 'Unknown species'
+         ELSE COALESCE({_normalize_key_sql('s.common_name')}, s.label) END"""
+EFFECTIVE_KEY = f"COALESCE({CORRECTED_KEY}, {NATIVE_KEY})"
 
 KEY_DISPLAY_CTE = f"""key_display AS (
     SELECT r.k AS k,
@@ -365,6 +389,28 @@ KEY_DISPLAY_CTE = f"""key_display AS (
         FROM species_corrections sc
         WHERE sc.suppressed = 0
           AND {_normalize_key_sql('sc.corrected_common')} IS NOT NULL
+    ) r
+    WHERE r.rn = 1
+)"""
+
+NATIVE_DISPLAY_CTE = f"""native_display AS (
+    SELECT r.k AS k,
+           r.display_common AS display_common,
+           r.display_scientific AS display_scientific
+    FROM (
+        SELECT n.k AS k,
+               n.common AS display_common,
+               n.sci AS display_scientific,
+               ROW_NUMBER() OVER (PARTITION BY n.k ORDER BY n.cnt DESC, n.common) AS rn
+        FROM (
+            SELECT {NATIVE_KEY} AS k,
+                   {_trim_name_sql('s.common_name')} AS common,
+                   NULLIF(MAX({_trim_name_sql('s.scientific_name')}), '') AS sci,
+                   COUNT(*) AS cnt
+            FROM species s
+            WHERE {_normalize_key_sql('s.common_name')} IS NOT NULL
+            GROUP BY {NATIVE_KEY}, {_trim_name_sql('s.common_name')}
+        ) n
     ) r
     WHERE r.rn = 1
 )"""
@@ -560,7 +606,8 @@ EFFECTIVE_SCIENTIFIC = f"COALESCE(NULLIF({UNIFIED_CORRECTION_SCIENTIFIC},''), s.
 #   - search(): the species half
 #
 # Each one interpolates the SAME constant in its GROUP BY / WHERE, takes its
-# display name from key_display (latest correction wins, id breaks ties),
+# display name native-first (native_display, then key_display, then raw; see
+# the display rule above),
 # and never GROUP BYs or ORDERs BY a bare `label`/`common_name` result alias
 # (SQLite would resolve that against the FROM-clause column and silently
 # regroup on the raw s.label). The API field `label` now carries the key, so
@@ -1990,6 +2037,7 @@ def get_stats() -> dict:
                 FROM dates WHERE day < DATE('now')
             ),
             {KEY_DISPLAY_CTE},
+            {NATIVE_DISPLAY_CTE},
             ev AS (
                 SELECT DATE(v.recorded_at) AS day,
                        v.id AS vid,
@@ -2004,12 +2052,13 @@ def get_stats() -> dict:
                   AND {EFFECTIVE_KEY} != 'Unknown species'
             )
             SELECT dates.day AS day,
-                   COALESCE(MAX(kd.display_common), MAX(ev.raw_common)) AS species,
+                   COALESCE(MAX(nd.display_common), MAX(kd.display_common), MAX(ev.raw_common)) AS species,
                    ev.ekey AS label,
                    COUNT(DISTINCT ev.vid) AS count
             FROM dates
             LEFT JOIN ev ON ev.day = dates.day
             LEFT JOIN key_display kd ON kd.k = ev.ekey
+            LEFT JOIN native_display nd ON nd.k = ev.ekey
             GROUP BY dates.day, ev.ekey
             ORDER BY dates.day
         """).fetchall()
@@ -2019,8 +2068,8 @@ def get_stats() -> dict:
         # The exclusion tests the KEY, not the raw label, so a detection
         # corrected away from Unknown counts under its corrected key.
         top_species = conn.execute(f"""
-            WITH {KEY_DISPLAY_CTE}
-            SELECT COALESCE(kd.display_common, g.raw_common) AS common_name,
+            WITH {KEY_DISPLAY_CTE}, {NATIVE_DISPLAY_CTE}
+            SELECT COALESCE(nd.display_common, kd.display_common, g.raw_common) AS common_name,
                    g.ekey AS label,
                    g.cnt AS cnt
             FROM (
@@ -2034,6 +2083,7 @@ def get_stats() -> dict:
                 GROUP BY {EFFECTIVE_KEY}
             ) g
             LEFT JOIN key_display kd ON kd.k = g.ekey
+            LEFT JOIN native_display nd ON nd.k = g.ekey
             ORDER BY g.cnt DESC, g.ekey
             LIMIT 5
         """).fetchall()
@@ -2062,9 +2112,13 @@ def get_stats() -> dict:
 
 def get_species_list() -> list:
     """
-    One row per EFFECTIVE bucket (EFFECTIVE_KEY, Phase 15): `label` carries the
-    key, which is what the dropdowns, the ?species= filters and the
-    /api/species/{label} drilldown all accept (D-05). No kept=1 predicate,
+    One row per EFFECTIVE bucket (EFFECTIVE_KEY, Phase 15; merged by normalised
+    common name since Phase 16 D-01, so a native and a corrected detection with
+    the same name are one row): `label` carries the key, which is what the
+    dropdowns, the ?species= filters and the /api/species/{label} drilldown all
+    accept (D-05; old raw labels resolve through resolve_species_key). The
+    display name is native-first (D-04) and has_correction is 1 when any member
+    detection is corrected (D-07). No kept=1 predicate,
     on purpose: get_gallery(), get_species_detail() and top_species have none
     either, and every cross-reader count invariant (gallery total ==
     detection_count) depends on the list matching them; get_timeline() and the
@@ -2073,7 +2127,7 @@ def get_species_list() -> list:
     """
     with get_conn() as conn:
         rows = conn.execute(f"""
-            WITH {KEY_DISPLAY_CTE},
+            WITH {KEY_DISPLAY_CTE}, {NATIVE_DISPLAY_CTE},
             base AS (
                 SELECT {EFFECTIVE_KEY} AS ekey,
                        s.common_name AS raw_common,
@@ -2096,9 +2150,11 @@ def get_species_list() -> list:
                 JOIN crops c ON c.detection_id = b.did
             )
             SELECT b.ekey AS label,
-                   CASE WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_common)
+                   CASE WHEN MAX(nd.k) IS NOT NULL THEN MAX(nd.display_common)
+                        WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_common)
                         ELSE MAX(b.raw_common) END AS common_name,
-                   CASE WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_scientific)
+                   CASE WHEN MAX(nd.k) IS NOT NULL THEN MAX(nd.display_scientific)
+                        WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_scientific)
                         ELSE MAX(b.raw_sci) END AS scientific_name,
                    COUNT(DISTINCT b.vid) AS video_count,
                    COUNT(*) AS detection_count,
@@ -2108,6 +2164,7 @@ def get_species_list() -> list:
                    MAX(bb.crop_path) AS best_crop
             FROM base b
             LEFT JOIN key_display kd ON kd.k = b.ekey
+            LEFT JOIN native_display nd ON nd.k = b.ekey
             LEFT JOIN best bb ON bb.ekey = b.ekey AND bb.rn = 1
             GROUP BY b.ekey
             ORDER BY detection_count DESC, b.ekey
@@ -2115,24 +2172,56 @@ def get_species_list() -> list:
         return [dict(r) for r in rows]
 
 
+def resolve_species_key(value):
+    """
+    Map an old raw SpeciesNet label, or any species name in any casing or
+    whitespace, to the current effective bucket key (Phase 16 D-06, BUCKET-05).
+
+    Boundary-only: it translates an untrusted input once, before the value is
+    bound as a `?` parameter, and never appears inside a SQL constant. The
+    value itself is only ever bound, never interpolated. Order: an exact raw
+    label first (idx_species_label; deterministic when one label's rows carry
+    different names), then the SQL-normalised name, then the value unchanged,
+    so an unknown value still reaches the reader and yields an empty result.
+    """
+    if not value:
+        return value
+    with get_conn() as conn:
+        row = conn.execute(
+            f"""SELECT {NATIVE_KEY} AS k FROM species s WHERE s.label = ?
+                GROUP BY {NATIVE_KEY} ORDER BY COUNT(*) DESC, {NATIVE_KEY} LIMIT 1""",
+            (value,),
+        ).fetchone()
+        if row is not None and row["k"] is not None:
+            return row["k"]
+        norm = conn.execute(f"SELECT {_normalize_key_sql('?')}", (value,)).fetchone()[0]
+        return norm if norm is not None else value
+
+
 def get_species_detail(label: str) -> dict:
     """
     Drilldown for one EFFECTIVE bucket. `label` is the key get_species_list()
-    emits (EFFECTIVE_KEY); it is only ever bound as a parameter. Returns
-    "info": {} when the key has no visible member, so web_app's falsy-info
-    404 fires for a bucket that has been corrected away (LABEL-05).
+    emits (EFFECTIVE_KEY) or anything resolve_species_key() maps to it (an old
+    raw SpeciesNet label, a name in any casing); it is resolved once and then
+    only ever bound as a parameter, and the returned "label" is the resolved
+    key. Returns "info": {} when the key has no visible member, so web_app's
+    falsy-info 404 fires for a bucket that has been corrected away (LABEL-05).
     """
+    label = resolve_species_key(label)
     with get_conn() as conn:
         info = conn.execute(f"""
-            WITH {KEY_DISPLAY_CTE}
-            SELECT CASE WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_common)
+            WITH {KEY_DISPLAY_CTE}, {NATIVE_DISPLAY_CTE}
+            SELECT CASE WHEN MAX(nd.k) IS NOT NULL THEN MAX(nd.display_common)
+                        WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_common)
                         ELSE MAX(s.common_name) END AS common_name,
-                   CASE WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_scientific)
+                   CASE WHEN MAX(nd.k) IS NOT NULL THEN MAX(nd.display_scientific)
+                        WHEN MAX(kd.k) IS NOT NULL THEN MAX(kd.display_scientific)
                         ELSE MAX(s.scientific_name) END AS scientific_name,
                    COUNT(*) AS total_detections
             FROM species s
             JOIN detections d ON s.detection_id = d.id
             LEFT JOIN key_display kd ON kd.k = {EFFECTIVE_KEY}
+            LEFT JOIN native_display nd ON nd.k = {EFFECTIVE_KEY}
             WHERE {KNOWN_SPECIES_FILTER} AND {EFFECTIVE_KEY} = ?
         """, (label,)).fetchone()
 
@@ -2203,7 +2292,7 @@ def get_gallery(
     params = []
     if species_label:
         conditions.append(f"{EFFECTIVE_KEY} = ?")
-        params.append(species_label)
+        params.append(resolve_species_key(species_label))
     if camera_name:
         conditions.append("v.camera_name = ?")
         params.append(camera_name)
@@ -2396,7 +2485,7 @@ def get_videos(
                      JOIN species s ON s.detection_id=d.id
                      WHERE {KNOWN_SPECIES_FILTER} AND {EFFECTIVE_KEY} = ?)
         """)
-        params.append(species_label)
+        params.append(resolve_species_key(species_label))
     if has_person is not None:
         conditions.append("v.has_person = ?")
         params.append(int(has_person))
@@ -2588,12 +2677,12 @@ def get_timeline(
 
         # Grouped on EFFECTIVE_KEY (the CTE adds no parameters, so the `params`
         # order is unchanged). The display name is resolved once per key via
-        # key_display, never per output row.
+        # native_display, then key_display, never per output row.
         rows = conn.execute(f"""
-            WITH {KEY_DISPLAY_CTE}
+            WITH {KEY_DISPLAY_CTE}, {NATIVE_DISPLAY_CTE}
             SELECT g.period AS period,
                    g.ekey AS label,
-                   COALESCE(kd.display_common, g.raw_common) AS common_name,
+                   COALESCE(nd.display_common, kd.display_common, g.raw_common) AS common_name,
                    g.count AS count
             FROM (
                 SELECT {period_expr} AS period,
@@ -2608,6 +2697,7 @@ def get_timeline(
                 GROUP BY {period_expr}, {EFFECTIVE_KEY}
             ) g
             LEFT JOIN key_display kd ON kd.k = g.ekey
+            LEFT JOIN native_display nd ON nd.k = g.ekey
             ORDER BY g.period, g.ekey
         """, params).fetchall()
 
@@ -2627,10 +2717,11 @@ def search(query: str) -> dict:
         # label on purpose (see the deferred raw-label readers near
         # EFFECTIVE_SCIENTIFIC).
         species = conn.execute(f"""
-            WITH {KEY_DISPLAY_CTE}
+            WITH {KEY_DISPLAY_CTE}, {NATIVE_DISPLAY_CTE}
             SELECT g.ekey AS label,
-                   COALESCE(kd.display_common, g.raw_common) AS common_name,
-                   CASE WHEN kd.k IS NOT NULL THEN kd.display_scientific
+                   COALESCE(nd.display_common, kd.display_common, g.raw_common) AS common_name,
+                   CASE WHEN nd.k IS NOT NULL THEN nd.display_scientific
+                        WHEN kd.k IS NOT NULL THEN kd.display_scientific
                         ELSE g.raw_sci END AS scientific_name,
                    g.cnt AS cnt
             FROM (
@@ -2647,6 +2738,7 @@ def search(query: str) -> dict:
                 GROUP BY {EFFECTIVE_KEY}
             ) g
             LEFT JOIN key_display kd ON kd.k = g.ekey
+            LEFT JOIN native_display nd ON nd.k = g.ekey
             ORDER BY g.cnt DESC, g.ekey
             LIMIT 10
         """, (q, q, q)).fetchall()

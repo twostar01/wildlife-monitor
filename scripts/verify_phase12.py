@@ -352,7 +352,9 @@ def suite_badge():
         # "northern raccoon" bucket. Asserting on "domestic cat" would now
         # pass only through dF's blank-name correction (has_correction=1,
         # key unchanged) — the wrong reason. See the ordering note in this
-        # function's docstring.
+        # function's docstring. Revised for Phase 16 (D-01): the native d_c
+        # row (label "Northern raccoon", common_name "Northern Raccoon") now
+        # joins the corrected bucket, so detection_count is 2 (dA + d_c).
         case_id = "B6"
         species_rows = database.get_species_list()
         raccoon_row = next(
@@ -361,7 +363,7 @@ def suite_badge():
         ok = (
             raccoon_row is not None
             and raccoon_row.get("has_correction") == 1
-            and raccoon_row.get("detection_count") == 1
+            and raccoon_row.get("detection_count") == 2
         )
         _check(case_id, ok, f"raccoon_row={raccoon_row}")
         if ok:
@@ -784,7 +786,12 @@ def suite_propagation():
         # rows labelled "northern raccoon" sum to 2, and dA/dB have left the
         # "domestic cat" drilldown. Phase 15's key decision (the normalised
         # corrected common name, raw label for uncorrected detections) is
-        # what made the old non-goal comment obsolete.
+        # what made the old non-goal comment obsolete. Revised for Phase 16
+        # (D-01): the native d_c row (label "Northern raccoon", common_name
+        # "Northern Raccoon") now joins the corrected bucket, so the bucket
+        # holds dA, dB and d_c: detection_count 3, video_count 3, stats cnt 3,
+        # timeline sum 3. The display name stays "Northern Raccoon" (d_c's
+        # native common_name wins, native-first D-04).
         case_id = "P10"
         species_rows = database.get_species_list()
         raccoon_row = next(
@@ -805,14 +812,14 @@ def suite_propagation():
         }
         ok = (
             raccoon_row is not None
-            and raccoon_row.get("detection_count") == 2
-            and raccoon_row.get("video_count") == 2
+            and raccoon_row.get("detection_count") == 3
+            and raccoon_row.get("video_count") == 3
             and raccoon_row.get("common_name") == "Northern Raccoon"
             and all("ai_common_name" not in r for r in species_rows)
             and stats_raccoon_row is not None
-            and stats_raccoon_row.get("cnt") == 2
+            and stats_raccoon_row.get("cnt") == 3
             and stats_raccoon_row.get("common_name") == "Northern Raccoon"
-            and timeline_raccoon_sum == 2
+            and timeline_raccoon_sum == 3
             and d_a not in cat_detail_ids
             and d_b not in cat_detail_ids
         )
