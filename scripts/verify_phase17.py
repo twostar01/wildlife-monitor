@@ -33,6 +33,14 @@ Suites:
                 GD6 keeps the four retired one-shot scripts gone. The scan is
                 data-driven (SCAN_GLOBS, FORBIDDEN_*, BARE_ALLOW,
                 GUARD_EXEMPT), so Phase 18 extends it with one line.
+    endpoints - EP1-EP6: every GET route of web_app.app through
+                fastapi.testclient.TestClient on both shapes (no 5xx, identical
+                DB-backed output), the live `user_common_name` API field end to
+                end, and the video-player correction endpoints. EP1 fails when a
+                GET route is not mapped in GET_URLS / SKIP_ROUTES, so a route
+                added later cannot escape the proof. Needs fastapi and httpx:
+                skipped under `--suite all` when they are missing, a FAIL when
+                `--suite endpoints` is asked for explicitly.
 
 Fixture. Both shapes are built from scripts/verify_phase15.py's fixture plus a
 dual-lens pair and a flagged video with two crops on disk. The legacy DDL below
@@ -40,7 +48,7 @@ lives ONLY in this file: database.py no longer declares those objects, so the
 harness re-creates them with raw statements on a copy.
 
 Usage:
-    python scripts/verify_phase17.py --suite schema|decoupled|guard|all
+    python scripts/verify_phase17.py --suite schema|decoupled|guard|endpoints|all
     python scripts/verify_phase17.py --list
 
 verify_phase15 is a sibling import, so run this file without `python -I`.
@@ -50,11 +58,14 @@ import argparse
 import contextlib
 import fnmatch
 import json
+import locale
+import os
 import re
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -988,12 +999,373 @@ def suite_guard():
     return (passed, total)
 
 
+# -- web layer helpers (endpoints suite) ---------------------------------------
+#
+# Every GET route of web_app.app is mapped below to a URL template. EP1 compares
+# the set of declared GET routes with these maps, so a route added to web_app.py
+# later fails the harness until somebody maps it here (or skips it with a reason).
+
+# route.path -> reason it is not requested.
+SKIP_ROUTES = {"/api/updates": "contacts PyPI over the network"}
+
+# Exact route.path string -> URL template. Placeholders: {paired_video_id},
+# {unpaired_video_id}, {playable_video_id}, {purged_video_id}, {species_key},
+# {run_id}, {crop_name}, {thumb_name}, {search_q}. Values that go into a path or
+# query are percent-quoted before they are substituted.
+GET_URLS = {
+    "/openapi.json": "/openapi.json",
+    "/": "/",
+    "/media/crops/{filename}": "/media/crops/{crop_name}",
+    "/media/thumbnails/{filename}": "/media/thumbnails/{thumb_name}",
+    "/media/video/{video_id}": "/media/video/{playable_video_id}",
+    "/api/stats": "/api/stats",
+    "/api/species": "/api/species",
+    "/api/species/search": "/api/species/search?q=fox",
+    "/api/species/{label:path}": "/api/species/{species_key}",
+    "/api/gallery": "/api/gallery",
+    "/api/cameras": "/api/cameras",
+    "/api/videos": "/api/videos",
+    "/api/videos/{video_id}": "/api/videos/{paired_video_id}",
+    "/api/timeline": "/api/timeline",
+    "/api/blanks": "/api/blanks",
+    "/api/system": "/api/system",
+    "/api/blacklist": "/api/blacklist",
+    "/api/corrections": "/api/corrections",
+    "/api/maintenance/reprocess_queue": "/api/maintenance/reprocess_queue",
+    "/api/search": "/api/search?q={search_q}",
+    "/api/runs": "/api/runs",
+    "/api/runs/last": "/api/runs/last",
+    "/api/runs/{run_id}": "/api/runs/{run_id}",
+    "/api/settings": "/api/settings",
+    "/api/schedule/next-run": "/api/schedule/next-run",
+    "/api/run/status": "/api/run/status",
+    "/api/maintenance/storage": "/api/maintenance/storage",
+}
+
+# Query variants that reach different SQL, or different branches of one route.
+EXTRA_GET_URLS = [
+    "/api/videos?has_species=true",
+    "/api/videos?has_species=false",
+    "/api/videos?search={search_q}",
+    "/api/videos?species={species_key}",
+    "/api/gallery?species={species_key}",
+    "/api/corrections?video_id={paired_video_id}",
+    "/api/videos/{unpaired_video_id}",
+    "/media/video/{purged_video_id}",
+]
+
+# The DB-backed URLs compared between the two shapes. Left out: the schema and
+# index page (not DB-backed), every /media/ URL (file serving), and the routes
+# that read the host rather than the database (/api/system, /api/run/status,
+# /api/schedule/next-run, /api/settings). If a compared response ever carries an
+# inherently shape-dependent field, exclude that field by name with a comment
+# giving the reason; never exclude a whole route.
+_NOT_COMPARED_PREFIXES = (
+    "/openapi.json", "/media/", "/api/system", "/api/run/status",
+    "/api/schedule/next-run", "/api/settings",
+)
+COMPARE_URLS = [
+    t for t in list(GET_URLS.values()) + EXTRA_GET_URLS
+    if t != "/" and not t.startswith(_NOT_COMPARED_PREFIXES)
+]
+
+# Bytes written at the playable video's filepath.
+TINY_VIDEO_BYTES = b"phase17-tiny-video"
+
+
+def _import_web():
+    """(web_app, TestClient). Raises ImportError with a one-line reason when
+    fastapi, httpx or web_app's own imports are unavailable."""
+    try:
+        import web_app
+        from fastapi.testclient import TestClient
+    except Exception as exc:  # noqa: BLE001 - any import-time failure is a skip reason
+        reason = " ".join(f"{type(exc).__name__}: {exc}".split())
+        raise ImportError(reason) from exc
+    return web_app, TestClient
+
+
+@contextlib.contextmanager
+def _web_context(web_app, db_path, data_dir):
+    """Point web_app and database at a fixture database and a temporary data
+    directory, and restore all three afterwards. The harness never runs against
+    ./data (T-17-16)."""
+    saved_db = database.get_db_path()
+    saved_data = web_app.DATA_DIR
+    saved_settings = web_app.SETTINGS_FILE
+    database.set_db_path(str(db_path))
+    web_app.DATA_DIR = str(data_dir)
+    web_app.SETTINGS_FILE = str(Path(data_dir) / "settings.json")
+    try:
+        yield
+    finally:
+        database.set_db_path(saved_db)
+        web_app.DATA_DIR = saved_data
+        web_app.SETTINGS_FILE = saved_settings
+
+
+def _all_templates():
+    return list(GET_URLS.values()) + list(EXTRA_GET_URLS)
+
+
+def _get_all(client, params):
+    """Request every GET_URLS and EXTRA_GET_URLS entry with the placeholders in
+    `params` filled in. Returns {url: (status, parsed JSON or text)}."""
+    out = {}
+    for template in _all_templates():
+        url = template.format(**params)
+        resp = client.get(url)
+        body = None
+        if "json" in resp.headers.get("content-type", ""):
+            try:
+                body = resp.json()
+            except ValueError:
+                body = None
+        if body is None:
+            body = resp.text
+        out[url] = (resp.status_code, body)
+    return out
+
+
+def _quote(value):
+    return urllib.parse.quote(str(value), safe="")
+
+
+@contextlib.contextmanager
+def _web_fixture():
+    """Fresh shapes plus everything the endpoint cases need: a tiny file at the
+    lens-0 paired video's filepath, one purged video (filepath NULL), one crop
+    and one thumbnail in a temporary data directory, and one runs row with fixed
+    values. Yields {"shapes", "ids", "params", "data_dir"}."""
+    original = database.get_db_path()
+    tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    try:
+        shapes = _build_shapes(tmp.name)
+        ids = shapes["ids"]
+        data_dir = Path(tmp.name) / "data"
+        (data_dir / "crops").mkdir(parents=True)
+        (data_dir / "thumbnails").mkdir(parents=True)
+        (data_dir / "crops" / "ep_crop.jpg").write_bytes(b"crop")
+        (data_dir / "thumbnails" / "ep_thumb.jpg").write_bytes(b"thumb")
+
+        run_id = None
+        for name in SHAPES:
+            database.set_db_path(shapes[name])
+            with database.get_conn() as conn:
+                playable_path = conn.execute(
+                    "SELECT filepath FROM videos WHERE id=?", (ids["pair0"],)
+                ).fetchone()[0]
+                conn.execute("UPDATE videos SET filepath=NULL WHERE id=?", (ids["vid2"],))
+                cur = conn.execute(
+                    """INSERT INTO runs (start_time, end_time, status, "trigger",
+                           videos_processed, detections_found)
+                       VALUES ('2026-10-01T06:00:00', '2026-10-01T06:10:00', 'success',
+                               'scheduled', 3, 5)"""
+                )
+                run_id = cur.lastrowid
+        Path(playable_path).write_bytes(TINY_VIDEO_BYTES)
+
+        params = {
+            "paired_video_id": ids["pair0"],
+            "unpaired_video_id": ids["vid1"],
+            "playable_video_id": ids["pair0"],
+            "purged_video_id": ids["vid2"],
+            "species_key": _quote(p15.KEY_CAT),
+            "run_id": run_id,
+            "crop_name": "ep_crop.jpg",
+            "thumb_name": "ep_thumb.jpg",
+            "search_q": _quote("raccoon"),
+        }
+        yield {"shapes": shapes, "ids": ids, "params": params, "data_dir": data_dir}
+    finally:
+        database.set_db_path(original)
+        tmp.cleanup()
+
+
+def _collect(web_app, TestClient, fx, name):
+    """Every GET response on one shape, plus the playable video's bytes."""
+    with _web_context(web_app, fx["shapes"][name], fx["data_dir"]):
+        client = TestClient(web_app.app, raise_server_exceptions=False)
+        got = _get_all(client, fx["params"])
+        media = client.get("/media/video/{playable_video_id}".format(**fx["params"]))
+        return got, media.content
+
+
+def _ep_problems(got, media_bytes, params):
+    """Assertions shared by EP2 and EP3 for one shape's responses."""
+    problems = []
+    bad = {u: s for u, (s, _b) in got.items() if s >= 500}
+    if bad:
+        problems.append(f"5xx responses: {bad}")
+    detail_url = "/api/videos/{paired_video_id}".format(**params)
+    status, body = got[detail_url]
+    if status != 200:
+        problems.append(f"{detail_url} -> {status}")
+    elif not isinstance(body, dict) or set(body) != {"video", "detections", "paired", "pair_detections"}:
+        problems.append(f"{detail_url} keys {sorted(body) if isinstance(body, dict) else type(body)}")
+    elif not body["pair_detections"]:
+        problems.append(f"{detail_url} pair_detections is empty")
+    playable = "/media/video/{playable_video_id}".format(**params)
+    if got[playable][0] != 200 or media_bytes != TINY_VIDEO_BYTES:
+        problems.append(f"{playable} -> {got[playable][0]}, {len(media_bytes)} bytes")
+    purged = "/media/video/{purged_video_id}".format(**params)
+    if got[purged][0] != 404:
+        problems.append(f"{purged} -> {got[purged][0]}, want 404")
+    return problems
+
+
+# -- endpoints suite -----------------------------------------------------------
+
+def suite_endpoints():
+    """`endpoints` suite cases EP1-EP6 (6 total). Returns (passed, total), or
+    (None, reason) when fastapi/httpx are unavailable (a skip, decided by main)."""
+    total = 6
+    passed = 0
+    try:
+        web_app, TestClient = _import_web()
+    except ImportError as exc:
+        return (None, str(exc))
+
+    # EP1 - every GET route is mapped, and nothing mapped is stale.
+    def ep1():
+        declared = {
+            r.path for r in web_app.app.routes
+            if "GET" in (getattr(r, "methods", None) or ())
+        }
+        mapped = set(GET_URLS) | set(SKIP_ROUTES)
+        problems = []
+        if declared - mapped:
+            problems.append(f"unmapped GET routes: {sorted(declared - mapped)}")
+        if mapped - declared:
+            problems.append(f"stale map entries: {sorted(mapped - declared)}")
+        overlap = set(GET_URLS) & set(SKIP_ROUTES)
+        if overlap:
+            problems.append(f"both requested and skipped: {sorted(overlap)}")
+        return not problems, "; ".join(problems)
+
+    passed += _case("EP1", ep1)
+
+    def _shape_case(name):
+        def run():
+            with _web_fixture() as fx:
+                got, media = _collect(web_app, TestClient, fx, name)
+                problems = _ep_problems(got, media, fx["params"])
+                return not problems, "; ".join(problems)
+        return run
+
+    # EP2 / EP3 - every GET route on each shape.
+    passed += _case("EP2", _shape_case("lacking"))
+    passed += _case("EP3", _shape_case("legacy"))
+
+    # EP4 - the DB-backed responses are identical between the shapes, and no
+    # frozen legacy value appears anywhere.
+    def ep4():
+        with _web_fixture() as fx:
+            a, _ = _collect(web_app, TestClient, fx, "lacking")
+            b, _ = _collect(web_app, TestClient, fx, "legacy")
+            problems = []
+            for template in COMPARE_URLS:
+                url = template.format(**fx["params"])
+                if a[url] != b[url]:
+                    problems.append(f"{url} differs between the shapes")
+            for label, got in (("lacking", a), ("legacy", b)):
+                for url, (_s, body) in got.items():
+                    text = body if isinstance(body, str) else _dump(body)
+                    if LEGACY_SEED_NAME in text or LEGACY_VIDEO_NAME in text:
+                        problems.append(f"[{label}] {url} carries a frozen legacy value")
+            return not problems, "; ".join(problems)
+
+    passed += _case("EP4", ep4)
+
+    # EP5 - the live API field user_common_name, end to end, on both shapes.
+    def ep5():
+        with _web_fixture() as fx:
+            det = fx["ids"]["r1"]
+            for name in SHAPES:
+                path = fx["shapes"][name]
+                with _web_context(web_app, path, fx["data_dir"]):
+                    client = TestClient(web_app.app, raise_server_exceptions=False)
+                    before = _species_row(path, det)
+                    resp = client.post("/api/species/correct", json={
+                        "detection_id": det, "user_common_name": "Bobcat",
+                        "user_scientific_name": "Lynx rufus",
+                    })
+                    if resp.status_code != 200 or resp.json() != {"ok": True}:
+                        return False, f"[{name}] POST -> {resp.status_code} {resp.text[:120]}"
+                    sc = _correction_row(path, det)
+                    if not sc or sc[0] != "Bobcat" or sc[2] != "gallery":
+                        return False, f"[{name}] species_corrections row {sc}"
+                    items = client.get("/api/gallery?per_page=100").json()["items"]
+                    item = next((i for i in items if i["detection_id"] == det), None)
+                    if not item or item["common_name"] != "Bobcat" or item["has_correction"] != 1:
+                        return False, f"[{name}] gallery item {item and (item['common_name'], item['has_correction'])}"
+                    if _species_row(path, det) != before:
+                        return False, f"[{name}] the species row changed"
+                    unknown = client.post("/api/species/correct", json={
+                        "detection_id": 99999999, "user_common_name": "Bobcat",
+                        "user_scientific_name": "Lynx rufus",
+                    })
+                    if unknown.status_code != 404:
+                        return False, f"[{name}] unknown detection -> {unknown.status_code}"
+                    ctrl = client.post("/api/species/correct", json={
+                        "detection_id": det, "user_common_name": "Bo\x07b",
+                        "user_scientific_name": "Lynx rufus",
+                    })
+                    if ctrl.status_code != 422:
+                        return False, f"[{name}] control character -> {ctrl.status_code}"
+            return True, ""
+
+    passed += _case("EP5", ep5)
+
+    # EP6 - the video-player endpoints, on both shapes.
+    def ep6():
+        with _web_fixture() as fx:
+            ids = fx["ids"]
+            for name in SHAPES:
+                path = fx["shapes"][name]
+                with _web_context(web_app, path, fx["data_dir"]):
+                    client = TestClient(web_app.app, raise_server_exceptions=False)
+                    database.set_db_path(path)
+                    with database.get_conn() as conn:
+                        raw = conn.execute(
+                            "SELECT label FROM species WHERE detection_id=?", (ids["pair_det0"],)
+                        ).fetchone()[0]
+                    resp = client.post("/api/corrections", json={
+                        "video_id": ids["pair0"], "original_label": raw,
+                        "corrected_label": "corr_label", "corrected_common": "Red Fox",
+                        "corrected_scientific": "Vulpes vulpes", "note": "",
+                    })
+                    if resp.status_code != 200 or resp.json().get("detections", 0) < 1:
+                        return False, f"[{name}] POST /api/corrections -> {resp.status_code} {resp.text[:120]}"
+                    listed = client.get(f"/api/corrections?video_id={ids['pair0']}").json()
+                    rows = [r for r in listed if r["detection_id"] == ids["pair_det0"]]
+                    if not rows:
+                        return False, f"[{name}] GET /api/corrections lists {[r['detection_id'] for r in listed]}"
+                    detail = client.get(f"/api/videos/{ids['pair0']}").json()
+                    if "corrections" in detail:
+                        return False, f"[{name}] video detail still has a corrections key"
+                    mine = [d for d in detail["detections"] if d["id"] == ids["pair_det0"]]
+                    if not mine or mine[0]["corrected"] != 1:
+                        return False, f"[{name}] video detail does not reflect the correction: {mine}"
+                    cid = rows[0]["id"]
+                    first = client.delete(f"/api/corrections/{cid}")
+                    second = client.delete(f"/api/corrections/{cid}")
+                    if first.status_code != 200 or second.status_code != 404:
+                        return False, f"[{name}] DELETE -> {first.status_code}, then {second.status_code}"
+            return True, ""
+
+    passed += _case("EP6", ep6)
+
+    return (passed, total)
+
+
 # -- registry / CLI ----------------------------------------------------------
 
 SUITES = {
     "schema": (suite_schema, 4),
     "decoupled": (suite_decoupled, 6),
     "guard": (suite_guard, 6),
+    "endpoints": (suite_endpoints, 6),
 }
 
 # Suites that only run when explicitly requested (never part of --suite all).
@@ -1014,12 +1386,33 @@ def main():
             print(f"{name}: {total} cases")
         return 0
 
+    # web_app.root() reads static/index.html with the locale's default encoding.
+    # On a UTF-8 box (the Linux target) that is right; on a cp1252 dev box GET /
+    # raises UnicodeDecodeError, which would be a false 5xx here. Re-run once in
+    # UTF-8 mode instead of weakening the "no 5xx on any GET route" proof.
+    if (not sys.flags.utf8_mode and os.environ.get("PHASE17_UTF8_RERUN") != "1"
+            and locale.getpreferredencoding(False).lower().replace("-", "") != "utf8"):
+        env = dict(os.environ, PYTHONUTF8="1", PHASE17_UTF8_RERUN="1")
+        return subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], env=env
+        ).returncode
+
     names = ([n for n in SUITES if n not in EXPLICIT_ONLY]
              if args.suite == "all" else [args.suite])
     all_passed = True
     for name in names:
         fn, _total = SUITES[name]
         passed, total = fn()
+        if passed is None:
+            # A suite that cannot run returns (None, reason). Under `all` that is a
+            # skip (never a PASS); asked for by name it is a FAIL, so the phase
+            # gate cannot be satisfied by a skip.
+            if args.suite == name:
+                all_passed = False
+                print(f"FAIL: {name} (fastapi/httpx unavailable: {total})")
+            else:
+                print(f"SKIP: {name} ({total})")
+            continue
         if passed == total:
             print(f"PASS: {name} ({passed}/{total})")
         else:
