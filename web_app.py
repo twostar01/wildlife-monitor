@@ -699,8 +699,7 @@ def api_requeue_species(label: str):
 @app.get("/api/corrections")
 def api_get_corrections(video_id: int = Query(None)):
     # Lists species_corrections so the ids returned here are the ids
-    # DELETE /api/corrections/{id} accepts. The frozen legacy video_corrections
-    # table (D-06) is no longer served by this endpoint.
+    # DELETE /api/corrections/{id} accepts.
     return db.get_corrections(video_id)
 
 

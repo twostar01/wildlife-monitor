@@ -366,7 +366,14 @@ detections   id, video_id → videos, frame_number, timestamp_secs,
              category (animal/person/vehicle), confidence, bbox_json
 
 species      id, detection_id → detections, label, common_name, scientific_name,
-             confidence, user_common_name, user_scientific_name, corrected_at
+             confidence, top_candidates_json
+
+species_corrections
+             id, detection_id → detections (unique), corrected_label,
+             corrected_common, corrected_scientific, suppressed, source,
+             corrected_at, note
+             (the single correction record: both the Gallery popover and the
+             video player write it)
 
 crops        id, detection_id → detections, crop_path, quality_score,
              sharpness, brightness, contrast, pixel_area, width, height, created_at

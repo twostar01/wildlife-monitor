@@ -13,7 +13,7 @@ Suites:
                   corrected signal per tile (U1-U8), verified as pure source
                   assertions over static/index.html — no browser, no DOM.
     propagation — UI-05/D-05 (plan 12-03), display-name propagation from
-                  video_corrections widened to get_gallery(),
+                  species_corrections rows widened to get_gallery(),
                   get_species_detail(), get_videos() and get_video_by_id()
                   (P1-P10). P1, P2, P5 and P6 are RED before this plan's
                   task 2 (P1, P2, P5) and task 3 (P6) land. P3, P4, P7, P9
@@ -21,14 +21,14 @@ Suites:
                   the guards that stop the fix being "achieved" by breaking
                   something else: P3 (the pre-existing Gallery-popover
                   path), P4 (an uncorrected crop), P7 (get_video_by_id()'s
-                  Python-side apply_corrections_to_species() overlay, which
+                  species_corrections read path, which
                   this plan never touches and which already produced the
                   correct value before this plan existed), P9 (the
                   suppression sentinel and the blank-corrected-name guard),
                   and P10 (Phase 15, D-13: get_species_list(),
                   get_stats() and get_timeline() group on the effective
                   key, so corrected detections leave their raw-label bucket).
-                  P8 (the video_corrections-vs-species.user_common_name
+                  P8 (the Gallery-vs-video-player most-recent-write
                   precedence case) checks get_gallery() AND
                   get_video_by_id() together — the get_video_by_id() half is
                   green from the start (same reason as P7), so P8 only
@@ -113,9 +113,8 @@ def _seed_fixture_db(path):
         corrected_label="Northern raccoon") is seeded here via the real
         database.save_video_correction() write path (Phase 14 plan 14-02:
         the unified species_corrections table is the only one any write
-        path targets — seeding through the frozen legacy table directly
-        would no longer be read by anything). species.corrected_at stays
-        NULL. Filename "WorldWatch_00_videoA.mp4" is already
+        path targets — a raw INSERT would bypass the snapshot fan-out). The
+        species row itself is never modified. Filename "WorldWatch_00_videoA.mp4" is already
         distinguishable from every other video in this fixture (substring
         search matches only this row) — plan 12-03's case P6 relies on
         that, no further change needed.
@@ -132,8 +131,8 @@ def _seed_fixture_db(path):
         "domestic cat", plus a video-player SUPPRESS action
         (database.save_video_correction() with corrected_label=None) —
         the species_corrections.suppressed column is the sentinel now
-        (Phase 14 D-00's dedicated column, replacing the legacy table's
-        NULL-corrected_label convention).
+        (Phase 14 D-00's dedicated column; a NULL corrected_label is not
+        the suppression signal).
       - video E / detection dE, species label "domestic cat" — carries
         BOTH a video-player correction (corrected_label="Northern
         raccoon", corrected_common="Northern Raccoon", written FIRST via
@@ -152,8 +151,8 @@ def _seed_fixture_db(path):
     Returns a dict of the real autoincrement ids assigned to each row.
 
     Every video-player-path correction above is written through the real
-    database.save_video_correction() write path, not a raw INSERT against
-    the frozen legacy correction table — each call opens its own
+    database.save_video_correction() write path, not a raw INSERT into
+    species_corrections — each call opens its own
     get_conn(), so (per Phase 14 plan 14-02's task 3) every one of these
     calls runs AFTER the INSERT block below has committed, mirroring the
     same hazard this function's comment already documented for the
@@ -169,7 +168,7 @@ def _seed_fixture_db(path):
     row count or set membership that video E/F's presence would perturb,
     and B6's aggregate has_correction==1 check for "domestic cat" was
     already going to be 1 from dA's video-player correction alone, so dE's
-    additional species.corrected_at stamp doesn't change B6's asserted
+    additional Gallery correction doesn't change B6's asserted
     value (verified empirically, not just by inspection, before this
     plan's task 1 commit).
     """
@@ -282,7 +281,7 @@ def suite_badge():
     aggregate for the "domestic cat" group) is checked BEFORE dB's
     Gallery-popover correction is applied, so that B6 isolates the
     video-player path's (dA's) contribution via MAX() and is genuinely RED
-    pre-fix. If dB were corrected first, its species.corrected_at would
+    pre-fix. If dB were corrected first, its species_corrections row would
     already flip the group's has_correction to 1 under the OLD (pre-fix)
     get_species_list() SQL too — B6 would spuriously pass pre-fix and stop
     being a real RED case. B1/B3/B4 don't depend on this ordering (they
@@ -402,12 +401,15 @@ def suite_badge():
         if ok:
             passed += 1
 
-        # B7 — case/encoding pin: a video_corrections row differing only by
-        # case from the actual species label does NOT flip has_correction
-        # for an otherwise-uncorrected crop; matching is exact/BINARY,
-        # identical to apply_corrections_to_species()'s Python dict-key
-        # lookup. Built against a fourth video whose species label is
-        # lowercase. Must pass before and after.
+        # B7 — exact, case-sensitive matching through the live
+        # video-player write path: save_video_correction() with an
+        # original_label differing only by case from the actual species
+        # label ("Domestic Cat" vs "domestic cat") fans out to 0
+        # detections (_fanout_detection_ids compares s.label = ? exactly),
+        # writes no species_corrections row, and so does NOT flip
+        # has_correction for the otherwise-uncorrected crop. Built against
+        # a fourth video whose species label is lowercase. Must pass
+        # before and after.
         case_id = "B7"
         with database.get_conn() as conn:
             conn.execute(
@@ -431,23 +433,22 @@ def suite_badge():
                 "VALUES (?, ?, ?, ?)",
                 (d_g, f"fixture12_crop_{d_g}.jpg", 80.0, "2026-08-16T04:00:00"),
             )
-            # Differs only by case from the real label "domestic cat".
-            conn.execute(
-                "INSERT INTO video_corrections "
-                "(video_id, original_label, corrected_label, corrected_common, "
-                " corrected_scientific, corrected_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    video_d,
-                    "Domestic Cat",
-                    "Something Else",
-                    "Something Else",
-                    "Aliquid alienum",
-                    "2026-08-16T04:00:00",
-                ),
-            )
+        # Runs after the fixture's write transaction has closed:
+        # save_video_correction() opens its own connection. Differs only
+        # by case from the real label "domestic cat".
+        applied = database.save_video_correction(video_d, "Domestic Cat", "Something Else", "Something Else", "Aliquid alienum")
+        with database.get_conn() as conn:
+            sc_rows = conn.execute(
+                "SELECT COUNT(*) FROM species_corrections WHERE detection_id=?", (d_g,)
+            ).fetchone()[0]
         item_g = _gallery_item(d_g)
-        ok = item_g is not None and item_g.get("has_correction") == 0
-        _check(case_id, ok, f"item_g={item_g}")
+        ok = (
+            applied == 0
+            and sc_rows == 0
+            and item_g is not None
+            and item_g.get("has_correction") == 0
+        )
+        _check(case_id, ok, f"applied={applied!r}, sc_rows={sc_rows}, item_g={item_g}")
         if ok:
             passed += 1
 
@@ -603,7 +604,7 @@ def suite_ui():
 def suite_propagation():
     """Propagation-suite cases P1-P10 (10 total), UI-05/D-05 (plan 12-03):
     a species corrected through the video player's per-crop editor
-    (video_corrections) now shows its corrected common/scientific name in
+    (species_corrections) now shows its corrected common/scientific name in
     the Gallery grid, the species-detail modal, the Videos tab and filename
     search — not only inside that one video's own detail view. Since Phase 15
     (D-13) the readers that group or filter on a species (get_species_list(),
@@ -717,10 +718,10 @@ def suite_propagation():
             passed += 1
 
         # P7 — get_video_by_id(A)'s detections still report "Northern
-        # Raccoon" — the SQL result and apply_corrections_to_species()'s
-        # overlay agree, so the overlay is idempotent rather than masking a
-        # divergence. Green before AND after: the Python overlay already
-        # produced this value before this plan touched any SQL.
+        # Raccoon" — the SQL result and get_video_by_id()'s
+        # read path agree, because both read the same species_corrections
+        # row. Green before AND after: get_video_by_id() already produced
+        # this value before this plan touched any SQL.
         case_id = "P7"
         detail_a = database.get_video_by_id(video_a)
         det_a = next((d for d in detail_a["detections"] if d.get("id") == d_a), None)
@@ -732,7 +733,7 @@ def suite_propagation():
         # P8 — precedence, revised for Phase 14's D-03 (plain recency
         # wins, UNIQUE(detection_id) UPSERT): this case previously pinned
         # the opposite ordering — the video-player value ("Northern
-        # Raccoon") beating the species.user_common_name value ("Bobcat")
+        # Raccoon") beating the Gallery-popover value ("Bobcat")
         # unconditionally, regardless of write order, which is what the
         # pre-Phase-14 read-time "video always wins" COALESCE chain
         # produced. Phase 14 replaced that with write-time recency: in

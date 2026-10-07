@@ -145,7 +145,7 @@ def _table_snapshot():
     """Return a mapping of table name to the full sorted list of that
     table's rows as plain tuples — the equality fixture the read-only
     assertions compare."""
-    tables = ["videos", "detections", "species", "crops", "video_corrections"]
+    tables = ["videos", "detections", "species", "crops", "species_corrections"]
     snapshot = {}
     with database.get_conn() as conn:
         for table in tables:
