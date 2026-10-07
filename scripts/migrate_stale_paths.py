@@ -172,7 +172,7 @@ def find_collisions(conn, rows):
     the same new_path (an adjacency collision no existing-table lookup
     would catch). Existing-table lookups are batched via a chunked IN
     clause -- mirrors _still_referenced_paths() in
-    backfill_dedup_videos.py -- rather than one query per row."""
+    the Phase 9 dedup backfill (retired in Phase 17; see git history) -- rather than one query per row."""
     collisions = []
 
     # (a) candidate crops rows vs. the existing crops table.
@@ -276,7 +276,7 @@ def non_path_digest(conn, table, exclude_column):
 def snapshot_db(src_path, dest_path):
     """Take an online backup of the database at src_path into dest_path
     using sqlite3.Connection.backup(). Copied verbatim (mechanism only)
-    from backfill_dedup_videos.py: a plain file copy is wrong here because
+    from the Phase 9 dedup backfill (retired in Phase 17; see git history): a plain file copy is wrong here because
     get_conn() sets PRAGMA journal_mode=WAL, and copying the main database
     file alone can miss data still sitting in the -wal file. Callers must
     treat a raised exception here as a hard abort before any write pass —
@@ -343,7 +343,7 @@ def render_plan_report(counts, rows, applied, digests=None, existence_pre=None,
     """Print a Go/No-Go summary. applied=False describes what the run
     would do (future tense); applied=True describes what the run did
     (past tense) — never the reverse, per the FIX-03 / P-02 honesty lesson
-    (backfill_dedup_videos.py's args.apply-branched summary). digests, if
+    (the Phase 9 dedup backfill (retired in Phase 17; see git history)'s args.apply-branched summary). digests, if
     given, is a {table: hex_digest} mapping from non_path_digest() -- the
     "nothing else changed" fingerprint for each target table.
     existence_pre/existence_post, if given, are the _existence_counts()
