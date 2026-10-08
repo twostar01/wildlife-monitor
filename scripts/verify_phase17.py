@@ -746,10 +746,10 @@ SCAN_GLOBS = [
 ]
 SCAN_EXCLUDE_GLOBS = ["scripts/verify_*.py"]
 
-# Whole-file exemptions: path -> reason. Empty in Phase 17. Phase 18's
-# standalone production drop script is expected to be added here with one line
-# and a reason, because it must name the objects it drops.
-GUARD_EXEMPT = {}
+# Whole-file exemptions: path -> reason. Empty in Phase 17. Phase 18 added its
+# standalone production drop script here with one line and a reason, because it
+# must name the objects it drops.
+GUARD_EXEMPT = {"scripts/drop_legacy_corrections.py": "Phase 18 one-shot production drop; must name the objects it drops"}
 
 # Unambiguous names: forbidden everywhere scanned, comments included (this is
 # what forces the stale-comment cleanup).
