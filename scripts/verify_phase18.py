@@ -62,7 +62,8 @@ ALL_SIX = sorted(p17.LEGACY_COLUMNS + [p17.LEGACY_TABLE] + p17.LEGACY_INDEXES)
 def _fixture18(root):
     """p17's two shapes, then on the legacy shape: an all-NULL orphan
     video_corrections row (for vid1), one closed runs row, vid2 purged
-    (filepath NULL) and an empty rehearsal.lock beside the database."""
+    (filepath NULL) and an empty rehearsal.lock in the fixture root, beside the
+    two shape directories."""
     shapes = p17._build_shapes(root)
     ids = shapes["ids"]
     legacy = shapes["legacy"]
@@ -81,7 +82,7 @@ def _fixture18(root):
                        'scheduled', 3, 5)"""
         )
         conn.execute("UPDATE videos SET filepath=NULL WHERE id=?", (ids["vid2"],))
-    lock = Path(legacy).parent / "rehearsal.lock"
+    lock = Path(root) / "rehearsal.lock"
     lock.write_bytes(b"")
     return {"db": legacy, "lacking": shapes["lacking"], "ids": ids,
             "lock": str(lock), "root": str(root)}
@@ -199,13 +200,19 @@ def _content_digests(conn):
     return {"species": species, "species_corrections": corrections}
 
 
+def _state_conn(conn):
+    """sqlite_master, every table's count and both digests, through `conn`."""
+    st = p17._src_state(conn)
+    st["digests"] = _content_digests(conn)
+    return st
+
+
 def _state(path):
     """Everything a refusal must leave untouched, through a mode=ro connection:
     sqlite_master and every table's count, both digests, the file sha256."""
     conn = _ro(path)
     try:
-        st = p17._src_state(conn)
-        st["digests"] = _content_digests(conn)
+        st = _state_conn(conn)
     finally:
         conn.close()
     st["sha256"] = _file_sha256(path)
@@ -761,6 +768,36 @@ def _id1():
     return not problems, "; ".join(problems)
 
 
+def _px1():
+    """The post-drop probe passes on a dropped fixture and its snapshot, and fails
+    on an undropped one (a negative control: the suite can fail)."""
+    problems = []
+    with _fixture_ctx() as fx:
+        undropped = fx["db"]
+        # A copy keeps the undropped file around after the apply drops the original.
+        copy = os.path.join(fx["tmp"], "undropped.db")
+        conn = _ro(undropped)
+        try:
+            p17._backup_copy(conn, copy)
+        finally:
+            conn.close()
+        code, out, err, _stub = _apply_ok(fx)
+        snaps = _snapshots(fx["snapdir"])
+        if code != 0 or len(snaps) != 1:
+            return False, f"the apply exited {code} with {len(snaps)} snapshot(s): {err[-200:]}"
+        for case_id, body in POSTDROP_CASES:
+            ok, detail = body(fx["db"], str(snaps[0]), [])
+            if not ok:
+                problems.append(f"{case_id} on the dropped fixture: {detail}")
+        ok, _detail = _pd1(copy, str(snaps[0]), [])
+        if ok:
+            problems.append("PD1 passed on an undropped fixture (the probe cannot fail)")
+        ok, _detail = _pd3(copy, str(snaps[0]), [])
+        if ok:
+            problems.append("PD3 passed on an undropped fixture")
+    return not problems, "; ".join(problems)
+
+
 SCRIPT_CASES = [
     ("DR1", _dr1),
     ("DR2", _dr2),
@@ -777,6 +814,7 @@ SCRIPT_CASES = [
     ("GT6", _gt6),
     ("SN1", _sn1),
     ("ID1", _id1),
+    ("PX1", _px1),
 ]
 
 
@@ -788,14 +826,401 @@ def suite_script():
     return (passed, len(SCRIPT_CASES))
 
 
+# -- suite: postdrop (explicit) --------------------------------------------------
+#
+# A mode=ro probe of a database after the drop, against the snapshot the drop
+# took. Both files are opened read-only and init_db() is never run on either.
+# Each body takes (db, snapshot, info) and returns (ok, detail); `info` collects
+# INFO lines the suite prints (a quiet list when PX1 calls the bodies).
+
+def _legacy_names_in(conn):
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(species)")]
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+    held = [c for c in p17.LEGACY_COLUMNS if c in cols]
+    held += [n for n in [p17.LEGACY_TABLE] + p17.LEGACY_INDEXES if n in names]
+    return sorted(held), cols
+
+
+def _sequence_has_legacy_table(conn):
+    names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+    if "sqlite_sequence" not in names:
+        return False
+    return bool(conn.execute(
+        "SELECT COUNT(*) FROM sqlite_sequence WHERE name=?", (p17.LEGACY_TABLE,)
+    ).fetchone()[0])
+
+
+def _pd1(db, snap, info):
+    conn = _ro(db)
+    try:
+        held, cols = _legacy_names_in(conn)
+    finally:
+        conn.close()
+    problems = []
+    if held:
+        problems.append(f"legacy objects remain: {held}")
+    if cols != p17.SPECIES_COLUMNS:
+        problems.append(f"species columns are {cols}")
+    return not problems, "; ".join(problems)
+
+
+def _pd2(db, snap, info):
+    conn = _ro(db)
+    try:
+        integrity = [tuple(r) for r in conn.execute("PRAGMA integrity_check")]
+        fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+    finally:
+        conn.close()
+    problems = []
+    if integrity != [("ok",)]:
+        problems.append(f"integrity_check {integrity[:3]}")
+    if fk:
+        problems.append(f"foreign_key_check returned {len(fk)} row(s)")
+    return not problems, "; ".join(problems)
+
+
+def _pd3(db, snap, info):
+    conn, sconn = _ro(db), _ro(snap)
+    try:
+        now, then = _state_conn(conn), _state_conn(sconn)
+    finally:
+        conn.close()
+        sconn.close()
+    problems = []
+    want = {t: n for t, n in then["counts"].items() if t != p17.LEGACY_TABLE}
+    if now["counts"] != want:
+        diff = sorted(t for t in set(now["counts"]) | set(want) if now["counts"].get(t) != want.get(t))
+        problems.append(f"row counts differ from the snapshot for {diff}")
+    for name in ("species", "species_corrections"):
+        if now["digests"][name] != then["digests"][name]:
+            problems.append(f"the {name} content digest differs from the snapshot's")
+    info.append(f"INFO: species_corrections_rows {now['counts'].get('species_corrections')}")
+    return not problems, "; ".join(problems)
+
+
+def _pd4(db, snap, info):
+    sconn = _ro(snap)
+    try:
+        integrity = [tuple(r) for r in sconn.execute("PRAGMA integrity_check")]
+        held, _cols = _legacy_names_in(sconn)
+        problems = []
+        if integrity != [("ok",)]:
+            problems.append(f"snapshot integrity_check {integrity[:3]}")
+        if held != ALL_SIX:
+            problems.append(f"the snapshot holds {held}, expected all six")
+            return False, "; ".join(problems)
+        rows = sconn.execute(
+            "SELECT id, video_id, original_label, corrected_label, corrected_common, "
+            "corrected_scientific, corrected_at, note FROM video_corrections ORDER BY id"
+        ).fetchall()
+        frozen = sconn.execute(
+            "SELECT COUNT(*) FROM species WHERE user_common_name IS NOT NULL "
+            "OR user_scientific_name IS NOT NULL OR corrected_at IS NOT NULL"
+        ).fetchone()[0]
+    finally:
+        sconn.close()
+    info.append(f"INFO: snapshot_video_corrections_rows {len(rows)}")
+    info.append(f"INFO: snapshot_frozen_species_rows {frozen}")
+    for r in rows:
+        if r[3] is None and r[4] is None and r[5] is None:
+            info.append(
+                f"INFO: orphan_row id={r[0]!r} video_id={r[1]!r} original_label={r[2]!r} "
+                f"corrected_at={r[6]!r} note={r[7]!r}"
+            )
+    return not problems, "; ".join(problems)
+
+
+def _pd5(db, snap, info):
+    conn, sconn = _ro(db), _ro(snap)
+    try:
+        live, kept = _sequence_has_legacy_table(conn), _sequence_has_legacy_table(sconn)
+    finally:
+        conn.close()
+        sconn.close()
+    problems = []
+    if live:
+        problems.append("sqlite_sequence still has a video_corrections row")
+    if not kept:
+        problems.append("the snapshot's sqlite_sequence has no video_corrections row")
+    return not problems, "; ".join(problems)
+
+
+POSTDROP_CASES = [("PD1", _pd1), ("PD2", _pd2), ("PD3", _pd3), ("PD4", _pd4), ("PD5", _pd5)]
+
+
+def suite_postdrop(db_path, snapshot_path):
+    """`postdrop` suite PD1-PD5. Explicit only: needs --db and --snapshot, both
+    opened mode=ro; init_db() is never run."""
+    passed = 0
+    print(f"INFO: python {sys.version.split()[0]}")
+    print(f"INFO: sqlite {sqlite3.sqlite_version}")
+    for case_id, body in POSTDROP_CASES:
+        info = []
+        passed += p17._case(case_id, lambda body=body, info=info: body(db_path, snapshot_path, info))
+        for line in info:
+            print(line)
+    return (passed, len(POSTDROP_CASES))
+
+
+# -- suite: bytecopy (explicit) --------------------------------------------------
+#
+# A production-volume rehearsal. The source is opened mode=ro (the one raw
+# connection, the same exception verify_phase17's bytecopy makes) and copied with
+# Connection.backup() into a TemporaryDirectory; the REAL drop CLI then runs on
+# the copies under the real Linux guards (systemctl, flock), against a scratch
+# lock file so the rehearsal never takes the production lock. The source is
+# never written.
+
+DROP_SCRIPT = Path(__file__).resolve().parent / "drop_legacy_corrections.py"
+
+
+def _linux_guards_available():
+    try:
+        import fcntl  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _real_cli(argv):
+    """The drop script as a real child process. Returns (code, stdout, stderr)."""
+    proc = subprocess.run(
+        [sys.executable, str(DROP_SCRIPT), *argv],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def _apply_argv(db, snapdir, audit, lock):
+    return ["--db", db, "--apply", "--confirm-irreversible", "--snapshot-dir", snapdir,
+            "--audit-log", audit, "--lock-file", lock]
+
+
+def suite_bytecopy(db_path):
+    """`bytecopy` suite BY1-BY5. Explicit only: needs --db (opened mode=ro)."""
+    total = 5
+    passed = 0
+    src_file = Path(db_path).resolve()
+    original = database.get_db_path()
+    tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    root = Path(tmp.name)
+    lock = str(root / "rehearsal.lock")
+    Path(lock).write_bytes(b"")
+    st = {}
+    src = _ro(src_file)
+
+    def need(key):
+        if key not in st:
+            raise RuntimeError(f"copy {key.upper()} is unavailable (an earlier case failed)")
+        return st[key]
+
+    try:
+        start = _state_conn(src)
+        legacy_rows = (src.execute("SELECT COUNT(*) FROM video_corrections").fetchone()[0]
+                       if p17.LEGACY_TABLE in start["counts"] else None)
+        print(f"INFO: python {sys.version.split()[0]}")
+        print(f"INFO: sqlite {sqlite3.sqlite_version}")
+        print(f"INFO: source_bytes {src_file.stat().st_size}")
+
+        def by1():
+            held, _cols = _legacy_names_in(src)
+            if held != ALL_SIX:
+                return False, (
+                    "source already lacks the legacy objects; Phase 18 rehearsal expects the "
+                    f"pre-drop shape (present: {held})"
+                )
+            frozen = src.execute(
+                "SELECT COUNT(*) FROM species WHERE user_common_name IS NOT NULL "
+                "OR user_scientific_name IS NOT NULL OR corrected_at IS NOT NULL"
+            ).fetchone()[0]
+            print(f"INFO: source_video_corrections_rows {legacy_rows}")
+            print(f"INFO: source_frozen_species_rows {frozen}")
+            path_a = root / "copy_a.db"
+            print(f"INFO: backup_seconds_a {p17._backup_copy(src, path_a):.2f}")
+            st["a"] = str(path_a)
+            sha = _file_sha256(st["a"])
+            code, out, err = _real_cli(["--db", st["a"], "--snapshot-dir", str(root / "snap_a"),
+                                        "--lock-file", lock])
+            lines = out.splitlines()
+            problems = []
+            if code != 0:
+                problems.append(f"dry-run exit {code}: {err[-200:]}")
+            if "DRY-RUN - nothing has been written" not in lines:
+                problems.append("no DRY-RUN line")
+            if len([ln for ln in lines if ln.startswith("OBJECT: ") and ln.endswith(" present")]) != 6:
+                problems.append("not six OBJECT present lines")
+            shown = len([ln for ln in lines if ln.startswith("LEGACY ROW: ")])
+            if shown != legacy_rows:
+                problems.append(f"{shown} LEGACY ROW lines, the source has {legacy_rows}")
+            if _file_sha256(st["a"]) != sha:
+                problems.append("the dry-run changed copy A")
+            if (root / "snap_a").exists():
+                problems.append("the dry-run created the snapshot directory")
+            return not problems, "; ".join(problems)
+
+        passed += p17._case("BY1", by1)
+
+        def by2():
+            a = need("a")
+            code, out, err = _real_cli(_apply_argv(a, str(root / "snap_a"), str(root / "audit_a.jsonl"), lock))
+            for ln in out.splitlines():
+                if ln.startswith(("COUNTS:", "CHECK:", "INFO:", "TIMING:")):
+                    print(f"INFO: rehearsal {ln}")
+            problems = []
+            if code != 0 or "APPLIED - legacy objects dropped and verified" not in out.splitlines():
+                return False, f"apply exit {code}: {err[-300:]}"
+            conn = _ro(a)
+            try:
+                held, cols = _legacy_names_in(conn)
+                after = _state_conn(conn)
+                integrity = [tuple(r) for r in conn.execute("PRAGMA integrity_check")]
+                fk = conn.execute("PRAGMA foreign_key_check").fetchall()
+            finally:
+                conn.close()
+            if held:
+                problems.append(f"legacy objects remain: {held}")
+            if cols != p17.SPECIES_COLUMNS:
+                problems.append(f"species columns are {cols}")
+            if integrity != [("ok",)] or fk:
+                problems.append(f"integrity {integrity[:3]}, foreign_key_check {len(fk)} row(s)")
+            want = {t: n for t, n in start["counts"].items() if t != p17.LEGACY_TABLE}
+            if after["counts"] != want:
+                problems.append("a surviving table's row count differs from the source's")
+            if after["digests"] != start["digests"]:
+                problems.append("a content digest differs from the source's")
+            snaps = _snapshots(str(root / "snap_a"))
+            if len(snaps) != 1:
+                problems.append(f"{len(snaps)} snapshot files, expected 1")
+            else:
+                ok, detail = _pd4(a, str(snaps[0]), [])
+                if not ok:
+                    problems.append(f"snapshot: {detail}")
+            return not problems, "; ".join(problems)
+
+        passed += p17._case("BY2", by2)
+
+        def by3():
+            path_b = root / "copy_b.db"
+            print(f"INFO: backup_seconds_b {p17._backup_copy(src, path_b):.2f}")
+            st["b"] = str(path_b)
+            real = dlc._execute_drop_statement
+            calls = {"n": 0}
+
+            def fail_fourth(conn, sql):
+                calls["n"] += 1
+                if calls["n"] == 4:
+                    raise RuntimeError("injected failure at the fourth statement")
+                real(conn, sql)
+
+            def boom(conn, expected):
+                raise RuntimeError("injected check failure")
+
+            problems = []
+            for label, seams in (("fourth statement", {"_execute_drop_statement": fail_fourth}),
+                                 ("checks", {"_in_txn_checks": boom})):
+                with _patched(**seams):
+                    code, out, err = _run_cli(_apply_argv(
+                        st["b"], str(root / "snap_b"), str(root / "audit_b.jsonl"), lock))
+                if code != 1 or "ROLLED BACK" not in err:
+                    problems.append(f"{label}: exit {code}, err {err[-200:]!r}")
+                after = _state_no_file(st["b"])
+                if after["master"] != start["master"]:
+                    problems.append(f"{label}: sqlite_master changed")
+                if after["counts"] != start["counts"] or after["digests"] != start["digests"]:
+                    problems.append(f"{label}: counts or digests changed")
+            return not problems, "; ".join(problems)
+
+        passed += p17._case("BY3", by3)
+
+        def by4():
+            a, b = need("a"), need("b")
+            web_app, TestClient = p17._import_web()
+            data_dir = root / "data"
+            data_dir.mkdir(exist_ok=True)
+            got, params = {}, {}
+            for key, path in (("a", a), ("b", b)):
+                with p17._web_context(web_app, path, data_dir):
+                    p = p17._pick_params()
+                    client = TestClient(web_app.app, raise_server_exceptions=False)
+                    species = client.get("/api/species").json()
+                    if not species:
+                        return False, f"[{key}] /api/species is empty"
+                    p["species_key"] = p17._quote(species[0]["label"])
+                    p["search_q"] = p17._quote(species[0].get("common_name") or species[0]["label"])
+                    got[key] = p17._get_all(client, p)
+                    params[key] = p
+            problems = []
+            if params["a"] != params["b"]:
+                problems.append("the two copies picked different placeholder values")
+            bad = {u: s for u, (s, _body) in got["a"].items() if s >= 500}
+            if bad:
+                problems.append(f"5xx responses on the dropped copy: {bad}")
+            for template in p17.COMPARE_URLS:
+                url = template.format(**params["a"])
+                if got["a"][url] != got["b"][url]:
+                    problems.append(f"{url} differs between the dropped and the undropped copy")
+            detail = got["a"]["/api/videos/{paired_video_id}".format(**params["a"])]
+            if detail[0] != 200 or not isinstance(detail[1], dict) or "corrections" in detail[1]:
+                problems.append(f"video detail on the dropped copy: status {detail[0]}, keys "
+                                f"{sorted(detail[1]) if isinstance(detail[1], dict) else '?'}")
+            before = p17._schema_snapshot(a)
+            database.init_db(a)
+            database.init_db(a)
+            if p17._schema_snapshot(a) != before or p17._legacy_objects(a):
+                problems.append("init_db() changed or re-added objects on the dropped copy")
+            return not problems, "; ".join(problems)
+
+        passed += p17._case("BY4", by4)
+
+        def by5():
+            b = need("b")
+            holder = subprocess.Popen(
+                ["flock", "-n", lock, "-c", "echo held; sleep 30"],
+                stdout=subprocess.PIPE, text=True, start_new_session=True,
+            )
+            problems = []
+            try:
+                first = holder.stdout.readline().strip()
+                if first != "held":
+                    return False, f"the flock holder printed {first!r}, not 'held'"
+                before = _state(b)
+                code, out, err = _real_cli(_apply_argv(
+                    b, str(root / "snap_b2"), str(root / "audit_b2.jsonl"), lock))
+                if code != 1 or "REFUSED" not in err or "run lock" not in err:
+                    problems.append(f"exit {code}, err {err[-200:]!r}: expected a REFUSED run lock")
+                if _state(b) != before:
+                    problems.append("copy B changed under a held lock")
+                if (root / "snap_b2").exists():
+                    problems.append("a snapshot was taken under a held lock")
+            finally:
+                import signal
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(holder.pid, signal.SIGTERM)
+                holder.wait(timeout=10)
+                holder.stdout.close()
+            end = _state_conn(src)
+            if end["master"] != start["master"] or end["counts"] != start["counts"]:
+                problems.append("the source's schema or row counts changed")
+            return not problems, "; ".join(problems)
+
+        passed += p17._case("BY5", by5)
+    finally:
+        src.close()
+        database.set_db_path(original)
+        tmp.cleanup()
+    return (passed, total)
+
+
 # -- registry / CLI ----------------------------------------------------------
 
 SUITES = {
-    "script": (suite_script, 15),
+    "script": (suite_script, 16),
+    "bytecopy": (suite_bytecopy, 5),
+    "postdrop": (suite_postdrop, 5),
 }
 
 # Suites that only run when explicitly requested (never part of --suite all).
-EXPLICIT_ONLY = set()
+EXPLICIT_ONLY = {"bytecopy", "postdrop"}
 
 
 def main():
@@ -805,12 +1230,53 @@ def main():
         help="which suite to run (default: all, the non-explicit suites)",
     )
     parser.add_argument("--list", action="store_true", help="list suites and exit")
+    parser.add_argument(
+        "--db", default=None,
+        help="database for the bytecopy and postdrop suites (required for them, no default). "
+             "It is opened read-only (mode=ro) and never written",
+    )
+    parser.add_argument(
+        "--snapshot", default=None,
+        help="the drop's snapshot, for the postdrop suite (required for it); opened mode=ro",
+    )
+    parser.add_argument(
+        "--make-fixture", default=None, metavar="DIR",
+        help="build the legacy-shaped fixture in the NEW directory DIR (refuses an "
+             "existing one), print FIXTURE: <database path>, and exit",
+    )
     args = parser.parse_args()
 
     if args.list:
         for name, (_fn, total) in SUITES.items():
             print(f"{name}: {total} cases")
         return 0
+
+    if args.make_fixture:
+        target = os.path.abspath(args.make_fixture)
+        if os.path.exists(target):
+            print(f"ERROR: {target} already exists; --make-fixture never overwrites")
+            return 2
+        original = database.get_db_path()
+        try:
+            fx = _fixture18(target)
+        finally:
+            database.set_db_path(original)
+        print(f"FIXTURE: {fx['db']}")
+        return 0
+
+    # Argument checks come first, before any connect: sqlite3.connect creates a
+    # missing file (the audit_species_buckets / verify_phase17 pattern).
+    if args.suite in ("bytecopy", "postdrop"):
+        if not args.db:
+            print(f"ERROR: --db is required for the {args.suite} suite")
+            return 2
+        if args.suite == "postdrop" and not args.snapshot:
+            print("ERROR: --snapshot is required for the postdrop suite")
+            return 2
+        for label, path in (("database", args.db), ("snapshot", args.snapshot)):
+            if path and (args.suite == "postdrop" or label == "database") and not os.path.isfile(path):
+                print(f"ERROR: no {label} at {path}")
+                return 2
 
     # The suites import web_app (the bytecopy GET sweep reads static/index.html with
     # the locale's default encoding). Re-run once in UTF-8 mode on a non-UTF-8
@@ -827,7 +1293,17 @@ def main():
     all_passed = True
     for name in names:
         fn, expected_total = SUITES[name]
-        passed, total = fn()
+        if name == "bytecopy":
+            if not _linux_guards_available():
+                # An explicit suite never skips into a pass.
+                all_passed = False
+                print("FAIL: bytecopy (needs Linux: fcntl, systemctl, flock)")
+                continue
+            passed, total = fn(args.db)
+        elif name == "postdrop":
+            passed, total = fn(args.db, args.snapshot)
+        else:
+            passed, total = fn()
         if passed == total == expected_total:
             print(f"PASS: {name} ({passed}/{total})")
         else:
