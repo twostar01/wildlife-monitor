@@ -365,10 +365,418 @@ def _rb1():
     return not problems, "; ".join(problems)
 
 
+def _apply_ok(fx, state="inactive"):
+    """A seam-driven clean apply on `fx`. Returns (code, out, err, stub)."""
+    patch, stub = _seams(state=state)
+    with _patched(**patch):
+        code, out, err = _run_cli(_apply_args(fx))
+    return code, out, err, stub
+
+
+def _dr2():
+    problems = []
+    with _fixture_ctx() as fx:
+        before = _state(fx["db"])
+        patch, _stub = _seams()
+        with _patched(**patch):
+            code, out, err = _run_cli([
+                "--db", fx["db"], "--snapshot-dir", fx["snapdir"], "--lock-file", fx["lock"],
+            ])
+        lines = out.splitlines()
+        if code != 0:
+            problems.append(f"exit code {code}: {err[-200:]}")
+        if f"PLAN: {fx['db']}" not in lines:
+            problems.append("no PLAN line with the absolute path")
+        want_version = (f"VERSION: python {sys.version.split()[0]} "
+                        f"sqlite {'.'.join(map(str, sqlite3.sqlite_version_info))}")
+        if want_version not in lines:
+            problems.append(f"no '{want_version}' line")
+        if len([ln for ln in lines if ln.startswith("OBJECT: ") and ln.endswith(" present")]) != 6:
+            problems.append("not six OBJECT present lines")
+        for table, n in before["counts"].items():
+            if f"COUNT: {table} {n}" not in lines:
+                problems.append(f"no COUNT line for {table}")
+        if "FROZEN: 2" not in lines:
+            problems.append("no 'FROZEN: 2' line")
+        rows = [ln for ln in lines if ln.startswith("LEGACY ROW: ")]
+        if len(rows) != 2:
+            problems.append(f"{len(rows)} LEGACY ROW lines, expected 2")
+        if not any("corrected_label=None corrected_common=None corrected_scientific=None" in ln
+                   for ln in rows):
+            problems.append("the all-NULL orphan row is not shown")
+        for prefix in ("GUARD: sqlite ", "GUARD: analysis_service ", "GUARD: run_lock ", "GUARD: open_runs "):
+            if not any(ln.startswith(prefix) for ln in lines):
+                problems.append(f"no '{prefix.strip()}' line")
+        if not any(ln.startswith("WOULD WRITE: snapshot ") for ln in lines):
+            problems.append("no WOULD WRITE line")
+        if os.path.exists(fx["snapdir"]):
+            problems.append("the snapshot directory was created")
+        if _state(fx["db"]) != before:
+            problems.append("the database changed")
+    return not problems, "; ".join(problems)
+
+
+def _ap2():
+    problems = []
+    with _fixture_ctx() as fx:
+        before = _state(fx["db"])
+        conn = _ro(fx["db"])
+        try:
+            row_text = [r[0] for r in conn.execute("SELECT original_label FROM video_corrections")]
+        finally:
+            conn.close()
+        code, out, err, _stub = _apply_ok(fx)
+        if code != 0:
+            problems.append(f"exit code {code}: {err[-200:]}")
+        snaps = _snapshots(fx["snapdir"])
+        if len(snaps) != 1:
+            problems.append(f"{len(snaps)} snapshot files, expected 1")
+        else:
+            snap = _ro(snaps[0])
+            try:
+                if [tuple(r) for r in snap.execute("PRAGMA integrity_check")] != [("ok",)]:
+                    problems.append("the snapshot fails integrity_check")
+                cols = [r[1] for r in snap.execute("PRAGMA table_info(species)")]
+                names = {r[0] for r in snap.execute("SELECT name FROM sqlite_master")}
+                held = [c for c in p17.LEGACY_COLUMNS if c in cols]
+                held += [n for n in [p17.LEGACY_TABLE] + p17.LEGACY_INDEXES if n in names]
+                if sorted(held) != ALL_SIX:
+                    problems.append(f"the snapshot holds {sorted(held)}")
+                if p17._src_state(snap)["counts"] != before["counts"]:
+                    problems.append("the snapshot's counts differ from the pre-drop counts")
+            finally:
+                snap.close()
+        events = _audit_events(fx["audit"])
+        if events != ["snapshot_taken", "drop_committed"]:
+            problems.append(f"audit events {events}")
+        if os.path.isfile(fx["audit"]):
+            text = Path(fx["audit"]).read_text(encoding="utf-8")
+            leaked = [t for t in row_text + [p17.LEGACY_SEED_NAME, p17.LEGACY_VIDEO_NAME,
+                                              p17.LEGACY_SEED_SCIENTIFIC, ORPHAN_LABEL]
+                      if t in text]
+            if leaked:
+                problems.append(f"the audit file contains row text: {leaked}")
+    return not problems, "; ".join(problems)
+
+
+def _ap3():
+    problems = []
+    with _fixture_ctx() as fx:
+        code, out, err, _stub = _apply_ok(fx)
+        if code != 0:
+            return False, f"the apply exited {code}: {err[-200:]}"
+        dropped = p17._schema_snapshot(fx["db"])
+        database.init_db(fx["db"])
+        database.init_db(fx["db"])
+        again = p17._schema_snapshot(fx["db"])
+        if again != dropped:
+            problems.append("init_db() changed the dropped database")
+        if p17._legacy_objects(fx["db"]):
+            problems.append(f"init_db() re-added {p17._legacy_objects(fx['db'])}")
+    return not problems, "; ".join(problems)
+
+
+def _rb2():
+    problems = []
+    real = dlc._execute_drop_statement
+
+    def boom(conn, expected):
+        raise RuntimeError("injected check failure")
+
+    with _fixture_ctx() as fx:
+        before_schema = p17._schema_snapshot(fx["db"])
+        before = _state(fx["db"])
+        patch, stub = _seams(_in_txn_checks=boom)
+        with _patched(**patch):
+            code, out, err = _run_cli(_apply_args(fx))
+        if code != 1 or "ROLLED BACK" not in err:
+            problems.append(f"patched check: exit {code}, err {err[-120:]!r}")
+        if p17._schema_snapshot(fx["db"]) != before_schema:
+            problems.append("patched check: the schema changed")
+        after = _state_no_file(fx["db"])
+        if after["counts"] != before["counts"] or after["digests"] != before["digests"]:
+            problems.append("patched check: counts or digests changed")
+        if len(stub.released) != 1:
+            problems.append(f"patched check: lock released {len(stub.released)} times, expected 1")
+
+    # The real checks must also catch a damaged result: a wrapper deletes every
+    # species_corrections row right after the fourth statement ran.
+    with _fixture_ctx() as fx:
+        before_schema = p17._schema_snapshot(fx["db"])
+        before = _state(fx["db"])
+        calls = {"n": 0}
+
+        def damaging(conn, sql):
+            real(conn, sql)
+            calls["n"] += 1
+            if calls["n"] == 4:
+                conn.execute("DELETE FROM species_corrections")
+
+        patch, _stub = _seams(_execute_drop_statement=damaging)
+        with _patched(**patch):
+            code, out, err = _run_cli(_apply_args(fx))
+        if code != 1 or "ROLLED BACK" not in err:
+            problems.append(f"real checks: exit {code}, err {err[-160:]!r}")
+        if p17._schema_snapshot(fx["db"]) != before_schema:
+            problems.append("real checks: the schema changed")
+        after = _state_no_file(fx["db"])
+        if after["counts"] != before["counts"] or after["digests"] != before["digests"]:
+            problems.append("real checks: the deletion was not rolled back")
+    return not problems, "; ".join(problems)
+
+
+def _gt1():
+    problems = []
+    with _fixture_ctx() as fx:
+        before = _state(fx["db"])
+        scenarios = [
+            ("--apply alone", ["--db", fx["db"], "--lock-file", fx["lock"], "--apply"],
+             "--confirm-irreversible"),
+            ("no --snapshot-dir",
+             ["--db", fx["db"], "--lock-file", fx["lock"], "--audit-log", fx["audit"],
+              "--apply", "--confirm-irreversible"], "--snapshot-dir"),
+            ("no --audit-log",
+             ["--db", fx["db"], "--lock-file", fx["lock"], "--snapshot-dir", fx["snapdir"],
+              "--apply", "--confirm-irreversible"], "--audit-log"),
+            ("no --confirm-irreversible",
+             ["--db", fx["db"], "--lock-file", fx["lock"], "--snapshot-dir", fx["snapdir"],
+              "--audit-log", fx["audit"], "--apply"], "--confirm-irreversible"),
+        ]
+        for label, argv, named in scenarios:
+            patch, stub = _seams()
+            with _patched(**patch):
+                code, out, err = _run_cli(argv)
+            if "REFUSED" not in err or named not in err:
+                problems.append(f"{label}: no REFUSED line naming {named}: {err[-160:]!r}")
+            problems += [f"{label}: {p}" for p in _nothing_written(fx, before, code)]
+            if stub.acquired:
+                problems.append(f"{label}: the lock was taken")
+            if os.path.exists(fx["snapdir"]):
+                problems.append(f"{label}: the snapshot directory was created")
+    return not problems, "; ".join(problems)
+
+
+def _gt2():
+    problems = []
+    with _fixture_ctx() as fx:
+        before = _state(fx["db"])
+        missing = os.path.join(fx["tmp"], "nope", "x.db")
+        scenarios = [
+            ("relative --db", ["--db", os.path.join("relative", "wildlife.db")]),
+            ("missing --db", ["--db", missing]),
+            ("relative --snapshot-dir", ["--db", fx["db"], "--snapshot-dir", "snap"]),
+            ("relative --audit-log", ["--db", fx["db"], "--audit-log", "audit.jsonl"]),
+            ("relative --lock-file", ["--db", fx["db"], "--lock-file", ".nas_sync.lock"]),
+        ]
+        for label, argv in scenarios:
+            patch, stub = _seams()
+            with _patched(**patch):
+                code, out, err = _run_cli(argv + ["--apply", "--confirm-irreversible"])
+            if code != 2:
+                problems.append(f"{label}: exit code {code}, expected 2")
+            if "ERROR" not in err:
+                problems.append(f"{label}: no ERROR line")
+            if stub.acquired:
+                problems.append(f"{label}: the lock was taken")
+        if os.path.exists(missing) or os.path.exists(os.path.dirname(missing)):
+            problems.append("the nonexistent database (or its directory) was created")
+        problems += _nothing_written(fx, before, 2, expect_code=2)
+    return not problems, "; ".join(problems)
+
+
+def _gt3():
+    problems = []
+    with _fixture_ctx() as fx:
+        before = _state(fx["db"])
+        patch, stub = _seams(_sqlite_version=lambda: (3, 34, 1))
+        with _patched(**patch):
+            code, out, err = _run_cli(_apply_args(fx))
+        if "REFUSED" not in err or "3.34.1" not in err:
+            problems.append(f"apply: no REFUSED line naming 3.34.1: {err[-160:]!r}")
+        problems += [f"apply: {p}" for p in _nothing_written(fx, before, code)]
+        with _patched(**patch):
+            code, out, err = _run_cli(["--db", fx["db"], "--lock-file", fx["lock"]])
+        if code != 0 or "GUARD: sqlite 3.34.1 too-old" not in out.splitlines():
+            problems.append(f"dry-run: exit {code}, no 'GUARD: sqlite 3.34.1 too-old'")
+    return not problems, "; ".join(problems)
+
+
+def _raiser(exc):
+    def raise_it():
+        raise exc
+    return raise_it
+
+
+def _gt4():
+    problems = []
+    with _fixture_ctx() as fx:
+        before = _state(fx["db"])
+        bad = [(f"state {s}", (lambda s=s: s)) for s in ("active", "activating", "deactivating", "reloading")]
+        bad += [
+            ("FileNotFoundError", _raiser(FileNotFoundError("systemctl"))),
+            ("CalledProcessError", _raiser(subprocess.CalledProcessError(1, "systemctl"))),
+            ("TimeoutExpired", _raiser(subprocess.TimeoutExpired("systemctl", 10))),
+            ("empty state", (lambda: "")),
+        ]
+        for label, seam in bad:
+            patch, stub = _seams(_analysis_service_state=seam)
+            with _patched(**patch):
+                code, out, err = _run_cli(_apply_args(fx))
+            if "REFUSED" not in err:
+                problems.append(f"{label}: no REFUSED line")
+            problems += [f"{label}: {p}" for p in _nothing_written(fx, before, code)]
+            if stub.acquired:
+                problems.append(f"{label}: the lock was taken before the service gate")
+    with _fixture_ctx() as fx:
+        code, out, err, _stub = _apply_ok(fx, state="failed")
+        if code != 0 or "APPLIED" not in out:
+            problems.append(f"state failed: exit {code}, expected a clean apply: {err[-200:]!r}")
+    return not problems, "; ".join(problems)
+
+
+def _gt5():
+    problems = []
+    with _fixture_ctx() as fx:
+        before = _state(fx["db"])
+        busy = LockStub(acquire_result=None)
+        oserr = LockStub(acquire_error=OSError("flock failed"))
+        for label, stub in (("lock busy", busy), ("acquire raises OSError", oserr)):
+            patch, _ = _seams(stub=stub)
+            with _patched(**patch):
+                code, out, err = _run_cli(_apply_args(fx))
+            if "REFUSED" not in err or "run lock" not in err:
+                problems.append(f"{label}: no REFUSED line naming the run lock: {err[-160:]!r}")
+            problems += [f"{label}: {p}" for p in _nothing_written(fx, before, code)]
+            if stub.released:
+                problems.append(f"{label}: released a lock it never held")
+        stub = LockStub()
+        patch, _ = _seams(stub=stub)
+        absent = os.path.join(fx["tmp"], "no.lock")
+        with _patched(**patch):
+            code, out, err = _run_cli(_apply_args(fx, **{"--lock-file": absent}))
+        if "REFUSED" not in err:
+            problems.append("missing lock file: no REFUSED line")
+        problems += [f"missing lock file: {p}" for p in _nothing_written(fx, before, code)]
+        if stub.acquired:
+            problems.append("missing lock file: the seam was called")
+        if os.path.exists(absent):
+            problems.append("missing lock file: it was created")
+    with _fixture_ctx() as fx:
+        code, out, err, stub = _apply_ok(fx)
+        if code != 0 or len(stub.acquired) != 1 or len(stub.released) != 1:
+            problems.append(
+                f"clean apply: exit {code}, acquired {len(stub.acquired)}, released {len(stub.released)}"
+            )
+    with _fixture_ctx() as fx:
+        def first_fails(conn, sql):
+            raise RuntimeError("injected")
+
+        patch, stub = _seams(_execute_drop_statement=first_fails)
+        with _patched(**patch):
+            code, out, err = _run_cli(_apply_args(fx))
+        if code != 1 or len(stub.released) != 1:
+            problems.append(f"injected failure: exit {code}, released {len(stub.released)}, expected 1")
+    return not problems, "; ".join(problems)
+
+
+def _gt6():
+    problems = []
+    with _fixture_ctx() as fx:
+        database.set_db_path(fx["db"])
+        with database.get_conn() as conn:
+            conn.execute(
+                """INSERT INTO runs (start_time, end_time, status, "trigger",
+                       videos_processed, detections_found)
+                   VALUES ('2026-10-08T06:00:00', NULL, 'running', 'scheduled', 0, 0)"""
+            )
+        before = _state(fx["db"])
+        code, out, err, stub = _apply_ok(fx)
+        if "REFUSED" not in err or "open run" not in err:
+            problems.append(f"no REFUSED line naming the open run: {err[-160:]!r}")
+        problems += _nothing_written(fx, before, code)
+        if len(stub.released) != 1:
+            problems.append(f"the lock was released {len(stub.released)} times, expected 1")
+    return not problems, "; ".join(problems)
+
+
+def _sn1():
+    problems = []
+
+    def bad_snapshot(snapshot_path, expected):
+        raise RuntimeError("injected snapshot mismatch")
+
+    with _fixture_ctx() as fx:
+        before_schema = p17._schema_snapshot(fx["db"])
+        before = _state(fx["db"])
+        patch, stub = _seams(_verify_snapshot=bad_snapshot)
+        with _patched(**patch):
+            code, out, err = _run_cli(_apply_args(fx))
+        if code != 1 or "REFUSED" not in err:
+            problems.append(f"exit {code}, err {err[-160:]!r}")
+        if p17._legacy_objects(fx["db"]) != ALL_SIX:
+            problems.append("DDL ran: not all six objects are present")
+        if p17._schema_snapshot(fx["db"]) != before_schema:
+            problems.append("the schema changed")
+        after = _state_no_file(fx["db"])
+        if after["counts"] != before["counts"] or after["digests"] != before["digests"]:
+            problems.append("counts or digests changed")
+        events = _audit_events(fx["audit"])
+        if "drop_committed" in events or "drop_rolled_back" in events:
+            problems.append(f"drop audit events were written: {events}")
+        if len(_snapshots(fx["snapdir"])) != 1:
+            problems.append("the snapshot file is not on disk")
+        if len(stub.released) != 1:
+            problems.append("the lock was not released")
+    return not problems, "; ".join(problems)
+
+
+def _id1():
+    problems = []
+    with _fixture_ctx() as fx:
+        code, out, err, _stub = _apply_ok(fx)
+        if code != 0:
+            return False, f"the first apply exited {code}: {err[-200:]}"
+        snaps = _snapshots(fx["snapdir"])
+        events = _audit_events(fx["audit"])
+        before = _state(fx["db"])
+        code, out, err, stub = _apply_ok(fx)
+        if code != 0 or "NOTHING TO DROP" not in out:
+            problems.append(f"second apply: exit {code}, no NOTHING TO DROP")
+        if _snapshots(fx["snapdir"]) != snaps:
+            problems.append("the second apply took a snapshot")
+        if _audit_events(fx["audit"]) != events:
+            problems.append("the second apply wrote audit lines")
+        if stub.acquired:
+            problems.append("the second apply took the lock")
+        if _state(fx["db"]) != before:
+            problems.append("the second apply changed the database")
+        patch, _ = _seams()
+        with _patched(**patch):
+            code, out, err = _run_cli(["--db", fx["db"], "--lock-file", fx["lock"]])
+        lines = out.splitlines()
+        if code != 0 or not any(ln.startswith("NOTHING TO DROP") for ln in lines):
+            problems.append(f"dry-run: exit {code}, no NOTHING TO DROP")
+        if len([ln for ln in lines if ln.startswith("OBJECT: ") and ln.endswith(" absent")]) != 6:
+            problems.append("dry-run: not six OBJECT absent lines")
+    return not problems, "; ".join(problems)
+
+
 SCRIPT_CASES = [
     ("DR1", _dr1),
+    ("DR2", _dr2),
     ("AP1", _ap1),
+    ("AP2", _ap2),
+    ("AP3", _ap3),
     ("RB1", _rb1),
+    ("RB2", _rb2),
+    ("GT1", _gt1),
+    ("GT2", _gt2),
+    ("GT3", _gt3),
+    ("GT4", _gt4),
+    ("GT5", _gt5),
+    ("GT6", _gt6),
+    ("SN1", _sn1),
+    ("ID1", _id1),
 ]
 
 
@@ -383,7 +791,7 @@ def suite_script():
 # -- registry / CLI ----------------------------------------------------------
 
 SUITES = {
-    "script": (suite_script, 3),
+    "script": (suite_script, 15),
 }
 
 # Suites that only run when explicitly requested (never part of --suite all).
