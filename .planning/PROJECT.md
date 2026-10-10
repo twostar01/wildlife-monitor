@@ -10,9 +10,18 @@ Every animal that passes a camera gets detected, identified, and browsable — w
 
 ## Current State
 
+**Shipped:** v1.5 Unified Species Buckets & Legacy Cleanup (2026-10-09) — see `.planning/milestones/v1.5-ROADMAP.md`
+
+v1.5 made a species one bucket everywhere and retired the correction machinery v1.4 froze. Phase 16 keyed native rows on the normalised common name too (`NATIVE_KEY`, Design B), gated by a read-only production audit that showed 51 keys becoming 47 through exactly four same-name merges; a merged card is named native-first, carries a corrected indicator, and old raw-label gallery links resolve onto the merged key. The Videos `has_species` filter, video text search and the videos half of global search now see corrected detections by their effective name, with taxonomy-token search ("canidae") preserved for uncorrected rows. Phase 17 removed every code path touching `species.user_common_name`, `user_scientific_name`, `corrected_at` and `video_corrections`, deleted four finished backfill scripts, and soaked the decoupled code through a real nightly. Phase 18 dropped the six legacy objects from production with `drop_legacy_corrections.py` (dry-run default, verified snapshot, one `BEGIN IMMEDIATE` transaction, operator Go/No-Go); the first nightly afterwards (run 80) succeeded. LEGACY-04 (observe a natural reprocess starting uncorrected) is unobserved and stays a standing, non-gating observation.
+
+<details>
+<summary>Previous state (v1.4, shipped 2026-10-06)</summary>
+
 **Shipped:** v1.4 Effective Species Labeling (2026-10-06) — see `.planning/milestones/v1.4-ROADMAP.md`
 
 v1.4 made a corrected detection's species the single effective label everywhere. Phase 14 unified the two correction mechanisms into one `species_corrections` table (UPSERT write-time precedence, one-time production backfill, legacy columns frozen). Phase 15 then made the species list, Stats, Timeline, drilldown, Gallery/Videos species filters and the species half of search group on one SQL-defined effective key, with correction-aware blacklist override and global suppression; the frontend gained a recoverable "Species not found" modal, sorted dropdowns that keep the active filter, and species names on gallery chips. Operator UAT: 6 pass, 1 issue, 1 optional check skipped. The one issue is deferred: a native AI-detected species and its corrected counterpart still show as two separate buckets (decision D-03); the operator says that is not acceptable and the fix can wait.
+
+</details>
 
 <details>
 <summary>Previous state (v1.3, shipped 2026-08-21)</summary>
@@ -30,7 +39,7 @@ v1.2 closed out the last known rough edges from the first two milestones: mobile
 
 ## Next Milestone Goals
 
-(None defined yet — run `/gsd-new-milestone`.) Candidates carried forward: merge a corrected species and its AI-detected counterpart into one bucket (`.planning/todos/pending/2026-10-06-merge-corrected-and-ai-detected-species-into-a-single-bucket.md`); convert the remaining raw-label readers `has_species` and `get_videos(search=)`; remove the frozen legacy correction columns (D-07); NOTIFY-02 observation (no deadline).
+(None defined yet — run `/gsd-new-milestone`.) Candidates carried forward: BUCKET-05 (an old raw-label bookmark whose detections were corrected elsewhere shows only the uncorrected remainder); v1.5 audit tech debt (WR-01 casing of a typed "Unknown species" correction, WR-02 unescaped `%`/`_` in search text, WR-03 lower-case free text in video chips, no committed test executing `canonicalizeSpeciesFilter()`); NOTIFY-02 and LEGACY-04 standing observations (no deadline).
 
 ## Requirements
 
@@ -82,18 +91,23 @@ v1.2 closed out the last known rough edges from the first two milestones: mobile
 - ✓ CORR-01..CORR-04: one `species_corrections` table, keyed uniquely per detection, is the authoritative source of a detection's corrected species; both correction write paths feed it with write-time recency precedence, the audit trail is preserved, and a one-time production backfill ran 2026-08-22 — Phase 14, v1.4
 - ✓ LABEL-01..LABEL-05: the species list, Stats, Timeline, drilldown and the Gallery/Videos species filters key on one effective label; a corrected detection fully leaves its stale AI bucket and an emptied bucket disappears everywhere; blacklist/suppression decided (correction overrides the blacklist, suppression is global) — Phase 15, v1.4 (browser UAT 6 pass / 1 deferred issue / 1 skipped)
 
+- ✓ BUCKET-01..BUCKET-04: a native and a corrected species with the same normalised common name are one bucket (card, dropdown entry, chart series) in every reader, named native-first, with a corrected indicator on merged cards and harnesses pinning list/drilldown/filter lockstep — Phase 16, validated 2026-10-07 against the production audit (51 keys to 47)
+- ✓ READER-01..READER-03: `has_species`, video text search and the videos half of `search()` match corrected detections by effective name, and taxonomy-token search still finds uncorrected rows — Phase 16, validated 2026-10-08
+- ✓ LEGACY-01, LEGACY-02: no code path reads, writes or recreates the legacy correction columns or `video_corrections`; the dependent one-shot scripts are retired and all harnesses pass on both database shapes — Phase 17, live in production 2026-10-08
+- ✓ LEGACY-03: the six legacy correction objects are dropped from production through a rehearsed, snapshot-backed, operator-approved script; post-drop nightly run 80 succeeded — Phase 18, 2026-10-09
+
 ### Active
 
-(None — planning next milestone)
+(None — define the next milestone with `/gsd-new-milestone`.)
 
 ### Live-Verification Follow-ups (deferred from Phase 2, code-verified but unobserved in production)
 
 - [ ] NOTIFY-02: zero-detection alert fires on a real no-animal night but not on an empty directory — `alert_on_zero_detections` armed true in production 2026-08-07; the firing shape has never occurred in 13+ runs to date; remains a standing, no-deadline observation item, not scoped into v1.3
 - [x] Phase 14: browser checks 5(a)-(i) repeated and recorded 2026-10-06 (all pass; see 14-04-SUMMARY.md)
-- [ ] Phase 14 (D-02): observe on the next real reprocess that a reprocessed video's detections start uncorrected (accepted consequence of snapshot fan-out)
-- [ ] Phase 14: legacy `video_corrections` row for video 31680 (spotted hyaena, 2026-06-15) matched 0 detections and is not in `species_corrections`; decide whether to re-apply by hand or drop
+- [ ] LEGACY-04 (was Phase 14 D-02): observe on the next natural reprocess that a reprocessed video's detections start uncorrected — standing, non-gating; no natural reprocess had occurred by v1.5 close (accepted consequence of snapshot fan-out)
+- [x] Phase 14: legacy `video_corrections` row for video 31680 — closed in Phase 18 (D-07): all corrected fields were NULL, nothing to re-apply. Original note: (spotted hyaena, 2026-06-15) matched 0 detections and is not in `species_corrections`; decide whether to re-apply by hand or drop
 - [x] Phase 15: rendered browser UAT completed 2026-10-06 (6 pass, 1 issue deferred — native vs corrected same-name buckets, 1 optional round-trip skipped); see `.planning/milestones/v1.4-phases/15-effective-label-grouping-filtering/15-UAT.md`
-- [ ] Phase 15 (operator decision 2): three readers still match the raw SpeciesNet label by design: `get_videos(has_species=...)`, `get_videos(search=...)` and the videos half of `search()`; tracked in `.planning/todos/pending/2026-10-06-has-species-and-video-search-raw-label.md`
+- [x] Phase 15 (operator decision 2, converted in Phase 16): three readers still match the raw SpeciesNet label by design: `get_videos(has_species=...)`, `get_videos(search=...)` and the videos half of `search()`; tracked in `.planning/todos/pending/2026-10-06-has-species-and-video-search-raw-label.md`
 
 ### Out of Scope
 
@@ -161,6 +175,12 @@ v1.2 closed out the last known rough edges from the first two milestones: mobile
 | Phase 15 (D-05): the `/api/species` field `label` now carries the effective key (not the raw label), so the dropdown value, the `?species=` filter and the `/api/species/{label}` drilldown stay in lockstep with no frontend contract change; gallery and video-player item dicts keep the raw `label` because the correction popover and write-time fan-out need it | The option value was already the value sent back to the server, so repurposing the field kept one key everywhere in one commit | ✓ Production: lockstep pinned by `verify_phase15` and checked live (largest bucket's detection and video counts match its drilldown and video filter). Browser checks PENDING with the operator (deferred 2026-10-06), not completed. |
 | Phase 15 (operator decision 1, D-08): suppression is now global: a suppressed detection is excluded from every reader including the Gallery, reversing the Gallery behaviour accepted in Phase 14 | A filtered gallery total has to equal the Species-tab count for the same bucket; a crop hidden in one view and shown in another makes that impossible | ✓ Orchestrator's live API check confirmed suppressed crop 23412 is gone. Browser checks PENDING with the operator (deferred 2026-10-06), not completed. Operator's acknowledgement of the Gallery reversal is pending. |
 | Phase 15 (D-07): a correction with a usable name overrides the blacklist (`CORRECTED_KEY IS NOT NULL`); blank-name and scientific-only corrections do not, and uncorrected detections of a blacklisted species stay hidden | Correcting a detection should not need un-blacklisting the whole species, and a nameless correction must not accidentally un-hide one | ✓ Pinned by `verify_phase15` blacklist_suppress BS1/BS2/BS7; production has 1 corrected detection with a blacklisted raw label (audit INFO). The visual override check is PENDING with the operator (deferred 2026-10-06). |
+| Phase 16 (D-02): Design B — key native rows on the normalised common name too (`NATIVE_KEY`), gated by a read-only production byte-copy audit and an explicit operator go | A correction onto a native name must merge with it without relabelling data; the audit found no different-taxa collisions, no blank or odd names | ✓ Good — 51 keys became 47 through exactly four merges |
+| Phase 16: `resolve_species_key` in `database.py` maps old raw-label links onto the merged key; the frontend canonicalizes on the resolved `d.label` | Old bookmarks and chips keep working without an API change | ⚠️ Revisit — a label whose detections were corrected elsewhere shows only the uncorrected remainder (BUCKET-05) |
+| Phase 17 (D-01): delete the four finished backfill scripts outright; history is the archive | Retiring beats rewriting one-shot tools that depend on dropped schema | ✓ Good — 14 harnesses pass on both database shapes |
+| Phase 17: a static guard scans comments as well as SQL for the legacy object names | A stale comment is how the objects creep back | ✓ Good |
+| Phase 18 (D-05/D-06): production drop only through a standalone dry-run-default script, verified snapshot, single `BEGIN IMMEDIATE` transaction, operator Go/No-Go, stop-and-report on failure | Irreversible write, same layered-rehearsal pattern as Phase 9 | ✓ Good — drop clean, nightly run 80 succeeded |
+| Phase 18 (D-07): orphan `video_corrections` row for video 31680 closed without re-applying | All corrected fields NULL; its detections have no correction to restore | ✓ Good |
 | Phase 15 (operator decision 2): only the species half of `search()` was converted to the effective key; `get_videos(has_species=...)`, `get_videos(search=...)` and the videos half of `search()` stay on the raw label | Narrow symptom (a video whose only detection was corrected away from Unknown still counts as "no species"; text search still finds a corrected detection by its old AI name) and out of the five readers LABEL-01..05 name | ✓ Accepted and recorded, not dropped: `.planning/todos/pending/2026-10-06-has-species-and-video-search-raw-label.md` |
 
 ## Evolution
@@ -181,4 +201,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-10-06 after v1.4 milestone*
+*Last updated: 2026-10-09 after v1.5 milestone*
