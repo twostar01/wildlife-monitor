@@ -28,3 +28,10 @@ Thumbs.db
 
 # GSD planning (local-only)
 .planning/
+
+# Tool/OS artifacts
+*.stackdump
+.gsd/
+SESSION_SUMMARIES.md
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
